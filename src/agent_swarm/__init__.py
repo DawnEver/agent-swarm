@@ -19,8 +19,6 @@ the extraction, not a new scheduler. Everything in it is stdlib-only by construc
 was a file move.
 """
 
-from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
-from agent_swarm.store import VERDICTS, InMemoryStore, Store
 from agent_swarm.admission import (
     CHEAP,
     KNOWN_CLASSES,
@@ -35,24 +33,31 @@ from agent_swarm.admission import (
     staleness_blocker,
     time_blocker,
 )
+from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
+from agent_swarm.loop import Box, Executor, Outcome, run_one
+from agent_swarm.store import VERDICTS, InMemoryStore, Store
 
 __all__ = [
     'AGENT_TASK',
     'CHEAP',
+    'KNOWN_CLASSES',
+    'SHARED_SLOWDOWN',
+    'TEST_RUN',
     'VERDICTS',
+    'WHOLE_BOX',
+    'Box',
+    'Executor',
     'InMemoryStore',
     'Job',
     'JobKind',
+    'Outcome',
     'Store',
-    'TEST_RUN',
-    'KNOWN_CLASSES',
-    'SHARED_SLOWDOWN',
-    'WHOLE_BOX',
     'admission_blockers',
     'capacity_blocker',
     'claim_key',
     'classes_conflict',
     'own_claim_is_abandoned',
+    'run_one',
     'should_retry',
     'staleness_blocker',
     'time_blocker',

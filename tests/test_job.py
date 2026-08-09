@@ -29,8 +29,9 @@ design refuses.
 
 from __future__ import annotations
 
-import pytest
 from dataclasses import fields
+
+import pytest
 
 from agent_swarm import KNOWN_CLASSES, WHOLE_BOX
 from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind

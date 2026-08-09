@@ -23,5 +23,11 @@ packages = ["src/agent_swarm"]
 line-length = 120
 src = ["src", "tests"]
 
+# The quote style is DECLARED, not left to the default. Without this, running ruff from a sibling
+# checkout picks up that project's config and rewrites every string in this one -- a diff of pure
+# churn that buries the real change.
+[tool.ruff.format]
+quote-style = "single"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
