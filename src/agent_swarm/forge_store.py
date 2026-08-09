@@ -284,6 +284,18 @@ class ForgeStore:
         number = self._item_number(job)
         return None if number is None else self.forge.state(number)
 
+    def work_item_number(self, job: Job, *, create: bool = False) -> int | None:
+        """Which work item carries `job`, creating it if asked. ``None`` if absent and not creating.
+
+        PUBLIC SO THAT NOBODY ELSE HAS TO REDERIVE THE TITLE SCHEME. `spool.ForgePublisher` needs
+        the item in order to scan for its replay marker, and the alternative -- spelling
+        `[swarm] <namespace>/<claim_key>` a second time in a second module -- is a duplicated
+        scheme rather than one drifted copy, which is the defect class this project names first. It
+        stays a READ plus the same create-and-converge the store already does; it decides nothing
+        new.
+        """
+        return self._item_number(job, create=create)
+
     def _item_title(self, job: Job) -> str:
         return f'{_ITEM_TITLE_ROOT} {self.namespace}/{job.claim_key()}'
 
