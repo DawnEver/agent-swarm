@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-swarm"
+version = "0.1.0"
+description = "L1 job layer: store adapters, job model, atomic claim, admission, lifecycles"
+requires-python = ">=3.11"
+# NO RUNTIME DEPENDENCIES, and that is a design constraint rather than a happy accident. This layer
+# decides; it does not reach. Facts arrive as arguments (fabric supplies them), stores arrive
+# through adapters. The day something here needs a third-party package, check first whether the
+# decision has quietly grown an I/O half that belongs in an adapter.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_swarm"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
