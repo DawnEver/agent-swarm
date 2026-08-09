@@ -12,11 +12,11 @@ WHAT EACH HALF CAN AND CANNOT PROVE, because this is exactly where a suite lies 
   by the server, monotonically, and a read that sees every earlier write. Racing the store against
   it proves the STORE's arbitration is right. **It can never prove the DEPLOYMENT has those
   properties**, because it was built to have them.
-* The `network` half runs the same arbitration against Gitea, where those properties are a measured
+* The `live_forge` half runs the same arbitration against Gitea, where those properties are a measured
   fact rather than a construction. That is the only half that can say the protocol HOLDS.
 
 Neither half is a mock of the other and nothing here monkeypatches the code under test. Deselect the
-server half with `-m 'not network'`.
+server half with `-m 'not live_forge'`.
 
 FOUR ROUNDS, NOT ONE, for the race against the real server. One round electing one winner is what a
 BROKEN protocol also does most of the time -- the failure being tested for is rare by construction,
@@ -92,7 +92,7 @@ class RecordingForge:
 
     So: a green run against this forge is evidence that `ForgeStore`'s arbitration is correct. It is
     NOT evidence that any real forge has these properties, and no amount of it ever will be. That is
-    what the `network` tests are for, and why they were measured before this was written.
+    what the `live_forge` tests are for, and why they were measured before this was written.
 
     It is not a mock of the code under test -- the store's logic runs unmodified against it -- and
     it is a second genuine backend, which is what makes the vendor-neutrality claim checkable.
@@ -323,9 +323,9 @@ class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
         """A machine that dies must not park a job forever. There is deliberately no separate
         takeover path: the dead claim stops counting and ordinary arbitration elects the next one.
         """
-        dying = ForgeStore('ns', recording_forge, lease_seconds=0.4)
+        dying = ForgeStore('ns', recording_forge, lease_seconds=0.05)
         assert dying.try_claim(JOB, owner='runner-dead') is True
-        time.sleep(0.6)
+        time.sleep(0.15)
         assert dying.claim_owner(JOB) is None, 'an expired claim must read as unheld'
         assert ForgeStore('ns', recording_forge).try_claim(JOB, owner='runner-b') is True
 
@@ -465,28 +465,28 @@ def server_store():
         store.purge_namespace()
 
 
-@pytest.mark.network
+@pytest.mark.live_forge
 class TestTheRealServerSatisfiesTheContract(_ClaimContract):
     @pytest.fixture
     def store(self, server_store):
         return server_store
 
 
-@pytest.mark.network
+@pytest.mark.live_forge
 class TestTheRealServerElectsOneWinner(_AtomicityContract):
     @pytest.fixture
     def store(self, server_store):
         return server_store
 
 
-@pytest.mark.network
+@pytest.mark.live_forge
 class TestTheRealServerRecordsVerdicts(_VerdictContract):
     @pytest.fixture
     def store(self, server_store):
         return server_store
 
 
-@pytest.mark.network
+@pytest.mark.live_forge
 class TestWhatOnlyTheRealServerCanSettle:
     def test_FOUR_rounds_each_elect_exactly_one_winner(self, server_store):
         """THE DISCRIMINATING TEST, and one round is not enough of it.

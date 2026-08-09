@@ -55,6 +55,15 @@ way against the real server before it was fixed. `_item_number` therefore applie
 level up: an issue number is server-assigned and monotonic too, so create, re-read, and take the
 lowest-numbered item with this title.
 
+THAT FIX HAS A MEASURED LIMIT AND IT IS NOT PORTABLE YET. It assumes the list read is fresh -- that
+an item created moments ago is visible to the next reader. True on our Gitea. On GitHub the
+`?labels=` filter was measured STALE for 4.0-6.6 s (20/20), the exact inverse of Gitea, and the
+resulting rule is that NO "does not exist" conclusion may be drawn from a list query on either
+forge. `_item_number` draws exactly that conclusion before it creates. Whether the plain issues list
+is fresh on GitHub is the first entry in `forge.GITHUB_UNMEASURED`, and it is why no GitHub client
+is written: if that list lags, two runners create two items and the sixteen-winner bug returns on
+the second forge.
+
 WHY A LOSER DELETES ITS OWN COMMENT
 ===================================
 

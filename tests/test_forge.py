@@ -18,6 +18,8 @@ from __future__ import annotations
 import pytest
 
 from agent_swarm.forge import (
+    GITHUB_CONFIRMED,
+    GITHUB_DIVERGENCES,
     GITHUB_UNMEASURED,
     Comment,
     Forge,
@@ -117,45 +119,89 @@ class TestConstructionTouchesNothing:
 
 
 class TestGitHubRefusesInsteadOfGuessing:
+    """GitHub HAS now been probed, and the refusal survives the good news.
+
+    The blocking unknown -- read-after-write on the comment list -- came back CLEAN: 4/4 rounds, 16
+    racers, one winner each. The design is portable. What stops the client being written is the
+    three measured DIVERGENCES, and the honest failure mode here would be to read "the protocol
+    works on GitHub" as "the client can be written now".
+    """
+
     @pytest.mark.parametrize('method', FORGE_METHODS)
     def test_every_method_raises_NotImplementedError(self, method):
         with pytest.raises(NotImplementedError):
             _call(GitHubForge('o/r'), method)
 
     @pytest.mark.parametrize('method', FORGE_METHODS)
-    def test_the_refusal_NAMES_the_method_and_the_experiments(self, method):
-        """ "Not implemented" alone sends the reader to guess what is missing. The message has to
-        carry the list, because the list IS the work.
+    def test_the_refusal_names_the_method_the_DIFFERENCES_and_the_UNKNOWNS(self, method):
+        """A refusal that said only "not implemented" sends the reader to guess what is missing.
+        It has to carry both lists, because between them they ARE the work.
         """
         with pytest.raises(NotImplementedError) as caught:
             _call(GitHubForge('o/r'), method)
         message = str(caught.value)
         assert method in message
-        assert 'measured' in message
+        assert GITHUB_DIVERGENCES[0] in message
         assert GITHUB_UNMEASURED[0] in message
 
-    def test_the_FIRST_experiment_is_the_four_round_race(self):
-        """Ordering is not cosmetic here: the first entry is what a reader implements against, and
-        the blocking unknown is the claim protocol itself, not a pagination limit.
+    def test_the_refusal_does_not_claim_the_protocol_is_UNMEASURED(self, method='comments'):
+        """It was measured and it passed. Saying otherwise would be the mirror-image lie -- a
+        refusal justified by evidence that no longer exists, which the next reader would check once,
+        find false, and then discount the rest of the message.
+        """
+        with pytest.raises(NotImplementedError) as caught:
+            _call(GitHubForge('o/r'), method)
+        assert 'passes' in str(caught.value)
+
+    def test_what_SURVIVED_the_second_forge_is_recorded(self):
+        """The portability claim is now evidence, not hope, and it must be findable from the code
+        rather than only from a memory file.
+        """
+        joined = ' '.join(GITHUB_CONFIRMED).lower()
+        assert '4 rounds' in joined
+        assert 'one winner' in joined
+        assert '64/64' in joined
+
+    def test_the_INVERTED_freshness_is_named_as_a_divergence(self):
+        """THE SHARPEST ONE. `?labels=` is exact on Gitea and stale up to 6.6 s on GitHub; text
+        search is the opposite. So "key on labels, never on text" is a GITEA rule, and a
+        vendor-neutral layer that adopted it would be wrong on the second forge -- silently, and
+        only for a few seconds at a time, which is the worst duration for a bug to last.
+        """
+        joined = ' '.join(GITHUB_DIVERGENCES).lower()
+        assert 'inverted' in joined
+        assert '6.6 s' in joined
+        assert 'no query path is fresh on both' in joined
+
+    def test_the_only_read_fresh_on_BOTH_forges_is_named(self):
+        """Because that is the one a machine decision may use. A divergence list that named the
+        problem without naming the survivor would leave the reader to pick.
+        """
+        joined = ' '.join(GITHUB_DIVERGENCES).lower()
+        assert 'get by issue number' in joined
+
+    def test_pagination_and_the_write_rate_limit_are_named(self):
+        """Both silently break something that works on Gitea: a truncated comment list is a claim
+        protocol that cannot see a claim, and a 403 after ~24 creates is a fleet-size ceiling that
+        has no Gitea equivalent.
+        """
+        joined = ' '.join(GITHUB_DIVERGENCES).lower()
+        assert 'paginate' in joined
+        assert 'link' in joined
+        assert 'secondary rate limit' in joined
+        assert '24 creates' in joined
+
+    def test_the_FIRST_unmeasured_item_is_the_one_that_breaks_OUR_code(self):
+        """Ordering is not cosmetic: the first entry is what a reader implements against. The
+        blocking unknown is no longer the protocol -- it is that `_item_number` concludes "does not
+        exist" from a LIST query, which the GitHub measurement explicitly forbids.
         """
         first = GITHUB_UNMEASURED[0].lower()
-        assert 'four' in first
-        assert 'barrier' in first
-        assert 'one winner' in first
+        assert 'list' in first
+        assert 'does not exist' in first
+        assert '_item_number' in first
 
-    def test_read_after_write_is_named_as_the_PRECONDITION(self):
-        """The protocol is sound only where a lower-id comment is visible to a later reader. That is
-        a property of the deployment, and GitHub's is unmeasured -- so it must be in the list, not
-        merely in someone's memory.
-        """
+    def test_the_unmeasured_list_still_names_the_open_experiments(self):
         joined = ' '.join(GITHUB_UNMEASURED).lower()
-        assert 'read-after-write' in joined
-        assert 'unverified' in joined or 'unmeasured' in joined
-
-    def test_the_unmeasured_list_names_the_things_that_ACTUALLY_surprised_us(self):
-        """Not a generic to-do. Each entry is one experiment, and every one corresponds to a Gitea
-        behaviour that was wrong when guessed.
-        """
-        joined = ' '.join(GITHUB_UNMEASURED).lower()
-        for topic in ('comment id', 'monotonic', 'label', 'pagination', 'search', 'delet', 'rate limit'):
+        for topic in ('pagination', 'rate', 'retire', 'project'):
             assert topic in joined, f'no experiment listed for {topic!r}'

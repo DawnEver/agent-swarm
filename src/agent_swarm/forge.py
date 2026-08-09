@@ -275,51 +275,91 @@ class GiteaForge:
         raise ForgeError(msg)
 
 
-#: What must be MEASURED before `GitHubForge` can be written. Raced, not read: documentation is
-#: evidence about intent, not about behaviour, and every Gitea behaviour this package relies on was
-#: a surprise when raced.
+#: MEASURED on a real GitHub repo (`DawnEver/optimi-lab`, 2026-08-09). What SURVIVED the second
+#: forge, so a reader knows which parts of this design are portable and which were luck.
+GITHUB_CONFIRMED = (
+    (
+        'the claim protocol holds: 16 racers x 4 rounds, exactly one winner each, ~820 ms against '
+        "Gitea's ~280 ms. All 16 comments were visible to all 16 racers in 64/64 reads, so "
+        'read-after-write on the comment list -- the precondition that gated everything -- holds '
+        'on GitHub too'
+    ),
+    'comment ids are server-assigned, unique and monotonic within a round',
+    'multi-label `labels=A,B` means AND on both forges',
+    (
+        'issues CAN be hard-deleted on GitHub via GraphQL deleteIssue (49/49), so retirement may '
+        'genuinely delete there -- which is why the store never spells out HOW an item is retired'
+    ),
+)
+
+#: MEASURED DIFFERENCES a GitHub client must absorb and must NOT abstract over. Each one silently
+#: breaks something that works on Gitea.
+GITHUB_DIVERGENCES = (
+    (
+        'FRESHNESS IS INVERTED. On Gitea `?labels=` is exact (0/25 stale) and TEXT search lags '
+        '~2.1 s (21/25). On GitHub the two swap: `?labels=` is stale 20/20 with a 4.0-6.6 s lag '
+        'while text search is fresh 0/20. "Key on labels, never on text" is therefore '
+        'GITEA-SPECIFIC and actively wrong on GitHub. NO query path is fresh on both forges; the '
+        'only read that is, is a direct GET by issue number (GitHub 0/10 stale) -- a primary-key '
+        'read rather than a filter'
+    ),
+    (
+        'COMMENT LISTS PAGINATE on GitHub (`per_page` honoured, `Link` header); Gitea ignores '
+        'per_page and returns everything. A client that does not follow `Link` truncates silently, '
+        'and a truncated comment list is a claim protocol that cannot see a claim'
+    ),
+    (
+        'A WRITE-SIDE SECONDARY RATE LIMIT exists on GitHub: 403 after ~24 creates in ~25 s with '
+        'the primary quota still at 96 %. Gitea has none. Sixteen racers posting claim comments is '
+        '~16 creates in about a second, so the fleet size at which claiming starts to fail is a '
+        'GitHub number with no Gitea equivalent'
+    ),
+)
+
+#: What is STILL unmeasured, and blocking. Each line is one experiment; documentation would be
+#: evidence about intent, not about behaviour.
 GITHUB_UNMEASURED = (
     (
-        'the claim protocol itself: sixteen threads from a barrier onto one fresh issue, FOUR '
-        'independent rounds, exactly one winner per round -- one round is what a broken protocol '
-        'also does most of the time'
+        'is the PLAIN issues list read-after-write fresh on GitHub? `_item_number` concludes "no '
+        'such work item" from a list query and then CREATES one, and the measured rule is that no '
+        '"does not exist" conclusion may come from a list query on either forge. If that list lags '
+        'the way `?labels=` does, two runners create two items and the 16-winner bug returns'
     ),
     (
-        'read-after-write on the comment list: GitHub is distributed, so a lower-id comment being '
-        'visible to a later reader is UNVERIFIED there and is the protocol precondition'
+        'the pagination probe: with a comment list past one page, is the LOWEST id still on page '
+        'one, and does the spool marker scan need every page? Truncation is safe for arbitration '
+        'and unsafe for idempotence, so those need separate answers'
     ),
-    'comment ids: server-assigned, monotonic and unique across concurrent posts',
-    'comment deletion: can a comment be deleted, and does a loser withdrawing race safely?',
+    'the secondary-limit backoff: what a 403 looks like, and what retry policy a fleet needs',
     (
-        'label identity: are labels addressed by name (no id lookup, no create step), and does '
-        'attaching an unknown label create it or 422?'
+        'whether retirement should delete (GraphQL) or close-and-retitle on GitHub, and what the '
+        'CLI still expects to be able to read afterwards'
     ),
-    'pagination: the per_page ceiling, and whether `state=all` is the same spelling',
-    'search: is the issues index reliable, or does it lag as Gitea 1.26.4 does?',
-    'deletion: can an issue be deleted at all, or is close-and-retitle the only retirement?',
-    'rate limiting: what a runner fleet does to the hourly budget, and what a 403 looks like',
+    'Projects v2: scope-blocked on the probe token (needs read:project), so still unusable',
 )
 
 
 class GitHubForge:
     """GitHub. **NOT IMPLEMENTED, ON PURPOSE**, and this refusal is the honest deliverable.
 
-    The user's constraint is that the system work on BOTH forges, and the seam for it is `Forge`.
-    What is NOT available is a GitHub instance to race, and the claim protocol's soundness rests on
-    a property of the DEPLOYMENT rather than of the API: read-after-write consistency on the comment
-    list. Our Gitea is a single node behind one database and was measured -- sixteen racers, four
-    rounds, one winner each. GitHub is a distributed system, and whether a runner there can read a
-    list that is missing a lower-id comment posted moments earlier is simply unknown. A client
-    shipped on the assumption that it behaves like this Gitea would produce duplicate execution
-    rarely, silently, and only under load: a declaration that lies, which this project treats as its
-    dominant defect class.
+    THE BLOCKING UNKNOWN IS NOW ANSWERED, AND IT IS GOOD NEWS. The claim protocol passed 4/4 rounds
+    on a real GitHub repo -- 16 racers each round, exactly one winner, all 16 comments visible in
+    64/64 reads. The zero-ref design is not Gitea-only. See :data:`GITHUB_CONFIRMED`.
+
+    IT IS STILL NOT WRITTEN, AND THE REASON HAS CHANGED RATHER THAN GONE AWAY. The same probes found
+    three differences a client cannot paper over (:data:`GITHUB_DIVERGENCES`), and the sharpest is
+    that FRESHNESS IS INVERTED: `?labels=` is exact on Gitea and stale for up to 6.6 s on GitHub,
+    while text search is stale on Gitea and fresh on GitHub. No query path is fresh on both. That is
+    not a client detail -- it refutes a rule this codebase already leans on, and `forge_store`'s
+    `_item_number` still draws a "does not exist" conclusion from a list query, which is exactly the
+    shape the measurement forbids. Writing this client before settling :data:`GITHUB_UNMEASURED`
+    would ship the sixteen-winner bug to the second forge.
 
     Every Gitea behaviour here was a surprise when raced -- the assignee is not a CAS, duplicate
-    labels are accepted, `POST /git/refs` is 405, `?q=` misses issues that exist. Four guesses would
-    have been four defects.
+    labels are accepted, `POST /git/refs` is 405, `?q=` misses issues that exist -- and GitHub then
+    inverted one of the conclusions drawn from them. Guessing has a perfect record of being wrong.
 
-    So the class exists, satisfies the protocol structurally, and refuses at the call. See
-    :data:`GITHUB_UNMEASURED`; each line is one experiment, and the first two are the blocking ones.
+    So the class exists, satisfies the protocol structurally, and refuses at the call.
     """
 
     def __init__(self, repo: str, base_url: str = 'https://api.github.com') -> None:
@@ -327,10 +367,13 @@ class GitHubForge:
         self.base_url = base_url
 
     def _unmeasured(self, what: str) -> NotImplementedError:
-        lines = '\n  - '.join(GITHUB_UNMEASURED)
+        blocking = '\n  - '.join(GITHUB_UNMEASURED)
+        differences = '\n  - '.join(GITHUB_DIVERGENCES)
         return NotImplementedError(
-            f'GitHubForge.{what} is unwritten because GitHub has not been measured. '
-            f'Race these against a real repo first, then write it:\n  - {lines}'
+            f'GitHubForge.{what} is unwritten. The claim protocol itself IS measured on GitHub and '
+            f'passes (4/4 rounds, one winner each), but these differences must be absorbed HERE '
+            f'rather than abstracted over:\n  - {differences}\n'
+            f'and these remain unmeasured and blocking:\n  - {blocking}'
         )
 
     def list_work_items(self) -> list[WorkItem]:

@@ -282,9 +282,9 @@ class TestAnUndrainableSpoolIsLOUD:
     """
 
     def test_a_stuck_entry_RAISES_once_it_is_stale(self, tmp_path):
-        spool = Spool(tmp_path / 's', stale_after_seconds=0.2)
+        spool = Spool(tmp_path / 's', stale_after_seconds=0.05)
         spool.record(JOB, verdict='PASS', detail='green')
-        time.sleep(0.3)
+        time.sleep(0.15)
         with pytest.raises(SpoolBacklogError):
             spool.drain(CountingPublisher(fail=True))
 
@@ -293,10 +293,10 @@ class TestAnUndrainableSpoolIsLOUD:
         carry how many and how old, because one entry stuck for a minute and two hundred stuck for a
         day are different incidents.
         """
-        spool = Spool(tmp_path / 's', stale_after_seconds=0.2)
+        spool = Spool(tmp_path / 's', stale_after_seconds=0.05)
         for n in range(3):
             spool.record(Job(id=f'j{n}', kind=TEST_RUN), verdict='PASS', detail='')
-        time.sleep(0.3)
+        time.sleep(0.15)
         with pytest.raises(SpoolBacklogError) as caught:
             spool.drain(CountingPublisher(fail=True))
         message = str(caught.value)
@@ -321,17 +321,17 @@ class TestAnUndrainableSpoolIsLOUD:
         """The dangerous shape is a spool nobody drains at all. `drain` on an empty-looking tick
         must still inspect what is already sitting there.
         """
-        spool = Spool(tmp_path / 's', stale_after_seconds=0.2)
+        spool = Spool(tmp_path / 's', stale_after_seconds=0.05)
         spool.record(JOB, verdict='PASS', detail='green')
-        time.sleep(0.3)
+        time.sleep(0.15)
         with pytest.raises(SpoolBacklogError):
             spool.drain(CountingPublisher(fail=True))
 
     def test_backlog_is_readable_WITHOUT_draining(self, tmp_path):
         """A monitor must be able to ask without publishing anything."""
-        spool = Spool(tmp_path / 's', stale_after_seconds=0.2)
+        spool = Spool(tmp_path / 's', stale_after_seconds=0.05)
         spool.record(JOB, verdict='PASS', detail='green')
-        time.sleep(0.3)
+        time.sleep(0.15)
         assert spool.stale_entries() != []
 
 
