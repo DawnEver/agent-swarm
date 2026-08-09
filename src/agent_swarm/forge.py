@@ -5,9 +5,9 @@ WHAT A FORGE IS FOR, AND WHAT IT IS NOT FOR
 
 Gitea and GitHub are demoted here to storage plus a human-readable surface (user directive:
 "把 Gitea/GitHub 降级为单纯的纯粹存储与 UI 界面, 业务逻辑和调度机制 100% 掌握在自己的 CLI 工具里").
-Every decision -- what a claim key is, how long a lease lasts, which words a verdict may take, when
-an item is retired -- lives in `forge_store.ForgeStore` and in `admission`. This file holds only the
-I/O, and it holds it once per vendor.
+Every decision -- what a claim key is, how long a lease lasts, who wins a contested claim, which
+words a verdict may take, when an item is retired -- lives in `forge_store.ForgeStore` and in
+`admission`. This file holds only the I/O, and it holds it once per vendor.
 
 THE SEAM IS DRAWN WHERE THE VENDORS DIFFER, which is why these methods are so small and so dull.
 Anything two forges do differently -- label identity (Gitea labels are ids, so a name must be
@@ -15,10 +15,16 @@ resolved and possibly created), pagination limits, state vocabulary, whether an 
 or only closed -- must be absorbed HERE. A vendor conditional in the store would mean the scheduler
 has two behaviours, and only one of them would ever be tested.
 
-WHAT IS DELIBERATELY ABSENT: the claim. `try_claim` is a compare-and-swap and no forge API offers
-one -- see `forge_store` for the measurements. The claim is a git ref push, git is the same program
-against both forges, and so the atomic primitive never enters this file at all. A forge is asked
-only for the URL to push at.
+NO REFS ANYWHERE. Issues and their comments are the whole storage layer (user directive 2026-08-09:
+彻底废弃 ref, 后面基于 issue 和 project 迭代). The claim protocol that replaces the ref push is
+built entirely from `add_comment` / `comments` / `delete_comment` -- see `forge_store` for why a
+server-assigned comment id is a sound ordering key and a client-chosen one is not.
+
+THE ONE PROPERTY THE STORE DEPENDS ON, and the reason `add_comment` returns an id rather than
+`None`: **the id must be assigned by the SERVER, monotonically increasing, at insert.** A forge that
+let a client choose it, or that reused ids, would break the claim protocol silently -- every runner
+would still get an answer, and two of them would sometimes be "yes". Any new vendor client must
+prove this by measurement before it is written.
 """
 
 from __future__ import annotations
@@ -62,18 +68,27 @@ class WorkItem:
     state: str
 
 
+@dataclass(frozen=True, slots=True)
+class Comment:
+    """One comment. THE ID IS THE LOAD-BEARING FIELD, not the body.
+
+    It is the ordering key the claim protocol arbitrates on, so it must be exactly what the server
+    assigned -- never a synthesised index, never a position in a list. A client that renumbered
+    these while paginating would hand the store a key with none of the properties it relies on.
+    """
+
+    id: int
+    body: str
+
+
 @runtime_checkable
 class Forge(Protocol):
     """Storage and UI. Every method is I/O; not one of them decides anything.
 
     THE TEST FOR WHETHER SOMETHING BELONGS HERE: could two vendors answer it differently? If yes it
-    is a forge method. If no -- a lease expiry, a verdict vocabulary, a title format -- it belongs
-    in the store, where it is written once and tested once.
+    is a forge method. If no -- a lease expiry, a verdict vocabulary, a title format, who wins a
+    contested claim -- it belongs in the store, where it is written once and tested once.
     """
-
-    def git_url(self) -> str:
-        """Where claim refs are pushed. The ONLY thing the claim mechanism asks of a forge."""
-        ...
 
     def list_work_items(self) -> list[WorkItem]:
         """Every item, open and closed. Paginated by the vendor client, not by the caller."""
@@ -81,10 +96,20 @@ class Forge(Protocol):
 
     def create_work_item(self, *, title: str, body: str) -> int: ...
 
-    def add_comment(self, number: int, body: str) -> None: ...
+    def add_comment(self, number: int, body: str) -> int:
+        """Post a comment, returning the SERVER-ASSIGNED id.
 
-    def comments(self, number: int) -> list[str]:
-        """Comment bodies, oldest first."""
+        Returning the id is not a convenience. It is the claim protocol's ordering key, and a
+        vendor that could not supply one at insert could not host a claim at all.
+        """
+        ...
+
+    def comments(self, number: int) -> list[Comment]:
+        """Every comment, oldest first, carrying its server id."""
+        ...
+
+    def delete_comment(self, number: int, comment_id: int) -> None:
+        """Remove one comment. How a claim is released, and how a loser withdraws."""
         ...
 
     def labels(self, number: int) -> list[str]:
@@ -118,6 +143,11 @@ class GiteaForge:
         base_url: the Gitea root, no trailing slash.
         repo: ``owner/name``.
 
+    MEASURED, not assumed: `POST .../comments` returns a server-assigned id; three successive posts
+    came back 595, 596, 597 -- monotonic and unique -- and `DELETE .../issues/comments/{id}` removed
+    the middle one (204) leaving [595, 597]. The sixteen-way behaviour the claim protocol needs is
+    recorded in `forge_store`'s docstring.
+
     Construction performs NO I/O -- not a connection, not a credential read. A store built against
     an unreachable host must still refuse a bad verdict word, and that refusal must be about the
     word rather than about the network.
@@ -129,18 +159,13 @@ class GiteaForge:
         self._token: str | None = None
         self._label_ids: dict[str, int] = {}
 
-    def git_url(self) -> str:
-        """The plain URL. THE TOKEN IS NEVER PUT HERE -- git's credential helper supplies it, and a
-        URL carrying a secret is persisted into `.git/config` and echoed by every git trace."""
-        return f'{self.base_url}/{self.repo}.git'
-
     def list_work_items(self) -> list[WorkItem]:
         """A plain listing, NOT `?q=`.
 
         `GET /issues?q=<title>` returned ZERO hits for an issue that demonstrably existed on this
-        deployment -- the issue indexer is not populated. A verdict lookup built on it would read
-        "not answered yet" for an answered job, which is the unearned green the vocabulary exists
-        to prevent. Vendor defect, absorbed here: the store just asks for the list.
+        deployment -- the issue indexer is not populated. A lookup built on it would read "no such
+        work item" for one that exists, so two runners would create two items for one job and each
+        would claim its own. Vendor defect, absorbed here: the store just asks for the list.
         """
         out: list[WorkItem] = []
         page, limit = 1, 50
@@ -154,11 +179,18 @@ class GiteaForge:
     def create_work_item(self, *, title: str, body: str) -> int:
         return self._api('POST', f'/repos/{self.repo}/issues', {'title': title, 'body': body})['number']
 
-    def add_comment(self, number: int, body: str) -> None:
-        self._api('POST', f'/repos/{self.repo}/issues/{number}/comments', {'body': body})
+    def add_comment(self, number: int, body: str) -> int:
+        return self._api('POST', f'/repos/{self.repo}/issues/{number}/comments', {'body': body})['id']
 
-    def comments(self, number: int) -> list[str]:
-        return [c['body'] for c in self._api('GET', f'/repos/{self.repo}/issues/{number}/comments') or []]
+    def comments(self, number: int) -> list[Comment]:
+        raw = self._api('GET', f'/repos/{self.repo}/issues/{number}/comments') or []
+        return [Comment(id=c['id'], body=c['body']) for c in raw]
+
+    def delete_comment(self, number: int, comment_id: int) -> None:
+        # Comment ids are repo-scoped here, so the issue number is not in the path. The store still
+        # passes it: a vendor that scopes ids per issue must be expressible without changing the
+        # protocol.
+        self._api('DELETE', f'/repos/{self.repo}/issues/comments/{comment_id}')
 
     def labels(self, number: int) -> list[str]:
         return [x['name'] for x in self._api('GET', f'/repos/{self.repo}/issues/{number}/labels') or []]
@@ -178,8 +210,7 @@ class GiteaForge:
     def retire_work_item(self, number: int) -> None:
         """Close and retitle. This deployment is not configured to let the API delete an issue, and
         an unavailable capability is not one to paper over -- the item stays, visibly spent."""
-        item = self._api('GET', f'/repos/{self.repo}/issues/{number}')
-        title = item['title']
+        title = self._api('GET', f'/repos/{self.repo}/issues/{number}')['title']
         suffix = '' if title.endswith(' (retired)') else ' (retired)'
         self._api('PATCH', f'/repos/{self.repo}/issues/{number}', {'state': 'closed', 'title': f'{title}{suffix}'})
 
@@ -244,15 +275,28 @@ class GiteaForge:
         raise ForgeError(msg)
 
 
-#: What must be MEASURED before `GitHubForge` can be written. Not read in a document -- raced, the
-#: way the Gitea numbers in `forge_store` were, because every one of these was a surprise there.
+#: What must be MEASURED before `GitHubForge` can be written. Raced, not read: documentation is
+#: evidence about intent, not about behaviour, and every Gitea behaviour this package relies on was
+#: a surprise when raced.
 GITHUB_UNMEASURED = (
-    'label identity: are GitHub labels addressed by name (no id lookup, no create step)?',
-    'label creation: does adding an unknown label to an issue create it, or 422?',
+    (
+        'the claim protocol itself: sixteen threads from a barrier onto one fresh issue, FOUR '
+        'independent rounds, exactly one winner per round -- one round is what a broken protocol '
+        'also does most of the time'
+    ),
+    (
+        'read-after-write on the comment list: GitHub is distributed, so a lower-id comment being '
+        'visible to a later reader is UNVERIFIED there and is the protocol precondition'
+    ),
+    'comment ids: server-assigned, monotonic and unique across concurrent posts',
+    'comment deletion: can a comment be deleted, and does a loser withdrawing race safely?',
+    (
+        'label identity: are labels addressed by name (no id lookup, no create step), and does '
+        'attaching an unknown label create it or 422?'
+    ),
     'pagination: the per_page ceiling, and whether `state=all` is the same spelling',
     'search: is the issues index reliable, or does it lag as Gitea 1.26.4 does?',
     'deletion: can an issue be deleted at all, or is close-and-retitle the only retirement?',
-    'the git URL and how the credential helper is keyed for github.com',
     'rate limiting: what a runner fleet does to the hourly budget, and what a 403 looks like',
 )
 
@@ -261,14 +305,21 @@ class GitHubForge:
     """GitHub. **NOT IMPLEMENTED, ON PURPOSE**, and this refusal is the honest deliverable.
 
     The user's constraint is that the system work on BOTH forges, and the seam for it is `Forge`.
-    What is NOT available is a GitHub instance to race, and every single Gitea behaviour this
-    package depends on was a SURPRISE when measured: the assignee is not a CAS, `POST /labels`
-    accepts duplicates, `POST /git/refs` is 405, and `?q=` returns nothing for issues that exist. A
-    GitHub client written from the documentation would be four more guesses wearing the same
-    interface -- a declaration that lies, which this project treats as its dominant defect class.
+    What is NOT available is a GitHub instance to race, and the claim protocol's soundness rests on
+    a property of the DEPLOYMENT rather than of the API: read-after-write consistency on the comment
+    list. Our Gitea is a single node behind one database and was measured -- sixteen racers, four
+    rounds, one winner each. GitHub is a distributed system, and whether a runner there can read a
+    list that is missing a lower-id comment posted moments earlier is simply unknown. A client
+    shipped on the assumption that it behaves like this Gitea would produce duplicate execution
+    rarely, silently, and only under load: a declaration that lies, which this project treats as its
+    dominant defect class.
+
+    Every Gitea behaviour here was a surprise when raced -- the assignee is not a CAS, duplicate
+    labels are accepted, `POST /git/refs` is 405, `?q=` misses issues that exist. Four guesses would
+    have been four defects.
 
     So the class exists, satisfies the protocol structurally, and refuses at the call. See
-    :data:`GITHUB_UNMEASURED` for the list; each line is one experiment.
+    :data:`GITHUB_UNMEASURED`; each line is one experiment, and the first two are the blocking ones.
     """
 
     def __init__(self, repo: str, base_url: str = 'https://api.github.com') -> None:
@@ -282,20 +333,20 @@ class GitHubForge:
             f'Race these against a real repo first, then write it:\n  - {lines}'
         )
 
-    def git_url(self) -> str:
-        raise self._unmeasured('git_url')
-
     def list_work_items(self) -> list[WorkItem]:
         raise self._unmeasured('list_work_items')
 
     def create_work_item(self, *, title: str, body: str) -> int:
         raise self._unmeasured('create_work_item')
 
-    def add_comment(self, number: int, body: str) -> None:
+    def add_comment(self, number: int, body: str) -> int:
         raise self._unmeasured('add_comment')
 
-    def comments(self, number: int) -> list[str]:
+    def comments(self, number: int) -> list[Comment]:
         raise self._unmeasured('comments')
+
+    def delete_comment(self, number: int, comment_id: int) -> None:
+        raise self._unmeasured('delete_comment')
 
     def labels(self, number: int) -> list[str]:
         raise self._unmeasured('labels')

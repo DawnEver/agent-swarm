@@ -1,26 +1,26 @@
-"""`ForgeStore`: the SAME contract as `test_store.py`, plus what only a real backend can get wrong.
+"""`ForgeStore`: the SAME contract as `test_store.py`, plus what only a real server can settle.
 
-THE CONTRACT SUITE IS REUSED, NOT RESTATED. `TestForgeStoreSatisfiesTheContract*` subclass the
-classes in `test_store.py` and override one fixture. Every assertion there -- including the
-sixteen-thread race -- runs unchanged against the real server. Copying them here would have let the
-two drift, and the copy would inevitably have been the weaker one.
+THE CONTRACT SUITE IS REUSED, NOT RESTATED. The `...SatisfiesTheContract` classes subclass the ones
+in `test_store.py` and override a single fixture. Every assertion there -- including the
+sixteen-thread race -- runs unchanged, twice: once against an in-memory forge and once against the
+real server. Copying them here would have let the two drift, and the copy would inevitably have been
+the weaker one.
 
-WHY THE REF AND NOT THE ASSIGNEE. Measured against our Gitea 1.26.4 deployment on 2026-08-09:
+WHAT EACH HALF CAN AND CANNOT PROVE, because this is exactly where a suite lies to itself:
 
-    PATCH /issues/{n} assignees   12 concurrent racers -> 12x 201.  Last-write-wins, no CAS.
-    POST /labels (duplicate name) 12 concurrent racers -> 12x 201, 12 identical labels. No CAS.
-    POST /git/refs                405. Not enabled here.
-    git push <sha>:refs/<new>      8 concurrent racers -> exactly 1 rc=0, 7 rejected. A CAS.
+* `RecordingForge` models the two properties the protocol REQUIRES of a deployment -- ids assigned
+  by the server, monotonically, and a read that sees every earlier write. Racing the store against
+  it proves the STORE's arbitration is right. **It can never prove the DEPLOYMENT has those
+  properties**, because it was built to have them.
+* The `network` half runs the same arbitration against Gitea, where those properties are a measured
+  fact rather than a construction. That is the only half that can say the protocol HOLDS.
 
-Only the last refuses a second writer -- and, now that the system must run on GitHub too, it is
-also the ONLY atomic primitive both vendors share. A claim on any forge API field would need two
-correctness arguments and we can race only one of them.
+Neither half is a mock of the other and nothing here monkeypatches the code under test. Deselect the
+server half with `-m 'not network'`.
 
-THE OFFLINE HALF IS NOT A MOCK OF THE ONLINE HALF. It tests the pure decisions -- which ref name a
-job contends for, what the lease payload says, which words are refused, whether any vendor leaked
-into the logic -- and those are exactly the places where a wrong answer would make the online CAS
-silently stop being one. Deselect the rest with `-m 'not network'`; nothing here monkeypatches the
-code under test.
+FOUR ROUNDS, NOT ONE, for the race against the real server. One round electing one winner is what a
+BROKEN protocol also does most of the time -- the failure being tested for is rare by construction,
+so the evidence has to repeat.
 """
 
 from __future__ import annotations
@@ -35,9 +35,14 @@ from pathlib import Path
 import pytest
 
 from agent_swarm import forge_store as forge_store_module
-from agent_swarm.forge import Forge, GiteaForge, WorkItem, default_forge
-from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore, claim_ref, decode_claim, encode_claim
-from agent_swarm.job import AGENT_TASK, TEST_RUN, Job
+from agent_swarm.forge import Comment, Forge, GiteaForge, WorkItem, default_forge
+from agent_swarm.forge_store import (
+    VERDICT_LABELS,
+    ForgeStore,
+    decode_claim,
+    encode_claim,
+)
+from agent_swarm.job import TEST_RUN, Job
 from agent_swarm.store import VERDICTS, Store
 
 # Imported under private names ON PURPOSE: a name starting with `Test` is COLLECTED wherever it is
@@ -50,61 +55,196 @@ from test_store import TestVerdictsAreRecorded as _VerdictContract
 JOB = Job(id='j1', kind=TEST_RUN)
 
 
+def _race_one_round(namespace: str, job: Job, *, racers: int) -> list[str]:
+    """Release `racers` threads at one job from a barrier; return everyone who believed they won.
+
+    A FUNCTION AND NOT AN INLINE LOOP BODY: the closure captures the barrier, lock and winner list,
+    and rebinding those per round inside a loop makes the thread bodies share whichever objects the
+    LAST iteration created. It happens to be safe while every round joins before the next begins --
+    which is exactly the kind of "safe for now" that a later edit turns into a race inside the test
+    for races.
+    """
+    winners: list[str] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(racers)
+    stores = [ForgeStore(namespace, default_forge()) for _ in range(racers)]
+
+    def attempt(n: int) -> None:
+        barrier.wait()
+        if stores[n].try_claim(job, owner=f'r{n:02d}'):
+            with lock:
+                winners.append(f'r{n:02d}')
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(racers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return winners
+
+
 class RecordingForge:
-    """A second, in-memory implementation of `Forge`. It exists to prove the seam is REAL.
+    """An in-memory `Forge` that MODELS THE PRECONDITION, and says so.
 
-    NOT A MOCK OF THE CODE UNDER TEST. The code under test is `ForgeStore`'s logic; this is a
-    genuine alternative backend, and the fact that the store's verdict behaviour is identical
-    against it and against Gitea is the portability claim, stated as a test rather than as prose.
+    It assigns comment ids from a single counter under a lock -- server-assigned, monotonic, unique
+    -- and every read sees every completed write. Those are precisely the two properties the claim
+    protocol requires of a deployment, and they are here by CONSTRUCTION.
 
-    It deliberately does NOT implement `git_url`: claims are git, not forge, so a claim cannot be
-    faked here -- and anything that tried would be testing the fake instead of the CAS.
+    So: a green run against this forge is evidence that `ForgeStore`'s arbitration is correct. It is
+    NOT evidence that any real forge has these properties, and no amount of it ever will be. That is
+    what the `network` tests are for, and why they were measured before this was written.
+
+    It is not a mock of the code under test -- the store's logic runs unmodified against it -- and
+    it is a second genuine backend, which is what makes the vendor-neutrality claim checkable.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_id = 1
         self.items: dict[int, WorkItem] = {}
-        self.item_comments: dict[int, list[str]] = {}
+        self.bodies: dict[int, str] = {}
+        self._comments: dict[int, list[Comment]] = {}
         self.item_labels: dict[int, list[str]] = {}
         self.retired: list[int] = []
 
-    def git_url(self) -> str:
-        msg = 'RecordingForge has no git remote: a claim is a real ref push or it is not a claim'
-        raise NotImplementedError(msg)
-
     def list_work_items(self) -> list[WorkItem]:
-        return list(self.items.values())
+        with self._lock:
+            return list(self.items.values())
 
     def create_work_item(self, *, title: str, body: str) -> int:
-        number = len(self.items) + 1
-        self.items[number] = WorkItem(number=number, title=title, state='open')
-        self.item_comments[number] = [body]
-        self.item_labels[number] = []
-        return number
+        with self._lock:
+            number = len(self.items) + 1
+            self.items[number] = WorkItem(number=number, title=title, state='open')
+            self.bodies[number] = body
+            self._comments[number] = []
+            self.item_labels[number] = []
+            return number
 
-    def add_comment(self, number: int, body: str) -> None:
-        self.item_comments[number].append(body)
+    def add_comment(self, number: int, body: str) -> int:
+        with self._lock:
+            # THE COUNTER IS THE POINT. A per-issue index, or a timestamp, would not be a
+            # server-assigned monotonic key and the store's arbitration would be untested.
+            comment_id = self._next_id
+            self._next_id += 1
+            self._comments[number].append(Comment(id=comment_id, body=body))
+            return comment_id
 
-    def comments(self, number: int) -> list[str]:
-        return list(self.item_comments[number])
+    def comments(self, number: int) -> list[Comment]:
+        with self._lock:
+            return list(self._comments[number])
+
+    def delete_comment(self, number: int, comment_id: int) -> None:
+        with self._lock:
+            self._comments[number] = [c for c in self._comments[number] if c.id != comment_id]
 
     def labels(self, number: int) -> list[str]:
-        return list(self.item_labels[number])
+        with self._lock:
+            return list(self.item_labels[number])
 
     def add_label(self, number: int, name: str) -> None:
-        self.item_labels[number].append(name)
+        with self._lock:
+            self.item_labels[number].append(name)
 
     def remove_label(self, number: int, name: str) -> None:
-        self.item_labels[number] = [x for x in self.item_labels[number] if x != name]
+        with self._lock:
+            self.item_labels[number] = [x for x in self.item_labels[number] if x != name]
 
     def close_work_item(self, number: int) -> None:
-        self.items[number] = WorkItem(number=number, title=self.items[number].title, state='closed')
+        with self._lock:
+            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='closed')
 
     def state(self, number: int) -> str:
-        return self.items[number].state
+        with self._lock:
+            return self.items[number].state
 
     def retire_work_item(self, number: int) -> None:
         self.retired.append(number)
         self.close_work_item(number)
+
+
+@pytest.fixture
+def recording_forge():
+    return RecordingForge()
+
+
+@pytest.fixture
+def memory_store(recording_forge):
+    return ForgeStore('ns', recording_forge)
+
+
+# --------------------------------------------------------------------------------------------
+# The claim comment, pure.
+# --------------------------------------------------------------------------------------------
+
+
+class TestTheClaimCommentIsReadableBothWays:
+    def test_it_round_trips(self):
+        claim = decode_claim(encode_claim(owner='runner-a', expires_at=1000.0), comment_id=7)
+        assert claim.owner == 'runner-a'
+        assert claim.expires_at == pytest.approx(1000.0)
+        assert claim.comment_id == 7
+
+    def test_it_is_readable_by_a_HUMAN_scrolling_the_issue(self):
+        """The forge is also the UI. An operator must be able to see who holds a job, and until
+        when, without running a tool.
+        """
+        assert encode_claim(owner='runner-a', expires_at=1000.0).startswith('CLAIM ')
+        assert 'runner-a' in encode_claim(owner='runner-a', expires_at=1000.0)
+
+    def test_an_owner_containing_a_SPACE_survives_the_round_trip(self):
+        """The expiry is encoded first so the owner can be the whole remainder. Truncating an owner
+        at its first word would give two machines one identity -- and a release by either would
+        then free the other's claim.
+        """
+        assert decode_claim(encode_claim(owner='box 7 runner a', expires_at=1.0)).owner == 'box 7 runner a'
+
+    def test_a_NON_claim_comment_decodes_to_None(self):
+        """Claims and verdicts share one comment stream, so 'this is not a claim' must be an
+        ordinary answer rather than an error.
+        """
+        assert decode_claim('**PASS**\n\n```\n10646 passed\n```') is None
+
+    def test_a_MALFORMED_claim_RAISES_instead_of_decoding_to_None(self):
+        """THE DISTINCTION IS THE WHOLE POINT. If an unreadable claim returned `None` it would be
+        skipped exactly like a verdict comment -- so a live claim in a format this version cannot
+        read would be invisible, and a second runner would take a running job.
+        """
+        with pytest.raises(ValueError, match='claim'):
+            decode_claim('CLAIM not-a-number runner-a')
+        with pytest.raises(ValueError, match='claim'):
+            decode_claim('CLAIM 12345')
+
+    def test_a_fresh_claim_is_not_expired(self):
+        assert decode_claim(encode_claim(owner='a', expires_at=time.time() + 300)).is_expired(now=time.time()) is False
+
+    def test_a_claim_past_its_expiry_IS_expired(self):
+        assert decode_claim(encode_claim(owner='a', expires_at=1000.0)).is_expired(now=1000.5) is True
+
+    def test_the_boundary_instant_is_still_HELD(self):
+        assert decode_claim(encode_claim(owner='a', expires_at=1000.0)).is_expired(now=1000.0) is False
+
+
+class TestNoRefMechanismSURVIVED:
+    """Refs are abandoned entirely (user directive 2026-08-09). A deleted mechanism that leaves a
+    helper behind is a mechanism that comes back the first time someone needs one.
+    """
+
+    def test_the_store_module_runs_no_git_and_names_no_ref(self):
+        source = Path(forge_store_module.__file__).read_text(encoding='utf-8')
+        code = [
+            token.string
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+            if token.type not in (tokenize.STRING, tokenize.COMMENT)
+        ]
+        # EXACT identifiers, not substrings: `title_prefix` contains "ref" and would make this
+        # assertion unpassable, which is how a check gets weakened until it means nothing.
+        banned = {'ref', 'refs', 'claim_ref', 'git', 'push', '_push', '_git', 'subprocess', 'ls_remote', 'commit_tree'}
+        offenders = sorted({t for t in code if t.lower() in banned})
+        assert not offenders, f'ref machinery still in the store: {offenders}'
+
+    def test_the_module_imports_no_SUBPROCESS(self):
+        assert not hasattr(forge_store_module, 'subprocess')
+        assert not hasattr(forge_store_module, 'claim_ref')
 
 
 class TestNoVendorLEAKEDIntoTheLogic:
@@ -137,127 +277,122 @@ class TestNoVendorLEAKEDIntoTheLogic:
         with pytest.raises(TypeError):
             ForgeStore('ns')  # type: ignore[call-arg]
 
-    def test_the_verdict_half_behaves_the_same_against_a_DIFFERENT_backend(self):
-        """The portability claim, offline. Same logic, a backend that shares no code with Gitea."""
-        store = ForgeStore('ns', RecordingForge())
-        store.record_verdict(JOB, verdict='FAIL', detail='3 failed')
-        assert store.verdict(JOB) == 'FAIL'
-        assert store.item_state(JOB) == 'closed'
-        assert '3 failed' in store.verdict_detail(JOB)
-
-    def test_the_sole_verdict_label_rule_lives_in_the_STORE_not_the_vendor(self):
-        """A retry after INCONCLUSIVE must leave one label, and it must do so on every backend --
-        so the rule cannot be a vendor's. Checked here against the backend that has no such rule.
-        """
-        forge = RecordingForge()
-        store = ForgeStore('ns', forge)
-        store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
-        store.record_verdict(JOB, verdict='PASS', detail='green on retry')
-        number = forge.list_work_items()[0].number
-        assert [x for x in forge.labels(number) if x.startswith('verdict:')] == ['verdict:pass']
-
-    def test_retirement_is_DELEGATED_never_spelled_out(self):
+    def test_retirement_is_DELEGATED_never_spelled_out(self, memory_store, recording_forge):
         """Gitea cannot delete an issue here and closes-and-retitles instead; another forge may
         hard-delete. The store must ask, not decide, or cleanup grows a vendor conditional.
         """
-        forge = RecordingForge()
-        store = ForgeStore('ns', forge)
-        store.record_verdict(JOB, verdict='PASS', detail='')
-        with pytest.raises(NotImplementedError):
-            store.purge_namespace()  # refs first, and this fake has no git remote
-        assert forge.retired == [], 'the ref purge must not be skipped to reach the items'
+        memory_store.record_verdict(JOB, verdict='PASS', detail='')
+        memory_store.purge_namespace()
+        assert recording_forge.retired == [1]
+
+    def test_purging_cannot_reach_ANOTHER_namespace(self, recording_forge):
+        ForgeStore('ns-a', recording_forge).record_verdict(JOB, verdict='PASS', detail='')
+        ForgeStore('ns-b', recording_forge).purge_namespace()
+        assert recording_forge.retired == []
 
 
-class TestTheRefNameIsTheContentionTOKEN:
-    """The owner must NOT appear in the ref name. Everything else is a detail; this is the design.
+class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
+    """Behaviour the contract suite does not reach, checked against the modelled forge."""
 
-    A create-only push is a CAS over ONE NAME. Put the owner in the name and sixteen runners push
-    sixteen different refs, every one of them succeeds, and `try_claim` returns True to all of them
-    while still looking, in the log, exactly like a CAS. That is push-then-arbitrate wearing the
-    new interface's clothes -- so the owner goes in the pushed COMMIT, which the winner alone gets
-    to write.
-    """
+    def test_a_REFUSED_claimant_withdraws_its_comment(self, memory_store, recording_forge):
+        """Not tidiness. See the next test for what an abandoned one does."""
+        memory_store.try_claim(JOB, owner='runner-a')
+        before = len(recording_forge.comments(1))
+        assert memory_store.try_claim(JOB, owner='runner-b') is False
+        assert len(recording_forge.comments(1)) == before, 'the loser left its claim comment behind'
 
-    def test_two_owners_contend_for_the_SAME_ref(self):
-        assert claim_ref('ns', JOB) == claim_ref('ns', JOB)
-
-    def test_the_owner_appears_nowhere_in_the_ref(self):
-        assert 'runner-a' not in claim_ref('ns', JOB)
-
-    def test_different_jobs_get_different_refs(self):
-        assert claim_ref('ns', JOB) != claim_ref('ns', Job(id='j2', kind=TEST_RUN))
-
-    def test_the_KIND_separates_two_jobs_of_one_id(self):
-        """`claim_key` already says so; the ref must not flatten it back together."""
-        assert claim_ref('ns', JOB) != claim_ref('ns', Job(id='j1', kind=AGENT_TASK))
-
-    def test_namespaces_do_not_collide(self):
-        assert claim_ref('ns-a', JOB) != claim_ref('ns-b', JOB)
-
-    def test_it_is_under_refs_claims_and_touches_no_reserved_namespace(self):
-        """`refs/heads`, `refs/candidates`, `refs/verdicts` and `refs/ci` belong to other systems."""
-        assert claim_ref('ns', JOB).startswith('refs/claims/')
-
-    def test_a_key_with_ref_hostile_characters_is_still_a_LEGAL_ref(self):
-        """Git refuses `..`, a trailing `.lock`, spaces and `~^:?*[`. An id is free text, so an
-        unsanitised one turns a claim into a push that always fails -- a job nothing can ever take.
+    def test_a_refused_claim_does_not_ACTIVATE_when_the_holder_releases(self, memory_store):
+        """THE FAILURE THAT MAKES WITHDRAWAL MANDATORY. A refused comment left in place becomes the
+        lowest LIVE claim the moment the holder releases -- and the runner that was told False now
+        reads itself as owning a job it never started. Nothing errors; it simply becomes true later.
         """
-        ref = claim_ref('ns', Job(id='a b..c~d:e.lock', kind=TEST_RUN))
-        assert '..' not in ref
-        assert not any(c in ref for c in ' ~^:?*[\\')
-        assert not ref.endswith('.lock')
+        memory_store.try_claim(JOB, owner='runner-a')
+        assert memory_store.try_claim(JOB, owner='runner-b') is False
+        memory_store.release(JOB, owner='runner-a')
+        assert memory_store.claim_owner(JOB) is None
 
-    def test_sanitising_does_not_MERGE_two_distinct_ids(self):
-        """The cheap sanitiser maps `a b` and `a-b` onto one name, and two different jobs sharing a
-        claim is the deadlock the mechanism exists to prevent -- silently, since neither errors.
+    def test_a_re_claim_by_the_HOLDER_leaves_the_original_claim_intact(self, memory_store):
+        """The contract refuses it; this checks the refusal did not damage the live claim on its way
+        out -- withdrawing the wrong comment would free a job that is being worked on.
         """
-        assert claim_ref('ns', Job(id='a b', kind=TEST_RUN)) != claim_ref('ns', Job(id='a-b', kind=TEST_RUN))
+        memory_store.try_claim(JOB, owner='runner-a')
+        assert memory_store.try_claim(JOB, owner='runner-a') is False
+        assert memory_store.claim_owner(JOB) == 'runner-a'
 
-
-class TestTheLeaseIsCARRIEDByTheClaim:
-    """A create-only ref has no expiry, so a machine that dies holds the job forever.
-
-    The payload is what fixes that, and it is why the owner and the timestamp must travel in the
-    commit rather than the name: the name is spent on being identical for every racer.
-    """
-
-    def test_the_payload_round_trips(self):
-        claim = decode_claim(encode_claim(owner='runner-a', claimed_at=1000.0, lease_seconds=300.0))
-        assert claim.owner == 'runner-a'
-        assert claim.claimed_at == pytest.approx(1000.0)
-        assert claim.lease_seconds == pytest.approx(300.0)
-
-    def test_a_fresh_claim_is_not_expired(self):
-        claim = decode_claim(encode_claim(owner='a', claimed_at=time.time(), lease_seconds=300.0))
-        assert claim.is_expired(now=time.time()) is False
-
-    def test_a_claim_past_its_lease_IS_expired(self):
-        claim = decode_claim(encode_claim(owner='a', claimed_at=1000.0, lease_seconds=300.0))
-        assert claim.is_expired(now=1301.0) is True
-
-    def test_the_boundary_is_not_yet_expired(self):
-        claim = decode_claim(encode_claim(owner='a', claimed_at=1000.0, lease_seconds=300.0))
-        assert claim.is_expired(now=1300.0) is False
-
-    def test_an_UNREADABLE_payload_raises_rather_than_reading_as_unheld(self):
-        """ "Corrupt" must not decode to "free". A claim nobody can parse is one a second runner
-        would take while the first is still working -- the exact failure the CAS removes.
+    def test_an_EXPIRED_claim_is_taken_over_by_the_next_racer(self, recording_forge):
+        """A machine that dies must not park a job forever. There is deliberately no separate
+        takeover path: the dead claim stops counting and ordinary arbitration elects the next one.
         """
-        with pytest.raises(ValueError, match='claim'):
-            decode_claim('not json at all')
+        dying = ForgeStore('ns', recording_forge, lease_seconds=0.4)
+        assert dying.try_claim(JOB, owner='runner-dead') is True
+        time.sleep(0.6)
+        assert dying.claim_owner(JOB) is None, 'an expired claim must read as unheld'
+        assert ForgeStore('ns', recording_forge).try_claim(JOB, owner='runner-b') is True
 
-    def test_a_payload_missing_the_OWNER_raises(self):
-        with pytest.raises(ValueError, match='claim'):
-            decode_claim('{"claimed_at": 1.0, "lease_seconds": 2.0}')
+    def test_a_LIVE_claim_is_never_taken_over(self, memory_store):
+        assert memory_store.try_claim(JOB, owner='runner-a') is True
+        assert memory_store.try_claim(JOB, owner='runner-b') is False
+        assert memory_store.claim_owner(JOB) == 'runner-a'
 
-    def test_each_attempt_encodes_a_DISTINCT_nonce(self):
-        """Two attempts by the same owner in the same second would otherwise build a byte-identical
-        commit, hence the same sha -- and `git push` calls pushing a ref to the value it already has
-        a SUCCESS. The CAS would answer True to a re-claim it is contractually required to refuse.
+    def test_a_ZERO_lease_is_refused_at_CONSTRUCTION(self, recording_forge):
+        """A zero lease expires the claim being made, so every runner refuses forever and the job
+        silently never runs -- which reads as healthy contention rather than as a bug.
         """
-        one = encode_claim(owner='a', claimed_at=1000.0, lease_seconds=300.0)
-        two = encode_claim(owner='a', claimed_at=1000.0, lease_seconds=300.0)
-        assert one != two
+        with pytest.raises(ValueError, match='lease_seconds'):
+            ForgeStore('ns', recording_forge, lease_seconds=0.0)
+
+    def test_the_verdict_detail_is_not_a_CLAIM_comment(self, memory_store):
+        """Claims and verdicts share one comment stream. A job claimed after its verdict would
+        otherwise hand back `CLAIM ...` as gate.py's output -- plausible, wrong, unflagged.
+        """
+        memory_store.record_verdict(JOB, verdict='FAIL', detail='3 failed, 10643 passed')
+        memory_store.try_claim(JOB, owner='runner-a')
+        assert '3 failed, 10643 passed' in memory_store.verdict_detail(JOB)
+
+    def test_the_sole_verdict_label_rule_lives_in_the_STORE(self, memory_store, recording_forge):
+        """A retry after INCONCLUSIVE must leave ONE label on every backend, so the rule cannot be a
+        vendor's. Checked against the backend that has no such rule of its own.
+        """
+        memory_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
+        memory_store.record_verdict(JOB, verdict='PASS', detail='green on retry')
+        assert [x for x in recording_forge.labels(1) if x.startswith('verdict:')] == ['verdict:pass']
+
+    def test_concurrent_claimants_do_not_each_create_their_OWN_work_item(self, recording_forge):
+        """The store-logic half of the creation race. It cannot prove the server's issue numbers are
+        monotonic -- that is the network test's job -- but it does prove the store converges on the
+        lowest one and retires its own duplicate instead of leaving it in the list.
+        """
+        job = Job(id='fresh-item', kind=TEST_RUN)
+        stores = [ForgeStore('ns', recording_forge) for _ in range(8)]
+        winners: list[int] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def attempt(n: int) -> None:
+            barrier.wait()
+            if stores[n].try_claim(job, owner=f'r{n}'):
+                with lock:
+                    winners.append(n)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # CONVERGENCE is the vendor-neutral property, not "one item exists". Whether a retired
+        # duplicate disappears from a title search is the FORGE's business -- this deployment
+        # retitles, another may hard-delete -- and asserting it here would put a vendor behaviour
+        # in a vendor-agnostic test. What must hold everywhere is that every racer resolved to the
+        # same item, because that is what makes their comments contend at all.
+        resolved = {store._item_number(job) for store in stores}
+        assert len(resolved) == 1, f'racers used different work items: {resolved}'
+        assert len(winners) == 1, f'{len(winners)} runners believed they won: {winners}'
+
+    def test_two_jobs_do_not_share_a_work_item(self, memory_store):
+        other = Job(id='j2', kind=TEST_RUN)
+        assert memory_store.try_claim(JOB, owner='a') is True
+        assert memory_store.try_claim(other, owner='b') is True
 
 
 class TestTheVerdictVocabularyIsClosedBEFOREAnyIO:
@@ -276,30 +411,54 @@ class TestTheVerdictVocabularyIsClosedBEFOREAnyIO:
 
 
 class TestItIsAStore:
-    def test_the_protocol_is_satisfied(self):
-        assert isinstance(ForgeStore('probe-never-contacted', RecordingForge()), Store)
+    def test_the_protocol_is_satisfied(self, memory_store):
+        assert isinstance(memory_store, Store)
 
-    def test_it_holds_a_forge_rather_than_BEING_one(self):
+    def test_it_holds_a_forge_rather_than_BEING_one(self, memory_store):
         """Storage is a collaborator, not a base class. Inheriting the vendor client would put the
         decisions and the I/O in one object, and the vendor half is the half we cannot test twice.
         """
-        assert not isinstance(ForgeStore('ns', RecordingForge()), Forge)
+        assert not isinstance(memory_store, Forge)
 
 
 # --------------------------------------------------------------------------------------------
-# Everything below talks to the real server.
+# The contract, against the modelled forge. Proves the STORE; cannot prove a deployment.
+# --------------------------------------------------------------------------------------------
+
+
+class TestTheStoreLogicSatisfiesTheContract(_ClaimContract):
+    @pytest.fixture
+    def store(self, memory_store):
+        return memory_store
+
+
+class TestTheStoreLogicArbitratesUnderThreads(_AtomicityContract):
+    @pytest.fixture
+    def store(self, memory_store):
+        return memory_store
+
+
+class TestTheStoreLogicRecordsVerdicts(_VerdictContract):
+    @pytest.fixture
+    def store(self, memory_store):
+        return memory_store
+
+
+# --------------------------------------------------------------------------------------------
+# Everything below talks to the real server, where the ordering properties are MEASURED FACTS
+# rather than constructions.
 # --------------------------------------------------------------------------------------------
 
 
 @pytest.fixture
-def forge_backed_store():
+def server_store():
     """A store in a namespace nobody else owns, purged afterwards.
 
     THE NAMESPACE IS PER-TEST because the server is shared and the contract suite hard-codes one
-    job id. Two runs of this file at once would otherwise contend for one claim ref and each would
+    job id. Two runs of this file at once would otherwise contend for one work item, and each would
     report the other's claim as a contract violation.
     """
-    store = ForgeStore(f'probe-{uuid.uuid4().hex[:12]}', default_forge())
+    store = ForgeStore(f'probe-p3-{uuid.uuid4().hex[:10]}', default_forge())
     try:
         yield store
     finally:
@@ -307,93 +466,136 @@ def forge_backed_store():
 
 
 @pytest.mark.network
-class TestForgeStoreSatisfiesTheContract(_ClaimContract):
+class TestTheRealServerSatisfiesTheContract(_ClaimContract):
     @pytest.fixture
-    def store(self, forge_backed_store):
-        return forge_backed_store
+    def store(self, server_store):
+        return server_store
 
 
 @pytest.mark.network
-class TestForgeStoreIsAtomicOnTheRealServer(_AtomicityContract):
+class TestTheRealServerElectsOneWinner(_AtomicityContract):
     @pytest.fixture
-    def store(self, forge_backed_store):
-        return forge_backed_store
+    def store(self, server_store):
+        return server_store
 
 
 @pytest.mark.network
-class TestForgeStoreRecordsVerdicts(_VerdictContract):
+class TestTheRealServerRecordsVerdicts(_VerdictContract):
     @pytest.fixture
-    def store(self, forge_backed_store):
-        return forge_backed_store
+    def store(self, server_store):
+        return server_store
 
 
 @pytest.mark.network
-class TestWhatOnlyTheRealBackendCanGetWrong:
-    def test_an_EXPIRED_lease_is_reclaimable_by_someone_else(self, forge_backed_store):
-        """A create-only ref never expires on its own, so without this a crashed machine takes the
-        job out of the fleet permanently -- and it looks healthy, because the claim is valid.
+class TestWhatOnlyTheRealServerCanSettle:
+    def test_FOUR_rounds_each_elect_exactly_one_winner(self, server_store):
+        """THE DISCRIMINATING TEST, and one round is not enough of it.
+
+        The failure mode -- two runners both reading themselves lowest -- is rare by construction,
+        so a single round electing a single winner is what a BROKEN protocol also does most of the
+        time. Four independent rounds on four fresh work items, sixteen threads released together
+        from a barrier, is the evidence the protocol was accepted on.
         """
-        short = ForgeStore(forge_backed_store.namespace, default_forge(), lease_seconds=0.0)
-        assert short.try_claim(JOB, owner='runner-dead') is True
-        assert short.claim_owner(JOB) is None, 'an expired claim must read as unheld'
-        assert short.try_claim(JOB, owner='runner-b') is True
+        for round_number in range(4):
+            job = Job(id=f'round{round_number}', kind=TEST_RUN)
+            winners = _race_one_round(server_store.namespace, job, racers=16)
+            assert len(winners) == 1, f'round {round_number}: {len(winners)} believed they won: {winners}'
+            assert server_store.claim_owner(job) == winners[0]
 
-    def test_a_LIVE_lease_is_not_stolen(self, forge_backed_store):
-        assert forge_backed_store.try_claim(JOB, owner='runner-a') is True
-        assert forge_backed_store.try_claim(JOB, owner='runner-b') is False
-        assert forge_backed_store.claim_owner(JOB) == 'runner-a'
+    def test_concurrent_claimants_converge_on_ONE_work_item(self, server_store):
+        """THE BUG THE FOUR-ROUND RACE CAUGHT, pinned with the assertion that names it.
 
-    def test_exactly_one_thread_wins_an_EXPIRED_claim_too(self, forge_backed_store):
-        """The takeover path is a second write path to the same ref, and a second write path is
-        where a CAS quietly stops being one. Racing it is the only way to say it still holds.
+        The protocol arbitrates comments on "the job's work item" -- and when that item does not
+        exist yet, creating it is itself an unarbitrated race. Sixteen runners read an empty list,
+        create sixteen issues, and each then arbitrates perfectly on its OWN: 16/16 winners, with
+        every individual claim correct. Counting winners alone would leave the cause ambiguous, so
+        this counts the ITEMS.
         """
-        dead = ForgeStore(forge_backed_store.namespace, default_forge(), lease_seconds=0.0)
-        dead.try_claim(JOB, owner='runner-dead')
-
-        live = [ForgeStore(forge_backed_store.namespace, default_forge()) for _ in range(8)]
-        winners: list[str] = []
+        job = Job(id='fresh-item', kind=TEST_RUN)
+        stores = [ForgeStore(server_store.namespace, default_forge()) for _ in range(16)]
+        winners: list[int] = []
         lock = threading.Lock()
-        barrier = threading.Barrier(8)
+        barrier = threading.Barrier(16)
 
         def attempt(n: int) -> None:
             barrier.wait()
-            if live[n].try_claim(JOB, owner=f'runner-{n}'):
+            if stores[n].try_claim(job, owner=f'r{n:02d}'):
                 with lock:
-                    winners.append(f'runner-{n}')
+                    winners.append(n)
 
-        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(8)]
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(16)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        assert len(winners) == 1, f'{len(winners)} runners took over one expired claim: {winners}'
-        assert forge_backed_store.claim_owner(JOB) == winners[0]
+        resolved = {store._item_number(job) for store in stores}
+        assert len(resolved) == 1, f'racers arbitrated on different work items: {resolved}'
+        assert len(winners) == 1, f'{len(winners)} runners believed they won: {winners}'
 
-    def test_the_verdict_survives_a_FRESH_store_object(self, forge_backed_store):
+    def test_comment_ids_come_back_MONOTONIC_under_concurrency(self, server_store):
+        """The property the whole protocol rests on, asserted rather than assumed. If ids were not
+        server-assigned and increasing, a later racer could carry a lower key -- which is precisely
+        the `ci_tick` defect this replaces, reintroduced by the storage layer.
+        """
+        forge = default_forge()
+        number = forge.create_work_item(title=f'[swarm] {server_store.namespace}/idprobe', body='probe')
+        posted: list[int] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def post(n: int) -> None:
+            barrier.wait()
+            got = forge.add_comment(number, f'CLAIM 99999999999 r{n}')
+            with lock:
+                posted.append(got)
+
+        threads = [threading.Thread(target=post, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        listed = [c.id for c in forge.comments(number)]
+        assert len(set(posted)) == 8, f'ids were not unique: {sorted(posted)}'
+        assert listed == sorted(listed), f'the list came back out of id order: {listed}'
+        assert sorted(posted) == listed, 'a post was not visible in the list it belongs to'
+
+    def test_a_LIVE_claim_is_not_stolen(self, server_store):
+        assert server_store.try_claim(JOB, owner='runner-a') is True
+        assert server_store.try_claim(JOB, owner='runner-b') is False
+        assert server_store.claim_owner(JOB) == 'runner-a'
+
+    def test_an_EXPIRED_claim_is_taken_over(self, server_store):
+        dying = ForgeStore(server_store.namespace, default_forge(), lease_seconds=0.5)
+        assert dying.try_claim(JOB, owner='runner-dead') is True
+        time.sleep(0.8)
+        assert dying.claim_owner(JOB) is None
+        assert ForgeStore(server_store.namespace, default_forge()).try_claim(JOB, owner='runner-b') is True
+
+    def test_the_verdict_survives_a_FRESH_store_object(self, server_store):
         """The point of a backing store. An in-process cache would pass every verdict test in the
         contract suite while storing nothing on the server.
         """
-        forge_backed_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
-        fresh = ForgeStore(forge_backed_store.namespace, default_forge())
-        assert fresh.verdict(JOB) == 'INCONCLUSIVE'
+        server_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
+        assert ForgeStore(server_store.namespace, default_forge()).verdict(JOB) == 'INCONCLUSIVE'
 
-    def test_the_detail_is_recorded_where_a_HUMAN_will_read_it(self, forge_backed_store):
+    def test_the_detail_is_recorded_where_a_HUMAN_will_read_it(self, server_store):
         """gate.py's output is the evidence behind the verdict; a verdict without it is a claim."""
-        forge_backed_store.record_verdict(JOB, verdict='FAIL', detail='3 failed, 10643 passed')
-        assert '3 failed, 10643 passed' in forge_backed_store.verdict_detail(JOB)
+        server_store.record_verdict(JOB, verdict='FAIL', detail='3 failed, 10643 passed')
+        assert '3 failed, 10643 passed' in server_store.verdict_detail(JOB)
 
-    def test_recording_a_verdict_CLOSES_the_item(self, forge_backed_store):
+    def test_recording_a_verdict_CLOSES_the_item(self, server_store):
         """The board column is driven by state; an answered job left open is one the lead re-reads
         every tick.
         """
-        forge_backed_store.record_verdict(JOB, verdict='PASS', detail='green')
-        assert forge_backed_store.item_state(JOB) == 'closed'
+        server_store.record_verdict(JOB, verdict='PASS', detail='green')
+        assert server_store.item_state(JOB) == 'closed'
 
-    def test_a_second_verdict_REPLACES_the_first(self, forge_backed_store):
+    def test_a_second_verdict_REPLACES_the_first(self, server_store):
         """A retry after INCONCLUSIVE must not leave the job carrying two verdict labels, since
         nothing downstream can act on a job that is both inconclusive and green.
         """
-        forge_backed_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
-        forge_backed_store.record_verdict(JOB, verdict='PASS', detail='green on retry')
-        assert forge_backed_store.verdict(JOB) == 'PASS'
+        server_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
+        server_store.record_verdict(JOB, verdict='PASS', detail='green on retry')
+        assert server_store.verdict(JOB) == 'PASS'
