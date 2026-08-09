@@ -12,12 +12,15 @@ one scheduler, not two.
 Dependency arrow strictly L2 -> L1 -> L0. The vocabulary test decides the layer: a sentence needing
 "issue/branch/gate" is swarm or project; one needing only "session/turn/node/pid" is fabric.
 
-WHAT IS HERE TODAY is `admission` -- extracted from motronics' `ci_tick.py`, where it had been
+WHAT IS HERE TODAY: `admission` (the decision layer), `job` (one model, two kinds) and `store`
+(the claim/verdict contract, with a reference in-memory implementation). `admission` -- extracted from motronics' `ci_tick.py`, where it had been
 running and measured for months, rather than written fresh. That is deliberate: M1's first block is
 the extraction, not a new scheduler. Everything in it is stdlib-only by construction so the move
 was a file move.
 """
 
+from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
+from agent_swarm.store import VERDICTS, InMemoryStore, Store
 from agent_swarm.admission import (
     CHEAP,
     KNOWN_CLASSES,
@@ -34,7 +37,14 @@ from agent_swarm.admission import (
 )
 
 __all__ = [
+    'AGENT_TASK',
     'CHEAP',
+    'VERDICTS',
+    'InMemoryStore',
+    'Job',
+    'JobKind',
+    'Store',
+    'TEST_RUN',
     'KNOWN_CLASSES',
     'SHARED_SLOWDOWN',
     'WHOLE_BOX',
