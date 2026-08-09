@@ -31,3 +31,7 @@ quote-style = "single"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The network tests are MARKED, not skipped-when-unreachable. An auto-skip on a connection error is
+# a disguise: the one run that most needs to be loud -- the server is down, or the token expired --
+# would report green. Deselect them deliberately with `-m 'not network'`.
+markers = ["network: talks to the real Gitea server"]
