@@ -20,22 +20,28 @@ test is the shipping one.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+from agent_swarm import spool as spool_module
+from agent_swarm.forge import Comment
 from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore
 from agent_swarm.job import TEST_RUN, Job
 from agent_swarm.spool import (
+    DIRECTORY_FSYNC_AVAILABLE,
     DrainReport,
     ForgePublisher,
+    PublishedTextReader,
     Publisher,
     Spool,
     SpoolBacklogError,
     SpoolCorruptError,
     SpoolEntry,
+    VerdictTamperedError,
 )
 from agent_swarm.store import VERDICTS
 from test_forge_store import RecordingForge
@@ -387,3 +393,107 @@ class TestTheSpoolFormatIsInspectable:
         spool = Spool(tmp_path / 'deep' / 'nested' / 'spool')
         spool.record(JOB, verdict='PASS', detail='')
         assert Path(spool.pending_dir).is_dir()
+
+
+class TestTamperingIsDETECTEDNeverRepaired:
+    """A comment is editable by anyone with write access, including a human "fixing" a red result.
+
+    No forge restores immutability -- locking an issue prevents new comments, not edits. The spool
+    narrows this by accident of its design: it already holds the text it published, so it can
+    compare. What it must NOT do is put the text back.
+    """
+
+    def test_an_untouched_verdict_audits_clean(self, spool, publisher):
+        spool.record(JOB, verdict='FAIL', detail='3 failed, 10643 passed')
+        spool.drain(publisher)
+        assert spool.audit(publisher) == []
+
+    def test_an_EDITED_verdict_is_reported(self, spool, publisher, forge):
+        """The named regression: someone edits a red result into a green one and nothing notices."""
+        entry = spool.record(JOB, verdict='FAIL', detail='3 failed, 10643 passed')
+        spool.drain(publisher)
+        number = publisher.store.work_item_number(JOB)
+        edited = next(c for c in forge.comments(number) if entry.marker() in c.body)
+        forge._comments[number] = [
+            Comment(id=edited.id, body=f'**PASS**\n\n```\nall good actually\n```\n\n{entry.marker()}')
+            if c.id == edited.id
+            else c
+            for c in forge.comments(number)
+        ]
+        with pytest.raises(VerdictTamperedError) as caught:
+            spool.audit(publisher)
+        assert [f.entry_id for f in caught.value.findings] == [entry.id]
+
+    def test_a_DELETED_verdict_is_reported_differently_from_an_edited_one(self, spool, publisher, forge):
+        """An edit is a disagreement to have with a person; a disappearance is an incident. A single
+        "tampered" verdict would send the reader to do the wrong thing half the time.
+        """
+        spool.record(JOB, verdict='FAIL', detail='3 failed')
+        spool.drain(publisher)
+        number = publisher.store.work_item_number(JOB)
+        forge._comments[number] = []
+        with pytest.raises(VerdictTamperedError) as caught:
+            spool.audit(publisher)
+        assert 'no longer present' in caught.value.findings[0].reason
+
+    def test_the_audit_does_NOT_put_the_text_back(self, spool, publisher, forge):
+        """THE REQUIREMENT MOST EASILY BROKEN BY BEING HELPFUL. Restoring silently converts a
+        visible disagreement into an invisible fight between a person and a daemon -- and the
+        person, who can see the issue and cannot see the daemon, loses without learning why.
+        """
+        entry = spool.record(JOB, verdict='FAIL', detail='3 failed')
+        spool.drain(publisher)
+        number = publisher.store.work_item_number(JOB)
+        tampered = f'edited by a human\n\n{entry.marker()}'
+        forge._comments[number] = [Comment(id=999, body=tampered)]
+        with pytest.raises(VerdictTamperedError):
+            spool.audit(publisher)
+        assert forge.comments(number)[0].body == tampered, 'the audit rewrote the forge'
+        assert len(forge.comments(number)) == 1, 'the audit posted a correction'
+
+    def test_the_finding_carries_EVERY_mismatch_not_just_the_first(self, spool, publisher, forge):
+        for n in range(3):
+            spool.record(Job(id=f'j{n}', kind=TEST_RUN), verdict='FAIL', detail=f'detail {n}')
+        spool.drain(publisher)
+        for item in forge.list_work_items():
+            forge._comments[item.number] = []
+        with pytest.raises(VerdictTamperedError) as caught:
+            spool.audit(publisher)
+        assert len(caught.value.findings) == 3
+
+    def test_an_UNPUBLISHED_entry_is_not_audited(self, spool, publisher):
+        """The comparison needs both halves. Auditing something never sent would report every
+        pending verdict as missing -- an alarm that fires on the normal case is not an alarm.
+        """
+        spool.record(JOB, verdict='PASS', detail='green')
+        assert spool.audit(publisher) == []
+
+    def test_the_marker_alone_does_not_certify_the_TEXT(self, spool, publisher, forge):
+        """The limit, as a test rather than a sentence. A body carrying the right marker and the
+        wrong text is exactly what a delete-and-repost produces, and the audit catches it ONLY
+        because it compares the text -- not because the marker told it anything.
+        """
+        entry = spool.record(JOB, verdict='FAIL', detail='the original evidence')
+        spool.drain(publisher)
+        number = publisher.store.work_item_number(JOB)
+        forge._comments[number] = [Comment(id=1000, body=f'different text {entry.marker()}')]
+        with pytest.raises(VerdictTamperedError):
+            spool.audit(publisher)
+
+    def test_the_forge_publisher_can_be_READ_back(self, publisher):
+        assert isinstance(publisher, PublishedTextReader)
+
+
+class TestTheDurabilityLimitIsNAMED:
+    def test_directory_fsync_availability_is_INSPECTABLE(self):
+        """A caller deciding how much to trust this spool must be able to READ the answer rather
+        than infer it from a silent `except OSError`. On Windows it is False, and our runners are
+        Windows -- so `kill -9` is fully covered and a power cut is not.
+        """
+        assert DIRECTORY_FSYNC_AVAILABLE is (os.name != 'nt')
+
+    def test_the_no_op_is_documented_AS_a_no_op(self):
+        """A hole that is named is a different defect from a hole the docs imply does not exist."""
+        doc = spool_module._fsync_directory.__doc__
+        assert 'DOES NOTHING' in doc
+        assert 'power cut' in doc.lower()

@@ -44,10 +44,33 @@ worse than none:
   unpublished verdicts with it.
 * **Power loss, as distinct from process death.** Entries are written with `fsync` and swapped with
   `os.replace`, which closes `kill -9` completely. Surviving a power cut additionally requires the
-  directory entry itself to be durable, and Windows exposes no directory `fsync`; the call is
-  best-effort and silently unavailable there.
+  directory entry itself to be durable, and **Windows has no directory fsync at all** -- see
+  :data:`DIRECTORY_FSYNC_AVAILABLE`, which is `False` there. Our runners are Windows.
 * **Two boxes spooling the same job.** The claim protocol is what prevents that. If it is bypassed,
   two spools will each publish, and the later drain wins with no arbitration.
+
+TAMPERING IS DETECTED, NOT PREVENTED, AND NEVER REPAIRED
+========================================================
+
+A verdict in an orphan git commit was immutable because git objects are. A comment is editable by
+anyone with write access, including a human "fixing" a red result, and no forge mechanism restores
+that property -- locking an issue prevents new comments, not edits.
+
+The spool narrows this by accident of its design: it already holds the exact text it published, so
+it can compare. `Spool.audit` does, and `VerdictTamperedError` is loud about a mismatch.
+
+**It does not restore, on purpose.** Silently rewriting a person's edit is a worse failure than the
+edit: it converts a visible disagreement into an invisible fight between a human and a daemon, and
+the human -- who can see the issue and cannot see the daemon -- loses without ever learning why.
+
+What it CANNOT do, said here rather than left to be discovered:
+
+* It cannot make a verdict immutable. It reports after the fact.
+* It cannot detect a delete-and-repost by someone who also reproduces the marker. The marker is
+  **evidence of DELIVERY, not of INTEGRITY** -- it says this text reached the forge once, never that
+  the text there now is that text.
+* It cannot audit what was never published, or anything whose spool entry has been lost. The
+  comparison needs both halves.
 """
 
 from __future__ import annotations
@@ -86,6 +109,18 @@ class SpoolCorruptError(SpoolError):
     """
 
 
+class VerdictTamperedError(SpoolError):
+    """A published verdict no longer matches what the spool published.
+
+    Carries every finding in `.findings`, because one mismatch and forty are different incidents and
+    a caller that saw only the first would fix a symptom.
+    """
+
+    def __init__(self, message: str, findings: list[TamperFinding]) -> None:
+        super().__init__(message)
+        self.findings = findings
+
+
 class SpoolBacklogError(SpoolError):
     """Entries have been undrainable long enough to be an incident.
 
@@ -113,6 +148,18 @@ class SpoolEntry:
         return now - self.recorded_at
 
 
+@dataclass(frozen=True, slots=True)
+class TamperFinding:
+    """One published verdict whose text on the forge is not the text we published.
+
+    `reason` distinguishes "edited" from "gone", because they need different responses: an edit is a
+    disagreement to have with a person, a disappearance is an incident.
+    """
+
+    entry_id: str
+    reason: str
+
+
 @dataclass(slots=True)
 class DrainReport:
     """What one drain did. `failed` carries `(entry id, reason)`."""
@@ -136,6 +183,20 @@ class Publisher(Protocol):
 
     def is_published(self, entry: SpoolEntry) -> bool:
         """Is `entry` fully reflected at the destination already?"""
+        ...
+
+
+@runtime_checkable
+class PublishedTextReader(Protocol):
+    """Can read back the text a published entry currently has at the destination.
+
+    SEPARATE FROM `Publisher` ON PURPOSE. Auditing is optional -- a destination that cannot be read
+    back is still a legal place to publish -- and folding this into `Publisher` would force every
+    implementation to pretend it can answer.
+    """
+
+    def published_body(self, entry: SpoolEntry) -> str | None:
+        """The body currently carrying `entry`'s marker, or ``None`` if no such body exists."""
         ...
 
 
@@ -238,6 +299,39 @@ class Spool:
             raise SpoolBacklogError(msg)
         return report
 
+    def published(self) -> list[SpoolEntry]:
+        """Every entry this spool believes it published. The audit trail, and the audit's baseline."""
+        return sorted(
+            (_decode(path) for path in self.published_dir.glob(f'*{_ENTRY_SUFFIX}')),
+            key=lambda entry: entry.recorded_at,
+        )
+
+    def audit(self, reader: PublishedTextReader) -> list[TamperFinding]:
+        """Check that what we published is still what is there. DETECTION ONLY.
+
+        Returns every finding, and then raises if there were any -- the same shape as `drain`, and
+        for the same reason: a caller ignores a return value by not reading it. The findings ride on
+        the exception so that nothing is lost by raising.
+
+        **NOTHING IS REPAIRED HERE, DELIBERATELY.** Rewriting a person's edit would turn a visible
+        disagreement into an invisible one, and the person cannot see the daemon that keeps undoing
+        their change. See the module docstring for what this cannot detect at all.
+
+        Raises:
+            VerdictTamperedError: at least one published verdict no longer matches.
+        """
+        findings: list[TamperFinding] = []
+        for entry in self.published():
+            body = reader.published_body(entry)
+            if body is None:
+                findings.append(TamperFinding(entry.id, 'the published verdict is no longer present'))
+            elif entry.detail not in body:
+                findings.append(TamperFinding(entry.id, 'the published text no longer contains what we published'))
+        if findings:
+            msg = f'{len(findings)} published verdict(s) no longer match the spool: {[f.entry_id for f in findings]}'
+            raise VerdictTamperedError(msg, findings)
+        return findings
+
     def stale_entries(self, *, now: float | None = None) -> list[SpoolEntry]:
         """Pending entries older than the limit. Readable WITHOUT publishing anything, so a monitor
         can ask the question without taking the action."""
@@ -280,6 +374,21 @@ class ForgePublisher:
             VERDICT_LABELS[entry.verdict] in self.store.forge.labels(number)
             and self.store.forge.state(number) == 'closed'
         )
+
+    def published_body(self, entry: SpoolEntry) -> str | None:
+        """The comment currently carrying this entry's marker.
+
+        THE MARKER LOCATES, IT DOES NOT VOUCH. Finding it proves this entry was delivered once; the
+        body beside it is whatever the forge holds NOW, which is exactly the thing worth comparing
+        and exactly the thing the marker cannot certify.
+        """
+        number = self.store.work_item_number(entry.job)
+        if number is None:
+            return None
+        for comment in self.store.forge.comments(number):
+            if entry.marker() in comment.body:
+                return comment.body
+        return None
 
     def _marker_present(self, number: int, entry: SpoolEntry) -> bool:
         return any(entry.marker() in comment.body for comment in self.store.forge.comments(number))
@@ -352,13 +461,29 @@ def _atomic_write(path: Path, data: bytes) -> None:
     _fsync_directory(path.parent)
 
 
-def _fsync_directory(directory: Path) -> None:
-    """Make the directory entry itself durable, where the platform allows it.
+#: Can this platform make a DIRECTORY entry durable? False on Windows, which has no directory
+#: fsync at all. Exported rather than hidden inside the helper so that a caller deciding how much to
+#: trust this spool can READ the answer instead of inferring it from a silent `except OSError`.
+DIRECTORY_FSYNC_AVAILABLE = os.name != 'nt'
 
-    BEST EFFORT, AND THAT LIMIT IS REAL: Windows has no directory fsync, so on Windows this is a
-    no-op and the spool survives `kill -9` but not necessarily a power cut. Said here rather than
-    implied by its absence.
+
+def _fsync_directory(directory: Path) -> None:
+    """Make the directory entry itself durable -- ON PLATFORMS THAT HAVE THAT OPERATION.
+
+    **ON WINDOWS THIS FUNCTION DOES NOTHING, and that is not a bug to be fixed here.** Windows
+    exposes no directory fsync; `os.open` on a directory fails outright. The early return is
+    deliberate and is named, because the alternative -- letting the call fall into a bare
+    `except OSError: pass` -- would look like an attempt that happened to fail rather than an
+    operation the platform does not have. A reader skimming for durability would see an fsync call
+    and believe it.
+
+    CONSEQUENCE, stated at the code rather than only in the module docstring: on Windows the spool
+    survives `kill -9` completely (the file contents are fsync'd and `os.replace` is atomic) but a
+    POWER CUT can lose the directory entry of a just-recorded verdict. Our runners are Windows, so
+    this is a live limit and not a theoretical one.
     """
+    if not DIRECTORY_FSYNC_AVAILABLE:
+        return
     try:
         fd = os.open(directory, os.O_RDONLY)
     except OSError:
