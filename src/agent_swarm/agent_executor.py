@@ -44,10 +44,13 @@ THE SESSION LAYER IS NOT REIMPLEMENTED HERE
 ===========================================
 
 Spawning and driving claude/codex sessions is `fabric`'s job and it already does it. This file
-defines the seam (`SessionRunner`) and stops. `FabricSessionRunner` is the adapter, and it is
-explicitly unimplemented for the same reason `GitHubForge` is: fabric is reached over MCP, not as a
-Python import, and writing a transport against an interface nobody has exercised from here would be
-a guess wearing an adapter's clothes. :data:`FABRIC_UNWIRED` names what has to be settled.
+defines the seam (`SessionRunner`) and stops; `fabric.FabricSessionRunner` is the implementation.
+
+THE SEAM IS NOT A CEREMONY. It was written before the transport existed and then MEASURED against
+two genuinely different backends -- `claude` and `codex` -- which took the same fields and answered
+in the same shape. Nothing here names fabric, node, MCP, a session id or a pid, and that is the
+layering rule: L1 may say issue/branch/gate, L0 says session/turn/node/pid, and neither vocabulary
+leaks. A `provider=` argument reaching this file would be the first sign it had.
 """
 
 from __future__ import annotations
@@ -199,52 +202,3 @@ def _context(detail: str, outcome: SessionOutcome) -> str:
     """
     claim = outcome.self_report.strip() or '(the session said nothing)'
     return f'{detail}\n\n--- the session said (NOT the verdict) ---\n{claim}'
-
-
-#: What must be settled before `FabricSessionRunner` can be written. Fabric is reached over MCP, not
-#: imported, so every line here is a transport question that reading the plugin cannot answer.
-FABRIC_UNWIRED = (
-    (
-        'how a non-interactive process calls fabric at all: it is an MCP server addressed by an '
-        'agent, and this package is a library with no MCP client and no agent loop'
-    ),
-    (
-        'what "the session finished on its own terms" looks like on the wire, as distinct from a '
-        'transport error -- `SessionOutcome.completed` is the field the whole INCONCLUSIVE rule '
-        'turns on, and a transport reporting it True for a timeout would convert the most '
-        'dangerous case into a confident verdict'
-    ),
-    (
-        'the timeout and its enforcement point: a session that hangs must become INCONCLUSIVE '
-        'rather than holding a claim until the lease expires'
-    ),
-    (
-        'whether a session runs in the caller working tree or an isolated one, since the workspace '
-        'fingerprint is meaningless if two concurrent sessions share a tree'
-    ),
-    ('cost and concurrency limits: a fleet of sessions is a spend, and `admission` prices RAM rather than tokens'),
-)
-
-
-class FabricSessionRunner:
-    """The fabric adapter. **NOT IMPLEMENTED, ON PURPOSE.**
-
-    Fabric already spawns and drives claude/codex sessions and this package must not grow a second
-    session layer. But fabric is an MCP server addressed by an agent, and `agent_swarm` is a
-    dependency-free library with no MCP client -- so the adapter is not a thin wrapper over an
-    import, it is a transport that nobody has yet exercised from here.
-
-    Writing it from the plugin's description would produce the one field the design cannot afford to
-    guess: `SessionOutcome.completed`. Every INCONCLUSIVE rule in `AgentTaskExecutor` turns on it,
-    and a transport that reported "completed" for a timed-out session would convert the most
-    dangerous case into a confident verdict. See :data:`FABRIC_UNWIRED`.
-    """
-
-    def run(self, brief: str, *, job: Job) -> SessionOutcome:
-        lines = '\n  - '.join(FABRIC_UNWIRED)
-        msg = (
-            'FabricSessionRunner.run is unwritten: fabric is reached over MCP, not imported, and '
-            'this package has no MCP client. Settle these first, then write it:\n  - '
-            f'{lines}'
-        )
-        raise NotImplementedError(msg)

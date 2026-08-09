@@ -13,14 +13,17 @@ of this file is about refusing to believe it.
 
 from __future__ import annotations
 
+import io
+import tokenize
+from pathlib import Path
+
 import pytest
 
+from agent_swarm import agent_executor as agent_executor_module
 from agent_swarm.admission import WHOLE_BOX
 from agent_swarm.agent_executor import (
-    FABRIC_UNWIRED,
     AgentTaskExecutor,
     Brief,
-    FabricSessionRunner,
     SessionOutcome,
     SessionRunner,
     StaticBrief,
@@ -264,28 +267,28 @@ class TestTheSeamsAreSeams:
         assert 'self_report' in fields
 
 
-class TestFabricIsSEAMEDNotReimplemented:
-    def test_it_satisfies_the_protocol_structurally(self):
-        assert isinstance(FabricSessionRunner(), SessionRunner)
+class TestTheSeamDoesNotLeakL0Vocabulary:
+    """The layering rule, as a check. L1 says issue/branch/gate; L0 says session/turn/node/pid.
 
-    def test_it_refuses_rather_than_guessing_a_transport(self):
-        with pytest.raises(NotImplementedError) as caught:
-            FabricSessionRunner().run('do the thing', job=TASK)
-        assert 'MCP' in str(caught.value)
+    The seam was written before the transport existed, so this guards the direction that actually
+    goes wrong later: a `provider=` or a `node=` appearing here would mean fabric's vocabulary had
+    climbed into the scheduler, and the next backend would need a branch rather than an adapter.
+    """
 
-    def test_the_refusal_names_the_field_the_whole_rule_turns_on(self):
-        """`completed` is the one that must not be guessed: a transport reporting it True for a
-        timed-out session converts the most dangerous case into a confident verdict.
-        """
-        joined = ' '.join(FABRIC_UNWIRED)
-        assert 'completed' in joined
-        assert 'timeout' in joined.lower()
+    def test_no_vendor_or_transport_name_appears_in_the_executor(self):
+        source = Path(agent_executor_module.__file__).read_text(encoding='utf-8')
+        code = [
+            token.string
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+            if token.type not in (tokenize.STRING, tokenize.COMMENT)
+        ]
+        banned = {'fabric', 'mcp', 'node', 'provider', 'pid', 'subprocess', 'socket', 'claude', 'codex'}
+        offenders = sorted({t for t in code if t.lower() in banned})
+        assert not offenders, f'L0 vocabulary leaked into the executor: {offenders}'
 
     def test_this_package_did_not_grow_a_session_layer(self):
         """Fabric already spawns and drives sessions. A second one here would be the duplicated
         scheme this project names first -- and the copy would be the one nobody maintains.
         """
-        import agent_swarm.agent_executor as module
-
-        assert not hasattr(module, 'subprocess')
-        assert not hasattr(module, 'socket')
+        assert not hasattr(agent_executor_module, 'subprocess')
+        assert not hasattr(agent_executor_module, 'socket')

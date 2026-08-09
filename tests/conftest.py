@@ -17,7 +17,10 @@ from pathlib import Path
 
 import pytest
 
-LIVE_MARKER = 'live_forge'
+#: Every tier that reaches off this box. Two, now: a forge over HTTP and a session fleet over
+#: fabric's own transport. They fail for different reasons and are deselected together.
+LIVE_MARKERS = ('live_forge', 'live_fabric')
+LIVE_MARKER = LIVE_MARKERS[0]
 
 #: Below this, the live tier has effectively vanished -- a renamed marker, a deleted file, an import
 #: error swallowing a module. The number is deliberately a floor and not an exact count: it must not
@@ -28,21 +31,23 @@ _deselected_live: list[str] = []
 
 
 def pytest_deselected(items) -> None:
-    _deselected_live.extend(item.nodeid for item in items if item.get_closest_marker(LIVE_MARKER))
+    _deselected_live.extend(item.nodeid for item in items if any(item.get_closest_marker(m) for m in LIVE_MARKERS))
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     """Say what was NOT run. Never silently."""
     selected_live = sum(1 for item in getattr(config, '_live_collected', []) if item)
+    selector = ' or '.join(LIVE_MARKERS)
     if _deselected_live:
         terminalreporter.write_sep('-', f'{LIVE_MARKER}: {len(_deselected_live)} NOT RUN', yellow=True)
         terminalreporter.write_line(
-            f'  no forge was contacted. Run them with:  pytest -m {LIVE_MARKER}\n'
-            f'  the contract itself IS covered offline (InMemoryStore and RecordingForge); what is '
-            f'missing is the evidence that a real deployment still behaves as measured.'
+            f'  nothing off this box was contacted. Run them with:  pytest -m "{selector}"\n'
+            f'  the contracts themselves ARE covered offline (InMemoryStore, RecordingForge and the\n'
+            f'  fake session); what is missing is the evidence that a real deployment and a real\n'
+            f'  session fleet still behave as measured.'
         )
     elif selected_live:
-        terminalreporter.write_sep('-', f'{LIVE_MARKER}: {selected_live} ran against a real forge', green=True)
+        terminalreporter.write_sep('-', f'{LIVE_MARKER}: {selected_live} ran off this box', green=True)
 
 
 def _is_whole_suite(config) -> bool:
@@ -64,7 +69,7 @@ def pytest_collection_modifyitems(config, items) -> None:
     on a green run. It counts what was COLLECTED before deselection, so it fires whether or not the
     tier was selected -- which is the point, since the default run is the one that would hide it.
     """
-    live = [item for item in items if item.get_closest_marker(LIVE_MARKER)]
+    live = [item for item in items if any(item.get_closest_marker(m) for m in LIVE_MARKERS)]
     config._live_collected = live
     if _is_whole_suite(config) and len(live) < MINIMUM_LIVE_TESTS:
         raise pytest.UsageError(

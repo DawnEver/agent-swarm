@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import LIVE_MARKER, MINIMUM_LIVE_TESTS
+from conftest import LIVE_MARKER, LIVE_MARKERS, MINIMUM_LIVE_TESTS
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -70,7 +70,7 @@ class TestTheDefaultRunIsOfflineAndSaysSo:
     def test_it_carries_the_COMMAND_that_runs_them(self):
         """A report that names a gap without naming the fix is a report that gets read once."""
         result = _pytest(LIVE_TEST_FILE, '--collect-only', '-q')
-        assert f'pytest -m {LIVE_MARKER}' in result.stdout
+        assert f'pytest -m "{" or ".join(LIVE_MARKERS)}"' in result.stdout
 
     def test_it_contacts_no_forge_at_all(self):
         """Asserted on the COLLECTION, which cannot reach a network: every live test is deselected
@@ -86,7 +86,7 @@ class TestTheLiveTierStillExists:
         """The floor guard's own premise. If the marker were renamed, or a module failed to import,
         the default run would still be green and this is the only thing that would notice.
         """
-        result = _pytest('tests/', '-m', LIVE_MARKER, '--collect-only', '-q')
+        result = _pytest('tests/', '-m', ' or '.join(LIVE_MARKERS), '--collect-only', '-q')
         # pytest prints e.g. "23/234 tests collected (211 deselected)"; take the first number.
         found = re.search(r'(\d+)/\d+ tests collected', result.stdout)
         assert found, f'could not read the collection summary from: {result.stdout[-500:]}'
@@ -96,4 +96,4 @@ class TestTheLiveTierStillExists:
         """An exact count gets edited to whatever it happens to be every time a test is added, until
         it asserts nothing. A floor only ever moves when the tier genuinely shrinks.
         """
-        assert MINIMUM_LIVE_TESTS < 23
+        assert MINIMUM_LIVE_TESTS < 27

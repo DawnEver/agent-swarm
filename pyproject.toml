@@ -31,11 +31,14 @@ quote-style = "single"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live_forge: talks to a real forge over the network"]
+markers = [
+    "live_forge: talks to a real forge over the network",
+    "live_fabric: spawns a real LLM session on the fabric fleet (needs node)",
+]
 # A TIER, DESELECTED BY DEFAULT -- not the auto-skip that was refused. An auto-skip on a connection
 # error is a disguise: the run that most needs to be loud (server down, token expired) would report
 # green. Deselected tests still FAIL loudly when you ask for them with `pytest -m live_forge`,
 # because by then you asked for the forge. And `tests/conftest.py` prints how many were skipped, so
 # that "all green" and "no forge was ever contacted" cannot be confused -- deselection without that
 # line would trade a wall of red for a silence, which is the worse of the two.
-addopts = ["-m", "not live_forge"]
+addopts = ["-m", "not live_forge and not live_fabric"]
