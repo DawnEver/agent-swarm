@@ -531,6 +531,47 @@ class ForgeStore:
             jobs.append(job)
         return Claimable(jobs=tuple(jobs))
 
+    def newest_open(self, kind: JobKind, *, group: str) -> Job | None:
+        """The newest OPEN item whose id starts with ``group/``, or ``None`` for none visible.
+
+        **CORRECTNESS LIVES HERE, NOT IN THE SUPERSEDE.** A submitter that replaces one work item
+        with another does TWO writes -- create the new, close the old -- and it will eventually die
+        between them. That leaves two open items for one group, and a reader that assumed the close
+        succeeded picks the STALE one. Which is precisely the failure the ref transport made
+        impossible: a force-push to `refs/candidates/<branch>` retired the previous SHA atomically,
+        so latest-wins was a property of the TRANSPORT and never of the design. Migrating without
+        replacing it would reintroduce the bug through the back door.
+
+        So the close is CLEANUP -- it bounds retention and keeps the tracker readable -- and a
+        failed close costs one extra item and nothing else.
+
+        **NEWEST = HIGHEST NUMBER**, server-assigned and monotonic, the same primitive the claim
+        protocol already rests on. Not a timestamp in the body: a body is written by the client, so
+        two submitters with skewed clocks would disagree about which item is newer, and the whole
+        point is that every observer converges without coordinating.
+
+        **`None` MEANS NONE VISIBLE**, never "the group has no work" -- a list read can be stale.
+        Unlike `claimable` this returns a bare optional rather than a wrapper, because there is no
+        ambiguous expression to ban: a caller must handle `None` explicitly either way, and
+        `Claimable`'s ban exists for `if not jobs:` specifically.
+
+        Args:
+            kind: which loop's work.
+            group: the id prefix that identifies the series -- a branch name, for candidates. The
+                store does not know what a branch is; it knows that ids are `group/rest`.
+        """
+        prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        best: tuple[int, Job] | None = None
+        for item in self.forge.list_work_items():
+            if item.state != 'open' or not item.title.startswith(prefix):
+                continue
+            job = decode_claim_key(item.title[len(prefix) :], kind=kind)
+            if job is None or not job.id.startswith(f'{group}/'):
+                continue
+            if best is None or item.number > best[0]:
+                best = (item.number, job)
+        return None if best is None else best[1]
+
     def register(self, job: Job) -> int:
         """Create this job's work item ONCE, from the single writer that owns submitting it.
 

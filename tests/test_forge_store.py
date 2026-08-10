@@ -120,19 +120,37 @@ class RecordingForge:
         self.retired: list[int] = []
 
     def list_work_items(self) -> list[WorkItem]:
-        """NEWEST FIRST, and the reversal is the point.
+        """DETERMINISTICALLY SCRAMBLED. Neither first nor last correlates with the number.
 
         A real forge promises no ordering on a list endpoint -- Gitea and GitHub both default to
-        recently-updated first, and either may change. Returning insertion order made this double
-        BETTER BEHAVED THAN REALITY, and it cost a real hole: with items ascending, "take the first
-        match" and "take the lowest-numbered match" are the same function, so the tie-break that
-        makes two observers converge on one item was indistinguishable from an arbitrary pick.
+        recently-updated first, and either may change -- so a double that returns a MEANINGFUL order
+        is better behaved than reality, and every ordering rule tested through it is really testing
+        the double.
 
-        Reversing is not a random shuffle on purpose: a shuffled double fails intermittently, which
-        reads as flakiness and gets retried away. A fixed adverse order fails every time.
+        This has now cost two holes, and the second is the more instructive:
+
+        * **Insertion order** made "first match" and "LOWEST-numbered match" the same function, so
+          `_lowest_numbered`'s tie-break was untestable.
+        * Fixing that by REVERSING made "first match" and "HIGHEST-numbered match" the same
+          function, so `newest_open`'s rule was untestable. **The fix relocated the hole rather than
+          closing it**, which is this suite's own law about elimination fixes, firing on the repair
+          for the previous instance of that law.
+
+        The order here is a ROTATION by half the list, which for three or more items puts neither
+        the lowest nor the highest number first -- so it is adverse to both `min` and `max` at once,
+        by construction rather than by luck. A digest-based scramble was tried first and is worse:
+        deterministic, but whether it happens to lead with the maximum is a property of the
+        particular numbers, so it discriminated `min` and not `max`. **Fewer than three items cannot
+        discriminate either way** -- with two, "first" IS one of min and max -- which is why the
+        crashed-supersede case is also tested at six.
+
+        Not `random.shuffle` and not `hash()`: an intermittent double fails intermittently, which
+        reads as flakiness and gets retried away, and `hash()` is salted per process.
         """
         with self._lock:
-            return list(reversed(self.items.values()))
+            items = list(self.items.values())
+        half = len(items) // 2
+        return items[half:] + items[:half]
 
     def work_item(self, number: int) -> WorkItem | None:
         """BY NUMBER, and therefore fresh even in `StaleListForge` -- which is the measured shape."""
@@ -1195,3 +1213,127 @@ class TestAbsenceIsUNWRITABLE:
 
         assert len(claimable) == 1
         assert [j.id for j in claimable] == ['a']
+
+
+class TestTheREADDecidesWhichCandidateIsCurrent:
+    """Latest-wins was a property of the REF TRANSPORT, not of the design.
+
+    `refs/candidates/<branch>` got it from force-push: the tip was the only candidate that existed,
+    so no stale SHA could be picked up. Nothing in the Issue transport provides that, and the
+    supersede that replaces it is TWO writes -- create the new item, close the old. A submitter that
+    dies between them leaves two open items for one branch.
+
+    Hence the rule under test: the READ decides, the close is cleanup. Every test here plants that
+    crashed-submitter state directly, because once the close works our own writer can never produce
+    it again -- the same reason `claimable`'s two filters needed a reopened item and a cancelled one.
+    """
+
+    def _submit(self, store, branch, sha):
+        return store.register(Job(id=f'{branch}/{sha}', kind=JobKind.TEST_RUN))
+
+    def test_the_only_candidate_is_the_current_one(self, memory_store):
+        self._submit(memory_store, 'main', 'aaa')
+
+        job = memory_store.newest_open(JobKind.TEST_RUN, group='main')
+
+        assert job is not None and job.id == 'main/aaa'
+
+    def test_a_CRASHED_SUPERSEDE_still_yields_the_NEW_sha(self, memory_store):
+        """THE WHOLE POINT. Two open items for one branch, and the older must never be picked.
+
+        This is the state a submitter leaves behind when it dies after creating the replacement and
+        before closing the predecessor. Refs made it unrepresentable; Issues do not, so it is the
+        read that has to be correct.
+        """
+        self._submit(memory_store, 'main', 'old')
+        self._submit(memory_store, 'main', 'new')  # the close never happened
+
+        job = memory_store.newest_open(JobKind.TEST_RUN, group='main')
+
+        assert job is not None and job.id == 'main/new', (
+            'the reader picked the stale SHA -- exactly what force-push made impossible'
+        )
+
+    def test_a_LONG_series_of_crashed_supersedes_still_yields_the_newest(self, memory_store, recording_forge):
+        """SIX items, not two, and the count is load-bearing.
+
+        With two, "take the newest" and "take whichever the forge listed first" agree half the time,
+        and under a deterministic double they agree ALWAYS or never -- so the two-item test above
+        passed with the rule mutated to `first seen`. It is kept because it names the scenario; this
+        one is what discriminates.
+
+        Six crashed supersedes in a row is not far-fetched: it is one submitter crashing repeatedly
+        against the same branch, which is exactly what a broken submitter does.
+        """
+        shas = [f's{i}' for i in range(6)]
+        for sha in shas:
+            self._submit(memory_store, 'main', sha)
+
+        listed = [i.title for i in recording_forge.list_work_items()]
+        assert not listed[0].endswith(f'main/{shas[-1]}'), (
+            'the forge happened to list the newest first, so this test cannot tell "newest" from '
+            '"first" -- change the double order, do not weaken the assertion'
+        )
+
+        assert memory_store.newest_open(JobKind.TEST_RUN, group='main').id == f'main/{shas[-1]}'
+
+    def test_every_observer_converges_without_coordinating(self, memory_store, recording_forge):
+        """Two cold readers, one answer. The ordering key is server-assigned, so this holds without
+        either reader knowing the other exists -- and it must, or two runners gate two SHAs and both
+        report on `main`."""
+        self._submit(memory_store, 'main', 'old')
+        self._submit(memory_store, 'main', 'new')
+
+        answers = {
+            ForgeStore('ns', recording_forge, role=Role.RUNNER).newest_open(JobKind.TEST_RUN, group='main').id
+            for _ in range(2)
+        }
+
+        assert answers == {'main/new'}
+
+    def test_a_CLOSED_predecessor_is_not_a_candidate(self, memory_store, recording_forge):
+        """The cleanup direction: when the close DOES land, the old item drops out. If closing had
+        no effect the namespace would never shrink and retention would be unimplementable."""
+        first = self._submit(memory_store, 'main', 'old')
+        self._submit(memory_store, 'main', 'new')
+        recording_forge.close_work_item(first)
+
+        assert memory_store.newest_open(JobKind.TEST_RUN, group='main').id == 'main/new'
+
+    def test_the_LAST_candidate_being_closed_means_NOTHING_VISIBLE(self, memory_store, recording_forge):
+        number = self._submit(memory_store, 'main', 'only')
+        recording_forge.close_work_item(number)
+
+        assert memory_store.newest_open(JobKind.TEST_RUN, group='main') is None
+
+    def test_ANOTHER_BRANCH_is_never_returned(self, memory_store):
+        """Branches are independent series. Leaking across them would gate a feature branch's SHA
+        and publish the verdict against `main`."""
+        self._submit(memory_store, 'main', 'aaa')
+        self._submit(memory_store, 'feature', 'zzz')
+
+        assert memory_store.newest_open(JobKind.TEST_RUN, group='main').id == 'main/aaa'
+        assert memory_store.newest_open(JobKind.TEST_RUN, group='feature').id == 'feature/zzz'
+
+    def test_a_branch_is_not_a_PREFIX_of_another_branch(self, memory_store):
+        """`main` must not match `main-experiment`. The separator is part of the test, not decoration
+        -- a bare `startswith(group)` passes every other test in this class."""
+        self._submit(memory_store, 'main', 'aaa')
+        # NEWER than the branch under test, so a bare `startswith(group)` returns THIS one. Ordered
+        # deliberately: with the newer item on `main`, the assertion holds either way and the test
+        # is vacuous -- which is how it first shipped, and the mutant survived it.
+        self._submit(memory_store, 'main-experiment', 'zzz')
+
+        assert memory_store.newest_open(JobKind.TEST_RUN, group='main').id == 'main/aaa'
+
+    def test_an_UNREACHABLE_store_RAISES(self, memory_store, monkeypatch):
+        """Same asymmetry as `claimable` and `live_runners`. `None` here would read as "no candidate
+        on this branch" and the scheduler would idle through an outage reporting healthy."""
+
+        def _boom():
+            raise ForgeError('the control plane is unreachable')
+
+        monkeypatch.setattr(memory_store.forge, 'list_work_items', _boom)
+
+        with pytest.raises(ForgeError):
+            memory_store.newest_open(JobKind.TEST_RUN, group='main')
