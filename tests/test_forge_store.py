@@ -1337,3 +1337,74 @@ class TestTheREADDecidesWhichCandidateIsCurrent:
 
         with pytest.raises(ForgeError):
             memory_store.newest_open(JobKind.TEST_RUN, group='main')
+
+
+class TestTheSubmitterDECLARESWhatToRun:
+    """The request is DATA on the item, not a rule the scheduler re-derives.
+
+    Under the ref transport there was nowhere to put it, so `ci.py candidate` printed a payload that
+    was published nowhere and `ci_tick` computed its own from the branch name. One rule, two
+    spellings -- and the duplicated derivation is the defect, not the copy that drifted. It had
+    already produced a visible one: `--heavy` on any branch but `main` reported work nobody would do.
+    """
+
+    def _job(self, sha='aaa'):
+        return Job(id=f'main/{sha}', kind=JobKind.TEST_RUN)
+
+    def test_what_was_declared_is_what_is_read_back(self, memory_store):
+        job = self._job()
+        memory_store.register(job, requests=['fast', 'heavy'])
+
+        assert memory_store.requested_runs(job) == frozenset({'fast', 'heavy'})
+
+    def test_a_request_is_NOT_recomputed_from_the_id(self, memory_store):
+        """THE DISCRIMINATING TEST. A branch called `main` asking for `fast` ONLY.
+
+        Under the deleted rule `main` implied `['fast', 'heavy']`, so any implementation that still
+        consults the id returns `heavy` here. Chosen deliberately: on any other branch name the two
+        rules agree and the test would be vacuous.
+        """
+        job = self._job()
+        memory_store.register(job, requests=['fast'])
+
+        assert memory_store.requested_runs(job) == frozenset({'fast'}), (
+            'the scheduler-side rule is back: `main` was expanded to fast+heavy by something other than the submitter'
+        )
+
+    def test_a_NON_main_branch_can_ask_for_heavy(self, memory_store):
+        """The hole the ref transport could not close, now closed. `--heavy` off `main` was a flag
+        that reported work nobody would do, because the request had no transport."""
+        job = Job(id='feature/zzz', kind=JobKind.TEST_RUN)
+        memory_store.register(job, requests=['fast', 'heavy'])
+
+        assert 'heavy' in memory_store.requested_runs(job)
+
+    def test_declaring_NOTHING_reads_back_as_nothing(self, memory_store):
+        """Not as a default. Choosing what to do about an empty declaration is the scheduler's, and
+        it is the only layer that knows whether a default is safe."""
+        job = self._job()
+        memory_store.register(job)
+
+        assert memory_store.requested_runs(job) == frozenset()
+
+    def test_an_EMPTY_request_is_REFUSED_at_the_write(self, memory_store):
+        """A bare prefix would read back as an unnamed run -- something nothing can schedule and
+        nobody can see on the board. Refused where it is written, not filtered where it is read."""
+        with pytest.raises(ValueError, match='must be named'):
+            memory_store.register(self._job(), requests=['fast', ''])
+
+    def test_a_VERDICT_label_is_not_mistaken_for_a_request(self, memory_store):
+        """Both vocabularies live in the same label namespace, so the prefixes must not collide --
+        and a verdict landing must not retroactively change what was asked for."""
+        job = self._job()
+        memory_store.register(job, requests=['fast'])
+        memory_store.record_verdict(job, verdict='PASS', detail='green')
+
+        assert memory_store.requested_runs(job) == frozenset({'fast'})
+
+    def test_requests_do_not_LEAK_between_items(self, memory_store):
+        memory_store.register(self._job('aaa'), requests=['fast'])
+        memory_store.register(self._job('bbb'), requests=['heavy'])
+
+        assert memory_store.requested_runs(self._job('aaa')) == frozenset({'fast'})
+        assert memory_store.requested_runs(self._job('bbb')) == frozenset({'heavy'})

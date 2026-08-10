@@ -89,6 +89,7 @@ import enum
 import re
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import ClassVar, Self
 
@@ -118,6 +119,19 @@ VERDICT_LABELS = {
 _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 
 _ITEM_TITLE_ROOT = '[swarm]'
+
+#: Prefix for the labels carrying what the SUBMITTER asked to be run.
+#:
+#: DECLARED, NEVER RECOMPUTED. The ref transport had nowhere to put this, so both `ci.py candidate`
+#: and `ci_tick` derived it independently from the branch name (`['fast','heavy'] if name == 'main'`)
+#: -- a duplicated derivation, which is the defect; the drifted copy is only its symptom. It had
+#: already produced one: `--heavy` on any branch but `main` printed work that nobody would ever do.
+#:
+#: LABELS RATHER THAN THE BODY. `WorkItem` carries no body and adding one would change the `Forge`
+#: protocol for both vendors; labels are already fetched by number, and this store already trusts
+#: them for the VERDICT, which is the more consequential read. If labels were too stale to carry a
+#: request, they would be too stale to carry an answer.
+_KIND_LABEL_PREFIX = 'run:'
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,7 +586,7 @@ class ForgeStore:
                 best = (item.number, job)
         return None if best is None else best[1]
 
-    def register(self, job: Job) -> int:
+    def register(self, job: Job, *, requests: Iterable[str] = ()) -> int:
         """Create this job's work item ONCE, from the single writer that owns submitting it.
 
         **THIS IS THE FIX, AND EVERYTHING BELOW IT IS MITIGATION.** Concurrent creation is a race
@@ -595,6 +609,13 @@ class ForgeStore:
         title = self._item_title(job)
         number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
         self._item_numbers[title] = number
+        for requested in sorted(set(requests)):
+            if not requested:
+                # An empty request would produce the bare prefix, which `requested_runs` would then
+                # read back as an unnamed run -- a request nothing can schedule and nobody can see.
+                msg = 'a requested run must be named; an empty request is not a request'
+                raise ValueError(msg)
+            self.forge.add_label(number, f'{_KIND_LABEL_PREFIX}{requested}')
         # THE INDEX IS WRITTEN HERE OR IT IS NEVER WRITTEN USEFULLY. The submitter is the only
         # creator, so this is the one moment the number is known for free -- and it was missing:
         # the index could previously only be warmed by a lookup that had ALREADY paid for the list
@@ -603,6 +624,30 @@ class ForgeStore:
         # through to the list. That is the assumption-not-measurement trap in one number.
         self._remember(job, number)
         return number
+
+    def requested_runs(self, job: Job) -> frozenset[str]:
+        """What the submitter ASKED to be run on this item. Empty means none declared.
+
+        **THE SCHEDULER READS THIS; IT DOES NOT RECOMPUTE IT.** That is the entire point. Under the
+        ref transport there was nowhere to put a request, so the submitter printed one payload and
+        the scheduler derived its own from the branch name -- two spellings of one rule, and the
+        rule was wrong in one of them for every branch that is not `main`.
+
+        EMPTY IS A REAL ANSWER HERE, unlike everywhere else in this class, and only because the
+        caller already holds the item: this reads labels BY NUMBER, which is the read measured fresh
+        on Gitea, not a list filter. A caller that got here from `claimable` or `newest_open` has
+        already survived the staleness question. What empty means is "the submitter declared
+        nothing" -- deciding what to do about that is policy and belongs to the scheduler, which is
+        also the only layer that knows whether a default is safe.
+        """
+        number = self._item_number(job)
+        if isinstance(number, NotVisible):
+            return frozenset()
+        return frozenset(
+            label.removeprefix(_KIND_LABEL_PREFIX)
+            for label in self.forge.labels(number)
+            if label.startswith(_KIND_LABEL_PREFIX)
+        )
 
     def _item_number(self, job: Job, *, create: bool = False) -> int | NotVisible:
         title = self._item_title(job)
