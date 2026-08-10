@@ -42,7 +42,12 @@ def _owners(n: int) -> list[str]:
 # --------------------------------------------------------------------------- it spreads
 
 
-#: (fleet size, items in flight AT LEAST, worst crowd AT MOST) -- MEASURED, not aspirational.
+#: (fleet size, items in flight AT LEAST, worst crowd AT MOST) -- MEASURED OFFLINE AND CONFIRMED
+#: LIVE: the 16-runner row reproduced verbatim against the real forge (7 in flight, worst crowd 4).
+#:
+#: WHAT DID NOT SURVIVE: "~N jobs per round". The real figure is ~0.44N -- 3 of 8 and 7 of 16 --
+#: which is the balls-in-bins expectation, not a defect. The claim was refuted the first time it
+#: was measured live, and the bound below is the measurement rather than the hope.
 #:
 #: The status quo is the row nobody writes: every fleet size puts ALL of its runners on item 0 and
 #: keeps ONE item in flight. These bounds are what the rotation actually delivers, with a little
@@ -61,9 +66,15 @@ def test_the_fleet_spreads_over_many_items_instead_of_one(n: int, least_in_fligh
     ITEMS IN FLIGHT is throughput: one contended item completes one job per round however many
     agents watch it, so k distinct leaders is k jobs progressing at once.
 
-    WORST CROWD is waste: every racer that is not the winner paid a full round to learn it lost,
-    and the round costs ~85 ms more for each of them. At 16 the measured round was 1373 ms with the
-    whole fleet on one item; with the worst crowd at 4 it is the ~430 ms of a 4-way race.
+    WORST CROWD is waste: every racer that is not the winner paid a full round to learn it lost.
+
+    IT IS A THROUGHPUT WIN AND NOT A LATENCY ONE, measured live 2026-08-10 and stated here because
+    the first version of this docstring claimed the opposite. Round WALL CLOCK barely moves (N=16:
+    2194 ms contended vs 2495 ms spread -- the spread arm was slightly SLOWER), because the wall is
+    dominated by the aggregate API-call volume both arms issue, not by per-item contention. What
+    moves is jobs completed per round: 1 -> 7 at N=16, 1 -> 3 at N=8, i.e. 0.5 -> 2.8 and
+    1.2 -> 4.2 jobs/s. The next ceiling is the forge's aggregate throughput under concurrency, not
+    contention.
     """
     work = _claimable(n)
     firsts = [work.preferred(owner)[0].id for owner in _owners(n)]

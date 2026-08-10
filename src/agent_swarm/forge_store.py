@@ -204,6 +204,14 @@ class Claimable:
         Rotating the start position by a hash of the owner spreads them with NO coordination --
         which is the property that matters, because a coordinator would need its own claim.
 
+        WHAT THIS BUYS, MEASURED LIVE rather than predicted: jobs completed per round goes 1 -> 7 at
+        16 runners and 1 -> 3 at 8 (0.5 -> 2.8 and 1.2 -> 4.2 jobs/s). That is ~0.44N, NOT N -- the
+        balls-in-bins expectation, and the N figure was refuted the first time it met a real server.
+        Round WALL CLOCK does not improve at all (2194 ms contended vs 2495 ms spread at N=16): the
+        wall is set by the aggregate API-call volume both arms issue. So this is a throughput repair
+        and not a latency one, and after it the binding constraint is the forge's aggregate
+        throughput under concurrency rather than per-item contention.
+
         **A PREFERENCE ORDER, NOT A PARTITION, and that distinction is the whole design.** A
         partition (`jobs[i::n]`) starves: with three items and ten runners, seven get an empty
         shard and idle while work sits visible. This returns a PERMUTATION -- every job is still
