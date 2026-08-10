@@ -25,6 +25,7 @@ so the evidence has to repeat.
 
 from __future__ import annotations
 
+import ast
 import io
 import threading
 import time
@@ -39,6 +40,7 @@ from agent_swarm.forge import Comment, CommentGone, Forge, ForgeError, GiteaForg
 from agent_swarm.forge_store import (
     NOT_VISIBLE,
     VERDICT_LABELS,
+    DuplicateWorkItems,
     ForgeStore,
     NotVisible,
     Role,
@@ -184,8 +186,19 @@ class RecordingForge:
             return self.items[number].state
 
     def retire_work_item(self, number: int) -> None:
+        """Closes AND retitles, because a retired item must stop matching its title.
+
+        The fake used only to close, which made it gentler than every real forge: retired items went
+        on answering title lookups, so `reconcile_duplicates` would have retired the same ones
+        forever and the test that counts survivors could never pass. Exactly the audit question from
+        the double note -- is this double better-behaved than reality, and does the difference hide
+        a failure class -- caught here by the sweep rather than in production.
+        """
         self.retired.append(number)
-        self.close_work_item(number)
+        with self._lock:
+            current = self.items[number]
+            suffix = '' if current.title.endswith(' (retired)') else ' (retired)'
+            self.items[number] = WorkItem(number=number, title=f'{current.title}{suffix}', state='closed')
 
 
 @pytest.fixture
@@ -828,3 +841,130 @@ class TestEditingAgainstTheRealForge:
         forge.delete_comment(number, beat)
         with pytest.raises(CommentGone):
             forge.update_comment(number, beat, 'BEAT 3')
+
+
+class TestTheDuplicateSubmitterReconciler:
+    """The cross-process half of the creation race, caught after the fact rather than prevented.
+
+    Deleting `_converge` made creation correct WITHIN a process and unguarded ACROSS them. Two
+    submitter processes for one key produce two work items and nothing detects it. Convergence is
+    not coming back -- it re-read the stale view whose removal was the point -- so the duplicate is
+    reconciled afterwards, loudly, by a sweep that is never on the create path.
+    """
+
+    @staticmethod
+    def _duplicate(forge: RecordingForge, count: int) -> tuple[ForgeStore, str]:
+        """Two submitter PROCESSES, modelled as two stores with no shared lock -- which is exactly
+        what the in-process lock cannot help with."""
+        job = Job(id='raced', kind=TEST_RUN)
+        title = f'[swarm] ns/{job.claim_key()}'
+        for _ in range(count):
+            ForgeStore('ns', forge, role=Role.SUBMITTER).register(job)
+        return ForgeStore('ns', forge, role=Role.SUBMITTER), title
+
+    def test_ONE_ITEM_survives_and_that_is_the_assertion(self, recording_forge):
+        """COUNT THE ITEMS, NOT THE WINNERS. Sixteen winners is ambiguous about the cause -- it is
+        equally consistent with broken arbitration and with duplicated items -- while one item is
+        not. That distinction is what hole 1 cost us the first time.
+        """
+        store, title = self._duplicate(recording_forge, 8)
+        with pytest.raises(DuplicateWorkItems):
+            store.reconcile_duplicates()
+        alive = [i for i in recording_forge.list_work_items() if i.title == title]
+        assert len(alive) == 1, f'{len(alive)} items survived the reconciler'
+
+    def test_the_LOWEST_number_is_the_survivor(self, recording_forge):
+        """Server-assigned and monotonic on both forges, so every observer converges on the same
+        survivor without coordinating -- and the earlier item is the one runners are likelier to
+        have already found.
+        """
+        store, title = self._duplicate(recording_forge, 5)
+        numbers = sorted(i.number for i in recording_forge.list_work_items() if i.title == title)
+        with pytest.raises(DuplicateWorkItems):
+            store.reconcile_duplicates()
+        alive = [i for i in recording_forge.list_work_items() if i.title == title]
+        assert [i.number for i in alive] == [numbers[0]]
+
+    def test_it_is_LOUD_about_every_retirement(self, recording_forge):
+        """Silent dedup hides a submitter racing itself forever, and an hourly tidy-up would make
+        the source impossible to find while the fleet looked healthy.
+        """
+        store, _ = self._duplicate(recording_forge, 4)
+        with pytest.raises(DuplicateWorkItems) as caught:
+            store.reconcile_duplicates()
+        assert len(caught.value.findings) == 3
+        assert 'submitter raced itself' in str(caught.value)
+        assert all(f.kept < f.retired for f in caught.value.findings)
+
+    def test_it_RETIRES_rather_than_deleting_or_merging(self, recording_forge):
+        """Detection and retirement only -- the same ruling as the tamper case. Merging would invent
+        a history that never happened, and HOW an item is retired is the forge's business.
+        """
+        store, title = self._duplicate(recording_forge, 3)
+        survivor = min(i.number for i in recording_forge.list_work_items() if i.title == title)
+        recording_forge.add_comment(survivor, 'a comment the reconciler must not touch')
+        before = recording_forge.comments(survivor)
+        with pytest.raises(DuplicateWorkItems):
+            store.reconcile_duplicates()
+        assert recording_forge.comments(survivor) == before, 'the reconciler edited the survivor'
+        assert len(recording_forge.retired) == 2
+
+    def test_reconciling_TWICE_is_silent_the_second_time(self, recording_forge):
+        """What the retirement contract buys. An implementation that merely CLOSED a duplicate would
+        leave it matching its title, and this sweep would then alarm about the same items forever --
+        which is how a real alarm gets ignored.
+        """
+        store, _ = self._duplicate(recording_forge, 4)
+        with pytest.raises(DuplicateWorkItems):
+            store.reconcile_duplicates()
+        assert ForgeStore('ns', recording_forge, role=Role.SUBMITTER).reconcile_duplicates() == []
+
+    def test_a_clean_namespace_is_SILENT(self, recording_forge):
+        """An alarm that fires on the normal case is not an alarm."""
+        ForgeStore('ns', recording_forge, role=Role.SUBMITTER).register(JOB)
+        assert ForgeStore('ns', recording_forge, role=Role.SUBMITTER).reconcile_duplicates() == []
+
+    def test_it_cannot_reach_ANOTHER_namespace(self, recording_forge):
+        """Scoped by the same title prefix as `purge_namespace`, so another swarm's duplicates are
+        not this sweep's to retire -- and its items are not this sweep's to count.
+        """
+        self._duplicate(recording_forge, 3)
+        assert ForgeStore('other', recording_forge, role=Role.SUBMITTER).reconcile_duplicates() == []
+        assert recording_forge.retired == []
+
+    def test_a_RUNNER_may_not_reconcile(self, recording_forge):
+        """Retiring is a write to the work-item lifecycle, which is the submitter's, and default-deny
+        is the rule that stopped runners creating in the first place.
+        """
+        self._duplicate(recording_forge, 2)
+        with pytest.raises(PermissionError):
+            ForgeStore('ns', recording_forge, role=Role.RUNNER).reconcile_duplicates()
+
+    def test_it_is_NOT_on_the_hot_path(self):
+        """A background sweep may be arbitrarily late; the create path may not be slow. A create
+        that waited for a list would be the deleted convergence mitigation wearing a new name, so
+        this checks the SOURCE rather than trusting the docstring.
+        """
+        source = Path(forge_store_module.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        hot = {'try_claim', 'register', '_item_number', '_from_index', 'record_verdict'}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in hot:
+                called = {
+                    n.func.attr for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                }
+                assert 'reconcile_duplicates' not in called, f'{node.name} calls the sweep inline'
+
+    def test_the_cache_does_not_keep_pointing_at_a_RETIRED_item(self, recording_forge):
+        """A store that had resolved a loser must not go on confirming it. Left in place, its index
+        entry would resolve to a retired item whose title no longer matches -- reported as index
+        corruption, which is loud but blames the wrong thing.
+        """
+        job = Job(id='raced', kind=TEST_RUN)
+        loser_store = ForgeStore('ns', recording_forge, role=Role.SUBMITTER)
+        ForgeStore('ns', recording_forge, role=Role.SUBMITTER).register(job)
+        loser_store.register(job)
+
+        with pytest.raises(DuplicateWorkItems):
+            loser_store.reconcile_duplicates()
+        assert loser_store.work_item_number(job) == 1

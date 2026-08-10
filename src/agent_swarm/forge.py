@@ -172,6 +172,13 @@ class Forge(Protocol):
         THE VERB IS DELIBERATELY NOT "DELETE". Gitea 1.26.4 on our deployment closes-and-retitles;
         another forge may hard-delete. The store must not care which, or it would grow a vendor
         conditional in exactly the place -- cleanup -- where nobody would ever notice it was wrong.
+
+        **THE ONE THING EVERY IMPLEMENTATION MUST GUARANTEE: a retired item stops matching its
+        title, and is no longer open.** Deleting achieves both; closing-and-retitling achieves both.
+        An implementation that only CLOSED would leave a retired duplicate answering title lookups,
+        so `_lowest_numbered` could resolve a live job to an item nobody is working. This is the
+        closest thing to a behavioural requirement in this protocol, and it is stated here because
+        it cannot be checked from outside the implementation.
         """
         ...
 

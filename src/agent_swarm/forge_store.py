@@ -119,6 +119,32 @@ _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 _ITEM_TITLE_ROOT = '[swarm]'
 
 
+@dataclass(frozen=True, slots=True)
+class RetiredDuplicate:
+    """One work item retired because another item claimed the same identity."""
+
+    title: str
+    kept: int
+    retired: int
+
+
+class DuplicateWorkItems(RuntimeError):
+    """A key had more than one work item, and the extras have been retired.
+
+    RAISED AFTER THE WORK, NOT INSTEAD OF IT -- the same shape as `Spool.drain`'s backlog alarm and
+    for the same reason: a caller ignores a return value by not reading it, and it cannot ignore
+    this. The duplicates ARE cleaned up; what must not happen is that the cleanup is quiet.
+
+    Silent dedup would hide a submitter racing itself indefinitely. That is a bug to fix at its
+    source -- two `ci.py candidate` invocations for one testkey -- and a sweep that tidied up after
+    it every hour would make the source impossible to find, while the fleet looked healthy.
+    """
+
+    def __init__(self, message: str, findings: list[RetiredDuplicate]) -> None:
+        super().__init__(message)
+        self.findings = findings
+
+
 class Role(enum.Enum):
     """Who this store is, and therefore what it is ALLOWED to do.
 
@@ -518,6 +544,87 @@ class ForgeStore:
         return min(matches) if matches else None
 
     # -- housekeeping ------------------------------------------------------------------------
+
+    def reconcile_duplicates(self) -> list[RetiredDuplicate]:
+        """Find every key with more than one work item, keep the LOWEST, retire the rest.
+
+        WHY THIS EXISTS. Deleting `_converge` made creation correct within a process -- the
+        in-process lock -- and unguarded across them. Two submitter PROCESSES for one key produce
+        two work items and nothing detects it. Convergence is not coming back: it re-read the stale
+        view whose removal was the whole point, and on GitHub it did not return even the reader's
+        own just-created issue, 24 of 24 times. So the duplicate is caught AFTER the fact instead of
+        prevented by a read that does not work.
+
+        **A BACKGROUND SWEEP, NEVER THE HOT PATH.** It may be arbitrarily late; the create path may
+        not be slow, and a create that waited for a list would be the deleted mitigation wearing a
+        new name. Nothing in `try_claim`, `register` or `_item_number` calls this, and a test
+        tokenises those to keep it so. The caller owns the schedule and must leave the backend's
+        list-staleness window behind it -- a sweep that ran a millisecond after a create could
+        retire an item whose sibling had not yet appeared, and then retire the other one next time.
+
+        IT IS IDEMPOTENT: only OPEN items are considered, and retiring closes them, so running it
+        twice alarms once. An alarm that fires every hour about work already done is one that gets
+        filtered out of somebody's inbox, and then the real one is filtered out too.
+
+        LOWEST WINS, because issue numbers are server-assigned and monotonic on both forges, so
+        every observer converges on the same survivor without coordinating. Retiring the LATER one
+        also loses less: the earlier item is the one runners are more likely to have found.
+
+        DETECTION AND RETIREMENT ONLY. Nothing is merged and nothing is resurrected -- the survivor
+        is not touched, and comments on a retired duplicate are not copied across. Merging would
+        invent a history that never happened, and the same ruling was made for verdict tampering:
+        the system reports, a human decides.
+
+        FORGE-NEUTRAL: the duplicate-submitter race follows from "no compare-and-swap", not from
+        Gitea. HOW an item is retired is the forge's business, which is why this calls
+        `retire_work_item` and does not spell out close-versus-delete.
+
+        Returns:
+            What was retired, oldest key first. Empty means the fleet is behaving.
+
+        Raises:
+            DuplicateWorkItems: at least one duplicate was found. The findings ride on the
+                exception, so nothing is lost by raising.
+            PermissionError: a runner may not retire work items; the lifecycle is the submitter's.
+        """
+        if self.role is Role.RUNNER:
+            msg = f'a {Role.RUNNER.value} store may not reconcile work items; that is the submitter lifecycle'
+            raise PermissionError(msg)
+
+        prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        by_title: dict[str, list[int]] = {}
+        for item in self.forge.list_work_items():
+            # OPEN ITEMS ONLY, and that is what makes this sweep IDEMPOTENT rather than an alarm
+            # that fires forever. Retirement closes the item, so a second pass has nothing to find.
+            # Filtering on the vendor's retirement DECORATION instead would mean knowing what each
+            # forge appends -- and a closed item is in any case either answered (its verdict is on
+            # record; leave it) or already retired.
+            if item.state == 'open' and item.title.startswith(prefix):
+                by_title.setdefault(item.title, []).append(item.number)
+
+        findings: list[RetiredDuplicate] = []
+        for title, numbers in sorted(by_title.items()):
+            if len(numbers) < 2:
+                continue
+            kept = min(numbers)
+            for duplicate in sorted(numbers):
+                if duplicate == kept:
+                    continue
+                self.forge.retire_work_item(duplicate)
+                findings.append(RetiredDuplicate(title=title, kept=kept, retired=duplicate))
+            # The cache and the index may be pointing at a loser; drop both so the next lookup
+            # resolves cleanly rather than confirming a retired item forever.
+            self._item_numbers.pop(title, None)
+
+        if findings:
+            msg = (
+                f'{len(findings)} duplicate work item(s) retired across '
+                f'{len({f.title for f in findings})} key(s): '
+                + ', '.join(f'{f.title!r} kept #{f.kept} retired #{f.retired}' for f in findings)
+                + '. A key with two items means a submitter raced itself -- fix that, do not rely on this sweep.'
+            )
+            raise DuplicateWorkItems(msg, findings)
+        return findings
 
     def purge_namespace(self) -> None:
         """Retire every work item THIS namespace created.
