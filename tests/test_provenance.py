@@ -243,6 +243,46 @@ class TestTheProvenanceLineCannotCarryACredential:
         plain = '{"url":"file:///C:/Users/linxu/Documents/PEMC/.pinned/agent-swarm-67c7aea","dir_info":{}}'
         assert redact_url_credentials(plain) == plain
 
+    def test_a_userinfo_with_NO_COLON_is_left_alone(self):
+        """THE COLON IS THE DISCRIMINATOR. `ssh://git@github.com/o/r.git` carries no secret -- the
+        `git` is a fixed protocol username. A pattern eating any userinfo destroys real provenance
+        to remove nothing, which is a redaction with a cost and no benefit.
+
+        The existing no-credential test uses a `file://` URL, which has no userinfo at all, so it
+        could never have discriminated this. The behaviour was already right; nothing guarded it.
+        """
+        plain = '{"url": "ssh://git@github.com/DawnEver/agent-swarm.git"}'
+        assert redact_url_credentials(plain) == plain
+
+    def test_TWO_urls_on_one_line_are_redacted_INDEPENDENTLY(self):
+        """THE MATCH MUST BE BOUNDED. A greedy pattern swallows everything between the first `//`
+        and the last `@`, which is correct on a single-URL payload and destroys a multi-URL one --
+        so the common case is the one that hides the defect.
+
+        Asserted in the direction that costs something: the surviving text between the two URLs.
+        """
+        text = 'from https://oauth2:ghp_A@github.com/o/r.git and https://u:ghp_B@gitea.local/o/s.git'
+
+        redacted = redact_url_credentials(text)
+
+        assert 'ghp_A' not in redacted and 'ghp_B' not in redacted
+        assert redacted.count('<redacted>') == 2
+        assert 'github.com/o/r.git and https://' in redacted, 'a greedy match ate the text between the URLs'
+
+    def test_a_credentialed_url_does_not_swallow_the_PLAIN_one_after_it(self):
+        """The same boundedness, in the asymmetric arrangement -- the second URL has no `@` at all,
+        so a pattern greedy in the OTHER direction runs past it and takes the whole path with it.
+
+        STATED BECAUSE IT IS TRUE: this test did NOT red under either mutation that was actually
+        applied (`(//)[^/\\s"]*@` and `(//).*:.*@`). Against `.*:.*@` the last `@` is the only one,
+        so the match stops where it should by accident. It is kept as a guard on a variant those two
+        do not reach, not as evidence -- the discriminating pair is the two tests above it.
+        """
+        redacted = redact_url_credentials('https://oauth2:ghp_C@github.com/o/r.git then https://gitea.local/o/s')
+
+        assert 'ghp_C' not in redacted
+        assert redacted.endswith('then https://gitea.local/o/s')
+
     def test_it_stays_valid_JSON_so_a_reader_can_still_parse_it(self):
         text = redact_url_credentials('{"url": "https://u:p@h/x.git", "dir_info": {}}')
         assert json.loads(text)['url'] == 'https://<redacted>@h/x.git'

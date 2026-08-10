@@ -31,6 +31,17 @@ quote-style = "single"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# THE SUITE MUST TEST THIS TREE, and without this line it did not. `agent_swarm` is also INSTALLED
+# into the interpreter that runs these tests (a pinned, non-editable copy, deliberately). With no
+# `pythonpath`, `import agent_swarm` resolved to site-packages, so every offline run was a verdict
+# about the PIN and not about the working tree -- green, plausible, and about the wrong code.
+#
+# Found by sabotage: two mutations were applied to `src/agent_swarm/provenance.py`, the suite was
+# re-run, and it stayed green. The tests were not weak; they never saw the edit. This is the same
+# shape as the index bug and the `0 ms` timing -- a working copy of a thing alibiing the copy under
+# test -- and it is the one that makes the other two hard to trust, because it is the mechanism by
+# which a revert-and-rerun proves nothing at all.
+pythonpath = ["src"]
 markers = [
     "live_forge: talks to a real forge over the network",
     "live_fabric: spawns a real LLM session on the fabric fleet (needs node)",
