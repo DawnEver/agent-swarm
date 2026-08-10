@@ -20,6 +20,7 @@ not check, which would make it worse than absent.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 from pathlib import Path
@@ -151,3 +152,54 @@ class TestATimingCannotBeQuotedWithoutItsProvenance:
         """
         source = (Path(__file__).resolve().parent / 'test_end_to_end.py').read_text(encoding='utf-8')
         assert 'running_provenance()' in source
+
+
+class TestNoCredentialCanReachAReportOrALog:
+    """The project invariant -- never log keys, tokens or fingerprints -- checked at the seam that
+    was just extracted, because counting calls means handling the thing being counted.
+
+    MEASURED, not assumed. With a raise forced into `_credential` immediately after the helper
+    returns (so the real 858-character token was live in that frame), the token appeared ZERO times
+    in the pytest report under `-q`, under `--showlocals`, and under `--showlocals --tb=long`.
+
+    THE EMPIRICAL RESULT IS NOT THE GUARD, THOUGH. It is one pytest version under three flag
+    combinations, and the dangerous path renders only when something has already gone wrong -- so it
+    is never exercised by a green run and would drift unnoticed. The assertions below are structural
+    instead: no credential-bearing name may be interpolated into any string in `forge.py`.
+    """
+
+    CREDENTIAL_NAMES = ('filled', '_token', 'password', 'token')
+
+    def test_no_credential_bearing_name_is_INTERPOLATED_into_any_string(self):
+        """An f-string is how a secret reaches a log, a report or an exception message, and the
+        exception message is the one that bites: it renders only on the failure path, so a green
+        suite says nothing about it.
+        """
+        source = (Path(__file__).resolve().parents[1] / 'src' / 'agent_swarm' / 'forge.py').read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        offenders: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            for part in ast.walk(node):
+                if isinstance(part, ast.Name) and part.id in self.CREDENTIAL_NAMES:
+                    offenders.append(f'line {node.lineno}: {part.id}')
+                if isinstance(part, ast.Attribute) and part.attr in self.CREDENTIAL_NAMES:
+                    offenders.append(f'line {node.lineno}: .{part.attr}')
+        assert not offenders, f'a credential-bearing name is formatted into a string: {offenders}'
+
+    def test_the_helper_is_never_run_with_check_TRUE(self):
+        """`subprocess.run(..., check=True)` raises `CalledProcessError`, whose repr carries stdout
+        -- which for this helper IS the credential. `check=False` is load-bearing, not a style
+        choice, and nothing else in the file says so.
+        """
+        source = (Path(__file__).resolve().parents[1] / 'src' / 'agent_swarm' / 'forge.py').read_text(encoding='utf-8')
+        assert 'check=True' not in source
+
+    def test_the_API_error_echoes_the_RESPONSE_never_the_request(self):
+        """The request carries the `Authorization` header; the response body is what explains a
+        refusal. Echoing the wrong one would put the token in every failed-call message.
+        """
+        source = (Path(__file__).resolve().parents[1] / 'src' / 'agent_swarm' / 'forge.py').read_text(encoding='utf-8')
+        message_line = next(line for line in source.splitlines() if 'exc.read()' in line)
+        assert 'request' not in message_line
