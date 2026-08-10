@@ -235,6 +235,16 @@ class GiteaForge:
     """
 
     def __init__(self, base_url: str, repo: str) -> None:
+        # THE SCHEME IS ALLOWLISTED, and the reason is not tidiness. `urllib.request` dispatches on
+        # the URL's scheme and honours `file:`, so a base URL of `file:///etc` would turn every API
+        # call into a LOCAL READ that still looks like a forge answering -- claims, verdicts and
+        # work items all fabricated from disk, with the retry loop faithfully retrying them. The
+        # value reaches here from the environment, so it is operator input, and this is the one
+        # place it can be refused before anything is built from it.
+        split = urllib.parse.urlsplit(base_url)
+        if split.scheme not in {'http', 'https'} or not split.netloc:
+            msg = f'base_url must be http:// or https:// with a host, got {base_url!r}'
+            raise ForgeError(msg)
         self.base_url = base_url.rstrip('/')
         self.repo = repo
         self._token: str | None = None

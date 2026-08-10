@@ -18,11 +18,13 @@ from __future__ import annotations
 import pytest
 
 from agent_swarm.forge import (
+    DEFAULT_GITEA_BASE_URL,
     GITHUB_CONFIRMED,
     GITHUB_DIVERGENCES,
     GITHUB_UNMEASURED,
     Comment,
     Forge,
+    ForgeError,
     GiteaForge,
     GitHubForge,
     WorkItem,
@@ -279,3 +281,37 @@ class TestRemovingALabelDetachesEveryIdSharingItsName:
 
         assert [m for m, _p in calls if m == 'POST'] == []
         assert [p for m, p in calls if m == 'DELETE'] == []
+
+
+# ---------------------------------------------------------------------------
+# The base URL is operator input and reaches urllib, which honours `file:`.
+
+
+@pytest.mark.parametrize(
+    'bad',
+    ['file:///etc/passwd', 'ftp://host/x', 'gopher://host/1', 'host:9000', 'http://', '', 'data:,x'],
+)
+def test_a_non_http_base_url_is_refused_where_it_enters(bad: str) -> None:
+    """`urllib.request` dispatches on the SCHEME. A `file:` base URL would turn every API call into
+    a local read that still looks like a forge answering -- work items, claims and verdicts all
+    fabricated from disk, with the retry loop dutifully retrying them. Refused at construction,
+    which is the one place the value can still be attributed to whoever supplied it.
+
+    THE SAME DEFECT EXISTED TWICE: `swarmctl`'s Gitea client had it too, and was rewritten onto
+    `http.client` (no scheme handler to reach at all). Fixed in both rather than in the copy that
+    happened to be under the cursor -- a duplicated scheme, not one drifted copy.
+    """
+    with pytest.raises(ForgeError, match='http'):
+        GiteaForge(bad, 'owner/repo')
+
+
+@pytest.mark.parametrize('good', ['http://host:9000', 'https://forge.example.com', 'https://h/gitea'])
+def test_http_and_https_are_accepted(good: str) -> None:
+    """The discriminating half: a guard that refused everything would also pass the test above."""
+    assert GiteaForge(good, 'owner/repo').base_url.startswith(('http://', 'https://'))
+
+
+def test_the_default_forge_url_satisfies_its_own_guard() -> None:
+    """The shipped default must not be refused by the check added for operator input -- otherwise
+    the guard is discovered by the first person to run the thing, not by this suite."""
+    assert GiteaForge(DEFAULT_GITEA_BASE_URL, 'owner/repo').base_url
