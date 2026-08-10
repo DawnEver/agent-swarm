@@ -83,7 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore
+from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore, NotVisible
 from agent_swarm.job import Job, JobKind
 from agent_swarm.store import VERDICTS
 
@@ -358,6 +358,7 @@ class ForgePublisher:
 
     def publish(self, entry: SpoolEntry) -> None:
         number = self.store.work_item_number(entry.job, create=True)
+        assert not isinstance(number, NotVisible)
         if self._marker_present(number, entry):
             # The comment landed and the process died before the rest. Finish it; do not repeat it.
             self._apply_verdict_state(number, entry)
@@ -366,7 +367,9 @@ class ForgePublisher:
 
     def is_published(self, entry: SpoolEntry) -> bool:
         number = self.store.work_item_number(entry.job)
-        if number is None:
+        if isinstance(number, NotVisible):
+            # NOT "published". An entry we cannot see is one we must try again, and a replay is
+            # idempotent by design -- whereas calling it published would drop the verdict silently.
             return False
         if not self._marker_present(number, entry):
             return False
@@ -383,7 +386,7 @@ class ForgePublisher:
         and exactly the thing the marker cannot certify.
         """
         number = self.store.work_item_number(entry.job)
-        if number is None:
+        if isinstance(number, NotVisible):
             return None
         for comment in self.store.forge.comments(number):
             if entry.marker() in comment.body:

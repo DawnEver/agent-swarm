@@ -54,6 +54,22 @@ LABEL_COLORS = {
 }
 _DEFAULT_LABEL_COLOR = '#ededed'
 
+#: MEASURED: how long a freshly created issue can stay invisible to a plain LIST query, per backend.
+#: This is the number `forge_store.ForgeStore(list_staleness_seconds=...)` wants, and it lives here
+#: because it is a fact about a VENDOR, not about the scheduler.
+#:
+#:     Gitea 1.26.4   plain list   0/25 stale                       -> 0.0
+#:     GitHub         plain list  22/22 stale, 0.42 s .. 6.36 s max -> 8.0 (measured max + margin)
+#:
+#: The GitHub number was NOT predicted: an 8-thread x 3-round integrated race left 8 duplicate work
+#: items every round, and the mode was `created-blind` -- the convergence re-read did not return
+#: even the reader's OWN just-created issue, 24 of 24 times. A mitigation that reads from the same
+#: stale view that caused the problem cannot work, which is why `ForgeStore.register` exists.
+LIST_STALENESS_SECONDS = {
+    'gitea': 0.0,
+    'github': 8.0,
+}
+
 
 class ForgeError(RuntimeError):
     """The forge refused something. Carries the status and body, NEVER the credential."""

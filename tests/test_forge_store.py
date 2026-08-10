@@ -37,8 +37,10 @@ import pytest
 from agent_swarm import forge_store as forge_store_module
 from agent_swarm.forge import Comment, Forge, GiteaForge, WorkItem, default_forge
 from agent_swarm.forge_store import (
+    NOT_VISIBLE,
     VERDICT_LABELS,
     ForgeStore,
+    NotVisible,
     decode_claim,
     encode_claim,
 )
@@ -599,3 +601,159 @@ class TestWhatOnlyTheRealServerCanSettle:
         server_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
         server_store.record_verdict(JOB, verdict='PASS', detail='green on retry')
         assert server_store.verdict(JOB) == 'PASS'
+
+
+class StaleListForge:
+    """A forge whose LIST lags, like GitHub's. THE HARNESS THIS BUG NEEDED.
+
+    `RecordingForge` is read-after-write fresh by construction, so the whole offline suite passed
+    for a design that produced 8 duplicate work items per round on a real GitHub repo. **Our test
+    double was fresher than reality**, which is the most expensive kind to own: it does not merely
+    fail to catch the bug, it certifies the bug as fixed.
+
+    This one hides items younger than `staleness` from `list_work_items` and from nothing else --
+    `create_work_item` still returns the number immediately, exactly as a 201 body does, and reads
+    by number stay fresh. That is precisely the measured GitHub shape:
+
+        plain list        22/22 stale, 0.42 s .. 6.36 s recovery
+        GET /issues/{n}    0/22 stale
+
+    It is a fake, and a fake proves nothing ABOUT GitHub. What it does is make a design that depends
+    on a fresh list fail offline, deterministically, in the second it takes to run -- the difference
+    between a bug we can hold still and one we can only observe.
+    """
+
+    def __init__(self, inner: RecordingForge, *, staleness: float) -> None:
+        self.inner = inner
+        self.staleness = staleness
+        self.created_at: dict[int, float] = {}
+        self.list_calls = 0
+
+    def list_work_items(self) -> list[WorkItem]:
+        self.list_calls += 1
+        now = time.monotonic()
+        return [
+            item
+            for item in self.inner.list_work_items()
+            if now - self.created_at.get(item.number, 0.0) >= self.staleness
+        ]
+
+    def create_work_item(self, *, title: str, body: str) -> int:
+        number = self.inner.create_work_item(title=title, body=body)
+        self.created_at[number] = time.monotonic()
+        return number
+
+    def __getattr__(self, name):
+        # Everything else -- comments, labels, state -- is a read BY NUMBER and is fresh on both
+        # forges. Only the list lags.
+        return getattr(self.inner, name)
+
+
+class TestAListQueryCannotSayABSENT:
+    """The bug this class exists for was invisible to the entire offline suite.
+
+    `_item_number` concluded "no such work item" from a LIST query and then created one. On Gitea
+    that is safe BY ACCIDENT -- its plain list is fresh. On GitHub the list was measured 22/22 stale
+    with up to 6.36 s recovery, so "nothing found" meant "created 200 ms ago and not replicated
+    yet", and the natural next line created a duplicate.
+    """
+
+    def test_the_answer_is_NOT_VISIBLE_never_None(self):
+        """The re-typing that makes the bug unwritable. `if number is None: create()` cannot be
+        written against a value that is never None -- and a comment saying so would have been prose
+        the code never consults.
+        """
+        store = ForgeStore('ns', StaleListForge(RecordingForge(), staleness=60.0))
+        answer = store.work_item_number(JOB)
+        assert answer is not None
+        assert isinstance(answer, NotVisible)
+
+    def test_a_hidden_item_reads_as_NOT_VISIBLE_rather_than_absent(self):
+        forge = StaleListForge(RecordingForge(), staleness=60.0)
+        ForgeStore('ns', forge).register(JOB)
+        assert isinstance(ForgeStore('ns', forge).work_item_number(JOB), NotVisible)
+
+    def test_NOT_VISIBLE_is_falsy_but_is_not_None(self):
+        """A visible item number is never 0 -- forges number from 1 -- so the falsy case is exactly
+        the unknown one, and `if not number:` is at least not silently wrong.
+        """
+        assert not NOT_VISIBLE
+        assert NOT_VISIBLE is not None
+
+
+class TestConcurrentCreationAgainstALAGGINGList:
+    """THE DISCRIMINATING HARNESS. All of this fails against the design that shipped this morning,
+    and none of it needs a network."""
+
+    @staticmethod
+    def _race(store_factory, racers: int = 8) -> set[int]:
+        """Race `racers` claimants at a job with no work item, and return the set of item numbers
+        they ended up arbitrating on.
+
+        CONVERGENCE IS THE VENDOR-NEUTRAL PROPERTY, not the raw item count: whether a retired
+        duplicate still matches a title search is the FORGE's business (this deployment retitles,
+        another hard-deletes), and asserting it here would put a vendor behaviour in a
+        vendor-agnostic test. What must hold everywhere is that every racer ended up on the SAME
+        item -- because that is what makes their claim comments contend at all.
+        """
+        job = Job(id='fresh', kind=TEST_RUN)
+        stores = [store_factory() for _ in range(racers)]
+        barrier = threading.Barrier(racers)
+
+        def attempt(n: int) -> None:
+            barrier.wait()
+            stores[n].try_claim(job, owner=f'r{n}')
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(racers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return {store.work_item_number(job) for store in stores}
+
+    def test_an_UNDECLARED_staleness_reproduces_the_measured_GitHub_failure(self):
+        """The bug, held still. Eight racers, a list that lags, a store that believes the list:
+        many work items, each racer then arbitrating flawlessly on its own -- which is exactly what
+        the real probe reported and exactly what a fresh double can never show.
+
+        The assertion is about the ITEM COUNT, not the winner count: eight winners is ambiguous
+        about the cause, eight items is not.
+        """
+        forge = StaleListForge(RecordingForge(), staleness=30.0)
+        resolved = self._race(lambda: ForgeStore('ns', forge, list_staleness_seconds=0.0))
+        assert len(resolved) > 1, 'the harness is not reproducing the lag it exists to reproduce'
+        assert len(resolved) == 8, f'expected every racer on its own item, got {sorted(resolved)}'
+
+    def test_a_DECLARED_staleness_converges_on_one_item(self):
+        """The mitigation, and it is ONLY a mitigation: it works because the declared window is
+        larger than this fake's lag. Declare it too small and the previous test is what you get --
+        which is why the constant carries its measurement and is not a knob to tune until green.
+        """
+        forge = StaleListForge(RecordingForge(), staleness=0.3)
+        resolved = self._race(lambda: ForgeStore('ns', forge, list_staleness_seconds=0.8))
+        assert len(resolved) == 1, f'racers arbitrated on different work items: {sorted(resolved)}'
+
+    def test_REGISTER_deletes_the_race_without_any_window_at_all(self):
+        """THE ACTUAL FIX. A single writer creates once; runners only discover and claim. No sleep,
+        no window, no dependence on replication -- and it holds with the list lagging by thirty
+        seconds, which no amount of convergence tuning could survive.
+        """
+        forge = StaleListForge(RecordingForge(), staleness=30.0)
+        job = Job(id='fresh', kind=TEST_RUN)
+        number = ForgeStore('ns', forge).register(job)
+
+        title = f'[swarm] ns/{job.claim_key()}'
+        items = [i for i in forge.inner.list_work_items() if i.title == title]
+        assert len(items) == 1
+        assert items[0].number == number
+
+    def test_register_does_not_RE_READ_to_find_what_it_just_created(self):
+        """`POST /issues` returns the number in its 201 body -- authoritative, fresh, free. Creating
+        and then listing to find your own creation is strictly worse on EVERY forge, and on GitHub
+        it was measured to fail outright: the re-read missed the reader's own issue 24 of 24 times.
+        """
+        forge = StaleListForge(RecordingForge(), staleness=30.0)
+        store = ForgeStore('ns', forge)
+        before = forge.list_calls
+        store.register(Job(id='fresh', kind=TEST_RUN))
+        assert forge.list_calls == before, 'register consulted the list it must not trust'

@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import ClassVar, Self
 
 from agent_swarm.forge import Forge
 from agent_swarm.job import Job
@@ -109,6 +110,53 @@ VERDICT_LABELS = {
 _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 
 _ITEM_TITLE_ROOT = '[swarm]'
+
+
+class NotVisible:
+    """The answer a LIST query is actually able to give: "I cannot see it", never "it is absent".
+
+    THIS TYPE EXISTS TO MAKE A BUG UNWRITABLE. `_item_number` used to return ``None`` for "no such
+    work item", and every caller then did the only natural thing with a ``None`` -- created one. On
+    Gitea that is safe by accident, because its plain list is read-after-write fresh. On GitHub the
+    plain list was measured **22/22 stale**, recovering in 0.42-6.36 s, so "None" meant "created 200
+    ms ago and not replicated yet" and the natural branch created a duplicate.
+
+    A comment saying "do not treat this as absent" would have been prose the code never consults.
+    A distinct type is a declaration the caller MUST handle, and `if number is None: create()`
+    cannot be written against it.
+    """
+
+    _instance: ClassVar[NotVisible | None] = None
+
+    def __new__(cls) -> Self:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return 'NOT_VISIBLE'
+
+    def __bool__(self) -> bool:
+        # FALSY ON PURPOSE, so `if not number:` is at least not silently wrong -- but note that a
+        # visible item number can never be 0 (forges number from 1), so the falsy case is exactly
+        # the unknown one.
+        return False
+
+
+#: "The list cannot see it." Never "it does not exist".
+NOT_VISIBLE = NotVisible()
+
+#: How long a freshly created work item may stay invisible to a LIST query on this backend.
+#:
+#: THE VALUE IS A VENDOR FACT AND LIVES WITH THE VENDOR -- see `forge.LIST_STALENESS_SECONDS`, which
+#: carries the measurements. This module keeps only the neutral default, because a per-backend
+#: number spelled here would put a vendor name in the one file that must not have one, and the test
+#: that tokenises this module for vendor names is what caught the first attempt.
+#:
+#: It is a **probability improvement, never a guarantee**: the window belongs to the forge's
+#: replication and the forge may change it tomorrow. NOT A KNOB TO TUNE UNTIL A TEST PASSES -- if a
+#: value has to grow to make something go green, the thing to change is the design. See `register`.
+DEFAULT_LIST_STALENESS_SECONDS = 0.0
 
 
 # --------------------------------------------------------------------------------------------
@@ -183,7 +231,15 @@ class ForgeStore:
     Construction performs NO I/O -- not a connection, not a credential read.
     """
 
-    def __init__(self, namespace: str, forge: Forge, *, lease_seconds: float = DEFAULT_LEASE_SECONDS) -> None:
+    def __init__(
+        self,
+        namespace: str,
+        forge: Forge,
+        *,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        list_staleness_seconds: float = DEFAULT_LIST_STALENESS_SECONDS,
+    ) -> None:
+        self.list_staleness_seconds = list_staleness_seconds
         if lease_seconds <= 0:
             # Refused at construction rather than at the claim: a zero lease makes `try_claim`
             # return False forever, which reads as healthy contention rather than as a bug.
@@ -199,6 +255,7 @@ class ForgeStore:
     def try_claim(self, job: Job, *, owner: str) -> bool:
         """Post a claim, then read the list once. Lowest live comment id wins."""
         number = self._item_number(job, create=True)
+        assert not isinstance(number, NotVisible)
         mine = self.forge.add_comment(number, encode_claim(owner=owner, expires_at=time.time() + self.lease_seconds))
 
         holder = self._holder(number, now=time.time())
@@ -216,7 +273,10 @@ class ForgeStore:
 
     def claim_owner(self, job: Job) -> str | None:
         number = self._item_number(job)
-        if number is None:
+        if isinstance(number, NotVisible):
+            # An item we cannot see holds no claim WE can honour. This errs toward "unclaimed",
+            # which risks a duplicate run; the lease bounds that, and the alternative -- reporting a
+            # claim we cannot read -- would deadlock the job instead.
             return None
         holder = self._holder(number, now=time.time())
         return holder.owner if holder else None
@@ -224,7 +284,7 @@ class ForgeStore:
     def release(self, job: Job, *, owner: str) -> None:
         """Release `job` if `owner` holds it. A non-owner's release is a no-op, never a steal."""
         number = self._item_number(job)
-        if number is None:
+        if isinstance(number, NotVisible):
             return
         holder = self._holder(number, now=time.time())
         if holder is not None and holder.owner == owner:
@@ -256,6 +316,7 @@ class ForgeStore:
             raise ValueError(msg)
 
         number = self._item_number(job, create=True)
+        assert not isinstance(number, NotVisible)
         self.forge.add_comment(number, f'**{verdict}**\n\n```\n{detail}\n```')
 
         # Exactly one verdict label at a time. A retry after INCONCLUSIVE that merely ADDED `pass`
@@ -268,7 +329,11 @@ class ForgeStore:
 
     def verdict(self, job: Job) -> str | None:
         number = self._item_number(job)
-        if number is None:
+        if isinstance(number, NotVisible):
+            # `None` here means "not answered", and an invisible item is reported as unanswered --
+            # so a stale read costs a RE-RUN, never an unearned green. That is the safe direction
+            # and it is not free: on GitHub it can cost a 25-minute gate. The fix is a local
+            # testkey -> number index, which is a layer above this one.
             return None
         for label in self.forge.labels(number):
             word = _LABEL_TO_VERDICT.get(label)
@@ -284,67 +349,104 @@ class ForgeStore:
         as the gate's output -- plausible, wrong, and nothing would flag it.
         """
         number = self._item_number(job)
-        if number is None:
+        if isinstance(number, NotVisible):
             return ''
         bodies = [c.body for c in self.forge.comments(number) if decode_claim(c.body, comment_id=c.id) is None]
         return bodies[-1] if bodies else ''
 
     def item_state(self, job: Job) -> str | None:
         number = self._item_number(job)
-        return None if number is None else self.forge.state(number)
+        return None if isinstance(number, NotVisible) else self.forge.state(number)
 
-    def work_item_number(self, job: Job, *, create: bool = False) -> int | None:
-        """Which work item carries `job`, creating it if asked. ``None`` if absent and not creating.
+    def work_item_number(self, job: Job, *, create: bool = False) -> int | NotVisible:
+        """Which work item carries `job`. Returns a number or :data:`NOT_VISIBLE` -- NEVER "absent".
 
-        PUBLIC SO THAT NOBODY ELSE HAS TO REDERIVE THE TITLE SCHEME. `spool.ForgePublisher` needs
-        the item in order to scan for its replay marker, and the alternative -- spelling
-        `[swarm] <namespace>/<claim_key>` a second time in a second module -- is a duplicated
-        scheme rather than one drifted copy, which is the defect class this project names first. It
-        stays a READ plus the same create-and-converge the store already does; it decides nothing
-        new.
+        PUBLIC SO THAT NOBODY ELSE REDERIVES THE TITLE SCHEME. `spool.ForgePublisher` needs the item
+        to scan for its replay marker, and spelling `[swarm] <namespace>/<claim_key>` a second time
+        in a second module would be a duplicated scheme rather than one drifted copy.
         """
         return self._item_number(job, create=create)
 
     def _item_title(self, job: Job) -> str:
+        """The ONE spelling of a work item's identity. Everything that needs to find a job's item
+        goes through here, so there is one scheme rather than two copies drifting apart."""
         return f'{_ITEM_TITLE_ROOT} {self.namespace}/{job.claim_key()}'
 
-    def _item_number(self, job: Job, *, create: bool = False) -> int | None:
-        """The work item for `job`, created if absent. LOWEST NUMBER WINS, for the same reason.
+    def register(self, job: Job) -> int:
+        """Create this job's work item ONCE, from the single writer that owns submitting it.
 
-        CREATION IS A RACE TOO, AND IT WAS THE ONE THAT BIT. Sixteen runners claiming a job whose
-        item does not exist yet all read an empty list, all create an item, and each then arbitrates
-        the claim on its OWN issue -- sixteen comment streams, sixteen lowest comments, sixteen
-        winners. Measured exactly that way against the real server: 16/16 believed they won, with
-        the claim protocol itself working perfectly on each of sixteen wrong issues.
+        **THIS IS THE FIX, AND EVERYTHING BELOW IT IS MITIGATION.** Concurrent creation is a race
+        that no amount of re-reading closes on a forge whose list lags -- measured on GitHub, 8
+        threads x 3 rounds left 8 duplicate items EVERY round, and the failure was not "each runner
+        arbitrated on its own item" but `created-blind`: the convergence re-read did not return even
+        the reader's OWN just-created issue, 24 of 24 times. A mitigation that reads from the same
+        stale view that caused the problem cannot work.
 
-        The fix is the protocol applied one level up, not a lock. An issue number is server-assigned
-        and monotonic, exactly like a comment id, so: create, re-read, and take the LOWEST-numbered
-        item carrying this title. Every racer converges on the same one. A runner that finds its own
-        creation was not the winner retires it, so the duplicate stops matching the title and the
-        list heals instead of accumulating.
+        So: the submitter calls `register` exactly once and records the number; runners DISCOVER and
+        claim, never create. That mirrors the retired ref design, where only `ci.py` wrote
+        `refs/candidates/*` and only `ci_tick` read them -- elimination, not mitigation.
+
+        Returns the number from the creation response, which is authoritative and fresh on every
+        forge. It does not re-read to find what it just made; see `_item_number`.
         """
+        title = self._item_title(job)
+        number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
+        self._item_numbers[title] = number
+        return number
+
+    def _item_number(self, job: Job, *, create: bool = False) -> int | NotVisible:
         title = self._item_title(job)
         cached = self._item_numbers.get(title)
         if cached is not None:
             return cached
 
         found = self._lowest_numbered(title)
-        if found is None:
-            if not create:
-                return None
-            mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
-            # Re-read AFTER creating: anyone who created concurrently is now visible, and the
-            # lowest number is the one every racer will independently agree on.
-            found = self._lowest_numbered(title)
-            if found is None or found > mine:  # pragma: no cover -- our own create must be visible
-                found = mine
-            if found != mine:
-                self.forge.retire_work_item(mine)
+        if found is not None:
+            self._item_numbers[title] = found
+            return found
+        if not create:
+            # NOT `None`. The list said "I cannot see it", and the caller must not be able to read
+            # that as "it is not there" -- which is the exact substitution that produced duplicates.
+            return NOT_VISIBLE
 
-        self._item_numbers[title] = found
+        # THE CREATION RESPONSE IS THE ONLY FRESH ANSWER. `POST /issues` returns the number in its
+        # 201 body: authoritative, immediate, free. Any code that creates and then lists to find
+        # what it just created is strictly worse, and is a bug on BOTH forges even though only one
+        # exposes it.
+        mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
+
+        winner = self._converge(title, mine)
+        self._item_numbers[title] = winner
+        return winner
+
+    def _converge(self, title: str, mine: int) -> int:
+        """Agree with concurrent creators on ONE item, as far as the backend permits.
+
+        A PROBABILITY IMPROVEMENT, NOT A GUARANTEE, and the docstring says so because the code
+        cannot. Issue numbers are server-assigned and monotonic, so "lowest wins" converges IF every
+        racer can see the others. When the list lags, they cannot, and each keeps its own -- which is
+        precisely the measured GitHub failure. `list_staleness_seconds` buys a window; it does not
+        close one, and a caller that needs a guarantee must use `register` instead.
+        """
+        if self.list_staleness_seconds > 0:
+            # Sleeping is ugly and it is the honest shape: the delay belongs to the forge's
+            # replication, and pretending otherwise would put the lie in the code instead of here.
+            time.sleep(self.list_staleness_seconds)
+        found = self._lowest_numbered(title)
+        if found is None or found >= mine:
+            return mine
+        # Someone earlier exists and is visible. Retire our duplicate so the list heals rather than
+        # accumulating; retirement is the FORGE's business, which is why it is not spelled out here.
+        self.forge.retire_work_item(mine)
         return found
 
     def _lowest_numbered(self, title: str) -> int | None:
+        """The lowest-numbered VISIBLE item with this title, or ``None`` for "none visible".
+
+        Private, and the ``None`` stays inside this class: at this depth "not visible" and "not
+        there" are genuinely the same observation, and it is the PUBLIC boundary that must refuse to
+        let a caller confuse them.
+        """
         matches = [item.number for item in self.forge.list_work_items() if item.title == title]
         return min(matches) if matches else None
 
