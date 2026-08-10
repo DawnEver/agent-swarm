@@ -120,6 +120,24 @@ _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 
 _ITEM_TITLE_ROOT = '[swarm]'
 
+#: THE HANDOVER LABEL. An item without it is NOT work, whoever created it and whatever its title.
+#:
+#: WHY DEFAULT-DENY. The alternative -- claimable unless a `swarm:hold` label says otherwise -- puts
+#: the cost of FORGETTING on the side where forgetting is normal: a human who meant to keep an item
+#: and did not say so gets an agent editing the same files. Two labels with opposite meanings are
+#: also a state machine nobody maintains. One label, absent by default, and the failure of memory
+#: costs an item that sits still.
+#:
+#: WHAT IT ADDS BEYOND THE TITLE PREFIX, which already excludes anything this store did not create:
+#: **taking work back mid-flight.** Removing the label is a one-click stop that needs no CLI, no
+#: credential and no race with a runner -- the next `claimable` simply stops offering it. Before
+#: this there was no lever at all short of closing the item, which is also how work is ANSWERED.
+#:
+#: Store-created items get it at creation, so the CI loop needs no human in it. That asymmetry is
+#: the design: the swarm hands work to itself, and a human hands work over by adding one label.
+READY_LABEL = 'swarm:ready'
+
+
 #: Prefix for the labels carrying what the SUBMITTER asked to be run.
 #:
 #: DECLARED, NEVER RECOMPUTED. The ref transport had nowhere to put this, so both `ci.py candidate`
@@ -540,7 +558,13 @@ class ForgeStore:
             if job is None:
                 continue
             self._item_numbers[item.title] = item.number
-            if any(label in _LABEL_TO_VERDICT for label in self.forge.labels(item.number)):
+            labels = self.forge.labels(item.number)
+            if any(label in _LABEL_TO_VERDICT for label in labels):
+                continue
+            # DEFAULT DENY. Read from the SAME label fetch as the verdict check -- a second call
+            # would be a second observation of a mutable thing, and an item whose label was removed
+            # between them would read as claimable on one line and withdrawn on the next.
+            if READY_LABEL not in labels:
                 continue
             jobs.append(job)
         return Claimable(jobs=tuple(jobs))
@@ -608,6 +632,11 @@ class ForgeStore:
             raise PermissionError(msg)
         title = self._item_title(job)
         number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
+        # HANDED OVER AT BIRTH: the swarm creating work for itself needs no human in the
+        # loop. A create that succeeds and a label that fails leaves an item nobody picks up
+        # -- visible and inert, which is the safe direction; the opposite order would leave
+        # a label on nothing.
+        self.forge.add_label(number, READY_LABEL)
         self._item_numbers[title] = number
         for requested in sorted(set(requests)):
             if not requested:
@@ -695,6 +724,7 @@ class ForgeStore:
             # asking the list to confirm what we just made is the `created-blind` failure: measured
             # on GitHub, the re-read did not return the reader's OWN issue 24 of 24 times.
             mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
+            self.forge.add_label(mine, READY_LABEL)  # see `register`: handed over at birth
             self._item_numbers[title] = mine
             self._remember(job, mine)
             return mine
