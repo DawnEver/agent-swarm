@@ -21,13 +21,15 @@ THE SCHEMA (version 1):
     key = 'spool-retention'            # required, unique, stable, human-chosen; the id's prefix
     title = 'Retention for refs/ci/…'  # required; the worker's brief. MATERIAL.
     acceptance = 'pytest tests/… -q'   # required, non-blank; how the verdict is decided. MATERIAL.
+    rem = 'MANUAL-20260614-001'        # required; the rem finding this was admitted FROM, or 'human'
     priority = 5                       # optional, 0..9 (allocator.PRIORITY_*). A hint.
     needs = ['other-key']              # optional; a cycle RAISES
     exclusivity = 'cheap'              # optional; admission class. Defaults to the whole box.
     ram_gib = 0.5                      # optional; omit when unmeasured -- never write 0
 
 Anything else is an error. `needs`, `priority`, `exclusivity` and `ram_gib` are SCHEDULING facts and
-deliberately not part of the identity; see `_material_id`.
+deliberately not part of the identity; see `_material_id`. `rem` is PROVENANCE and likewise not part
+of it -- see `HUMAN_PROVENANCE`.
 """
 
 from __future__ import annotations
@@ -44,7 +46,13 @@ from agent_swarm.job import AGENT_TASK, Job
 SCHEMA_VERSION = 1
 
 #: Every key an item may carry. The set is closed on purpose -- see the module docstring.
-_ITEM_FIELDS = frozenset({'key', 'title', 'acceptance', 'priority', 'needs', 'exclusivity', 'ram_gib'})
+_ITEM_FIELDS = frozenset({'key', 'title', 'acceptance', 'rem', 'priority', 'needs', 'exclusivity', 'ram_gib'})
+
+#: The provenance of intent that was never a recorded finding -- the human's own vision, which is
+#: most of a roadmap. It is a REAL ANSWER, not an escape hatch: what `rem` refuses is SILENCE, which
+#: leaves the reader to supply "presumably someone wanted this" and makes a leftover indistinguishable
+#: from admitted intent. Saying so puts the claim on record where it can be disputed.
+HUMAN_PROVENANCE = 'human'
 
 #: The fields that decide what the work IS and how it is JUDGED. A change to any of them mints a new
 #: id, because a recorded verdict is a statement about a specific brief under a specific criterion,
@@ -76,6 +84,10 @@ class RoadmapItem:
     key: str
     title: str
     acceptance: str
+    #: Where this item CAME FROM: a rem finding id, or `HUMAN_PROVENANCE`. Deliberately NOT material
+    #: -- a verdict is a statement about a brief under a criterion, so correcting a provenance typo
+    #: must not throw away a recorded PASS.
+    rem: str
     priority: int
     needs: tuple[str, ...]
     job: Job
@@ -158,6 +170,10 @@ def _parse_item(raw: dict) -> RoadmapItem:
     # words and none of them means "unanswerable", so queueing such an item produces work that is
     # claimed, run, and then cannot be judged -- and the pressure at that moment is to call it PASS.
     acceptance = _require_text(raw, 'acceptance', key)
+    # PROVENANCE IS REQUIRED, and `rem = 'human'` is how you say it was your own idea. The backlog
+    # had three homes and no relation between them; an item that names none of them cannot be told
+    # apart from one whose reason has been forgotten.
+    rem = _require_text(raw, 'rem', key)
     priority = raw.get('priority', PRIORITY_MIN)
     if not isinstance(priority, int) or not (PRIORITY_MIN <= priority <= PRIORITY_MAX):
         msg = f'item {key!r}: priority must be an int in [{PRIORITY_MIN}, {PRIORITY_MAX}], got {priority!r}'
@@ -169,7 +185,7 @@ def _parse_item(raw: dict) -> RoadmapItem:
         ram_gib=raw.get('ram_gib'),
         **({'exclusivity': raw['exclusivity']} if 'exclusivity' in raw else {}),
     )
-    return RoadmapItem(key=key, title=title, acceptance=acceptance, priority=priority, needs=needs, job=job)
+    return RoadmapItem(key=key, title=title, acceptance=acceptance, rem=rem, priority=priority, needs=needs, job=job)
 
 
 def _check_dependencies(items: tuple[RoadmapItem, ...]) -> None:

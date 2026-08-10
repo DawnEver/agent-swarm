@@ -47,12 +47,14 @@ version = 1
 key = "probe-e2e-first"
 title = "The first rehearsal item"
 acceptance = "the verdict travels"
+rem = "human"
 priority = 3
 
 [[item]]
 key = "probe-e2e-second"
 title = "A dependent item"
 acceptance = "it does not start before the first"
+rem = "human"
 priority = 3
 needs = ["probe-e2e-first"]
 """

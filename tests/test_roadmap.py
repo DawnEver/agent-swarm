@@ -23,19 +23,21 @@ version = 1
 key = 'spool-retention'
 title = 'Retention for refs/ci/shards and refs/candidates'
 acceptance = 'pytest tests/test_spool.py -q'
+rem = 'human'
 priority = 5
 
 [[item]]
 key = 'testkey-index'
 title = 'CLI-owned testkey -> number index'
 acceptance = 'pytest tests/test_forge_store.py -q'
+rem = 'human'
 priority = 7
 needs = ['spool-retention']
 """
 
 
 def _item(**kw) -> dict:
-    base = {'key': 'k', 'title': 't', 'acceptance': 'pytest -q'}
+    base = {'key': 'k', 'title': 't', 'acceptance': 'pytest -q', 'rem': 'human'}
     base.update(kw)
     return {'version': 1, 'item': [base]}
 
@@ -63,7 +65,7 @@ class TestSchema:
             load(_item(rationale='because it seemed like a good idea'))
 
     def test_a_duplicate_key_is_refused(self) -> None:
-        data = {'version': 1, 'item': [{'key': 'k', 'title': 'a', 'acceptance': 'x'}] * 2}
+        data = {'version': 1, 'item': [{'key': 'k', 'title': 'a', 'acceptance': 'x', 'rem': 'human'}] * 2}
         with pytest.raises(RoadmapError, match='duplicate'):
             load(data)
 
@@ -103,7 +105,7 @@ class TestIdStability:
         first = load(_item(key='a'))
         data = {
             'version': 1,
-            'item': [{'key': 'z', 'title': 't', 'acceptance': 'pytest -q'}, _item(key='a')['item'][0]],
+            'item': [{'key': 'z', 'title': 't', 'acceptance': 'pytest -q', 'rem': 'human'}, _item(key='a')['item'][0]],
         }
         assert load(data).by_key['a'].job.id == first.by_key['a'].job.id
 
@@ -114,7 +116,7 @@ class TestIdStability:
         # would abandon the verdict history of work that did not change.
         assert load(_item(**hint)).items[0].job.id == load(_item()).items[0].job.id
 
-    @pytest.mark.parametrize('material', [{'title': 'a different job'}, {'acceptance': 'pytest -q -k other'}])
+    @pytest.mark.parametrize('material', [{'title': 'a different job'}, {'acceptance': 'pytest -q -k other', 'rem': 'human'}])
     def test_a_material_change_moves_the_id(self, material) -> None:
         # A verdict is a statement about a specific brief judged by a specific criterion. Keeping
         # the id would let an old PASS answer the new item -- the unearned green, by re-editing.
@@ -130,8 +132,8 @@ class TestDependencies:
         data = {
             'version': 1,
             'item': [
-                {'key': 'a', 'title': 't', 'acceptance': 'x', 'needs': ['b']},
-                {'key': 'b', 'title': 't', 'acceptance': 'x', 'needs': ['a']},
+                {'key': 'a', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['b']},
+                {'key': 'b', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['a']},
             ],
         }
         with pytest.raises(RoadmapError, match='cycle'):
@@ -146,9 +148,9 @@ class TestDependencies:
         data = {
             'version': 1,
             'item': [
-                {'key': 'a', 'title': 't', 'acceptance': 'x', 'needs': ['b']},
-                {'key': 'b', 'title': 't', 'acceptance': 'x', 'needs': ['c']},
-                {'key': 'c', 'title': 't', 'acceptance': 'x', 'needs': ['a']},
+                {'key': 'a', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['b']},
+                {'key': 'b', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['c']},
+                {'key': 'c', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['a']},
             ],
         }
         with pytest.raises(RoadmapError, match=r'a -> b -> c -> a'):
@@ -161,10 +163,10 @@ class TestDependencies:
         data = {
             'version': 1,
             'item': [
-                {'key': 'base', 'title': 't', 'acceptance': 'x'},
-                {'key': 'left', 'title': 't', 'acceptance': 'x', 'needs': ['base']},
-                {'key': 'right', 'title': 't', 'acceptance': 'x', 'needs': ['base']},
-                {'key': 'top', 'title': 't', 'acceptance': 'x', 'needs': ['left', 'right']},
+                {'key': 'base', 'title': 't', 'acceptance': 'x', 'rem': 'human'},
+                {'key': 'left', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['base']},
+                {'key': 'right', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['base']},
+                {'key': 'top', 'title': 't', 'acceptance': 'x', 'rem': 'human', 'needs': ['left', 'right']},
             ],
         }
         assert len(load(data).items) == 4
