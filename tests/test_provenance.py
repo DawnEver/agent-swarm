@@ -21,11 +21,12 @@ not check, which would make it worse than absent.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from agent_swarm.provenance import Provenance, read_provenance
+from agent_swarm.provenance import Provenance, read_provenance, running_provenance
 
 #: The interpreter every gate on this box runs under. A LITERAL PATH, not discovery: the whole point
 #: is to assert about one specific environment, and a check that searched for "some venv" would pass
@@ -117,3 +118,36 @@ class TestTheGateInterpreterHoldsACopy:
             f'pip install --no-deps <copy of `git archive <sha>`>. direct_url.json says: '
             f'{found.direct_url_text}'
         )
+
+
+class TestATimingCannotBeQuotedWithoutItsProvenance:
+    """`running_provenance()` exists so a measured number cannot be printed without saying where its
+    code came from. The rule it replaces -- "always quote the two together" -- is one a person has
+    to remember, and this suite has already produced one figure that travelled without it."""
+
+    def test_it_names_the_source_tree_and_its_sha_when_run_from_a_checkout(self):
+        line = running_provenance()
+        assert 'agent_swarm' in line
+        assert 'SOURCE' in line or 'INSTALLED' in line
+
+    def test_it_says_DIRTY_when_the_tree_has_uncommitted_changes(self):
+        """The state in which a figure is unreproducible by anyone else -- and therefore the one it
+        must never be quoted from silently.
+        """
+        line = running_provenance()
+        if 'SOURCE' not in line:
+            pytest.skip('this interpreter runs an installed copy, so there is no working tree to be dirty')
+        dirty = subprocess.run(
+            ['git', '-C', str(Path(__file__).resolve().parent.parent), 'status', '--porcelain'],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        assert ('DIRTY' in line) is bool(dirty)
+
+    def test_the_timing_test_actually_CALLS_it(self):
+        """Otherwise this module is a capability nobody uses, and the discipline is back to being a
+        thing someone remembers.
+        """
+        source = (Path(__file__).resolve().parent / 'test_end_to_end.py').read_text(encoding='utf-8')
+        assert 'running_provenance()' in source

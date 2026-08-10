@@ -35,6 +35,7 @@ from agent_swarm.forge_store import ForgeStore, Role
 from agent_swarm.item_index import ItemIndex
 from agent_swarm.job import AGENT_TASK, TEST_RUN, Job
 from agent_swarm.loop import Box, Outcome, run_one
+from agent_swarm.provenance import running_provenance
 from agent_swarm.roadmap import loads
 from agent_swarm.spool import ForgePublisher, Spool
 from agent_swarm.tick import Fleet, submit, tick
@@ -257,9 +258,21 @@ class TestTheCostOfOneCycle:
         tick(rehearsal, BOX)
         tick_ms = (time.perf_counter() - tick_start) * 1000
 
+        warm_start = time.perf_counter()
+        submit(rehearsal)  # everything already exists: the INDEX-WARM existence check
+        warm_ms = (time.perf_counter() - warm_start) * 1000
+
         with capsys.disabled():
-            print(f'\n  submit (2 items): {submit_ms:.0f} ms')
-            print(f'  one full tick:    {tick_ms:.0f} ms')
+            # THE PROVENANCE PRINTS WITH THE NUMBERS, ALWAYS. A wall-clock figure measured against a
+            # working tree, quoted beside an interpreter pinned commits behind it, LOOKS reproducible
+            # and is not -- the same defect as an install landing mid-gate, aimed at a number rather
+            # than a verdict. The rule that follows is "always quote the two together", and a rule
+            # someone has to remember is one they will eventually not. So the qualification travels
+            # with the figure instead of with whoever measured it.
+            print(f'\n  {running_provenance()}')
+            print(f'  submit, cold index (2 items): {submit_ms:.0f} ms')
+            print(f'  submit, warm index (2 items): {warm_ms:.0f} ms')
+            print(f'  one full tick:                {tick_ms:.0f} ms')
         assert tick_ms > 0
 
 

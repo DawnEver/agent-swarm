@@ -26,6 +26,7 @@ timing, and only an install-time interlock or a provenance line in the gate log 
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,3 +82,48 @@ def read_provenance(site_packages: Path, distribution: str = 'agent_swarm') -> P
         editable=bool(parsed.get('dir_info', {}).get('editable', False)),
         url=parsed.get('url'),
     )
+
+
+def running_provenance() -> str:
+    """One line describing where the `agent_swarm` in THIS interpreter came from.
+
+    WHY THIS IS A FUNCTION AND NOT A DISCIPLINE. A wall-clock figure measured against a working tree,
+    quoted next to an interpreter pinned three commits behind it, is a number that LOOKS reproducible
+    and is not -- the same defect as an install landing mid-gate, pointed at a number instead of a
+    verdict. The instruction that follows from it is "always quote the two together", and an
+    instruction I have to remember is one I will eventually not.
+
+    So every timing this suite prints calls this, and the qualification travels with the figure
+    instead of with the person who measured it. A number that cannot say where its code came from
+    should not be quoted, and now it cannot be printed without saying.
+
+    It names the SOURCE tree and its sha when running from a checkout, and the recorded install
+    otherwise -- and it says `dirty` when the tree has uncommitted changes, because that is precisely
+    the state in which a figure is unreproducible by anyone else.
+    """
+    module_dir = Path(__file__).resolve().parent
+    installed = read_provenance(module_dir.parent)
+    if installed is not None and installed.recorded:
+        return f'agent_swarm INSTALLED: {installed.direct_url_text}'
+
+    repo = module_dir.parent.parent
+    try:
+        sha = subprocess.run(
+            ['git', '-C', str(repo), 'rev-parse', '--short', 'HEAD'],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ['git', '-C', str(repo), 'status', '--porcelain'],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover -- git absent is not a failure here
+        return f'agent_swarm from SOURCE {module_dir} (sha unknown)'
+    if not sha:
+        return f'agent_swarm from SOURCE {module_dir} (not a git checkout)'
+    return f'agent_swarm from SOURCE {module_dir} @ {sha}{" DIRTY" if dirty else ""}'
