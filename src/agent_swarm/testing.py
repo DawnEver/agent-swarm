@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import threading
 
-from agent_swarm.forge import Comment, CommentGone, WorkItem
+from agent_swarm.forge import STATUS_STATES, Comment, CommentGone, ForgeError, WorkItem
 
 #: Bumped whenever this double's MODEL of the forge changes -- a new adverse property, a corrected
 #: identity, a refuted simplification.
@@ -62,6 +62,10 @@ class RecordingForge:
         self._lock = threading.Lock()
         self._next_id = 1
         self.items: dict[int, WorkItem] = {}
+        #: (sha, context) -> (state, description). Keyed, not appended: a status is the
+        #: CURRENT answer for one context, and a list would let a test read a green that a
+        #: later failure had already replaced.
+        self.statuses: dict[tuple[str, str], tuple[str, str]] = {}
         self.bodies: dict[int, str] = {}
         self._comments: dict[int, list[Comment]] = {}
         # LABELS ARE (id, name) PAIRS, and the id is what a real removal targets.
@@ -231,6 +235,19 @@ class RecordingForge:
     def state(self, number: int) -> str:
         with self._lock:
             return self.items[number].state
+
+    def set_status(self, sha: str, *, state: str, context: str, description: str) -> None:
+        """Recorded per (sha, context), LAST WRITE WINS -- which is what a real forge does.
+
+        A double that appended would let a test assert a commit is green while a later `failure` is
+        sitting behind it in a list nobody reads. The whole value of a status is that it is the
+        CURRENT answer for one context.
+        """
+        if state not in STATUS_STATES:
+            msg = f'state must be one of {sorted(STATUS_STATES)}, got {state!r}'
+            raise ForgeError(msg)
+        with self._lock:
+            self.statuses[sha, context] = (state, description)
 
     def retire_work_item(self, number: int) -> None:
         """Closes AND retitles, because a retired item must stop matching its title.

@@ -52,11 +52,20 @@ ARITY = {
     'close_work_item': 1,
     'state': 1,
     'retire_work_item': 1,
+    'set_status': 1,  # sha positional; state/context/description keyword-only
+}
+
+
+#: Keyword-only arguments per method. Tabulated rather than special-cased in `_call`, so a new
+#: method with keyword-only arguments is a table entry and not a branch nobody remembers to add.
+KWARGS = {
+    'create_work_item': {'title': 't', 'body': 'b'},
+    'set_status': {'state': 'success', 'context': 'c', 'description': 'd'},
 }
 
 
 def _call(forge, method: str):
-    kwargs = {'title': 't', 'body': 'b'} if method == 'create_work_item' else {}
+    kwargs = KWARGS.get(method, {})
     return getattr(forge, method)(*[1] * ARITY[method], **kwargs)
 
 

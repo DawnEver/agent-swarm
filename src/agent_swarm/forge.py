@@ -76,6 +76,12 @@ def _is_retryable_status(code: int) -> bool:
 
 #: This project's forge. It lives in the VENDOR module, not in the store: a default is a choice of
 #: vendor, and a store holding one would name a vendor in the one file that must not.
+#: The vendor-neutral status words. Gitea uses these verbatim; another forge maps them.
+STATUS_STATES = frozenset({'pending', 'success', 'failure', 'error'})
+
+#: Gitea rejects a description past this length. Truncated rather than refused -- see `set_status`.
+_STATUS_DESCRIPTION_LIMIT = 255
+
 DEFAULT_GITEA_BASE_URL = 'http://server.mingyangbao.site:9000'
 DEFAULT_REPO = 'Tianjie-Zou-Team/motronics-studio'
 
@@ -211,6 +217,29 @@ class Forge(Protocol):
     def close_work_item(self, number: int) -> None: ...
 
     def state(self, number: int) -> str: ...
+
+    def set_status(self, sha: str, *, state: str, context: str, description: str) -> None:
+        """Publish a commit status -- the check a protected branch waits on.
+
+        THIS IS WHAT TURNS "gate green before main moves" FROM A CONVENTION INTO A MECHANISM. Today
+        that rule is carried by whoever remembers it, and this session alone has the receipts on how
+        that goes. A required status check is the server refusing the merge instead.
+
+        `state` is the vendor-neutral word, one of `pending` / `success` / `failure` / `error`; the
+        implementation maps it. `context` NAMES the check and must match the branch rule exactly --
+        a rule waiting on a context nobody publishes freezes the branch, which is why enabling
+        protection before this exists is the wrong order.
+
+        **NOT SERVER-ENFORCEABLE ON EVERY FORGE, and stated here rather than implied.** Gitea has no
+        scope for commit status: writing one requires repository write, which any identity that
+        pushes branches must already have. So "only the verifier marks a commit green" is carried by
+        credential distribution, not by the server. GitHub CAN enforce it (an App may hold
+        statuses:write without contents:write). The strongest available check on our side is an
+        architecture test that `set_status` is reached only through the verifier-role forge -- the
+        server cannot stop another identity, but a test can stop OUR code from becoming one.
+        """
+        ...
+
 
     def retire_work_item(self, number: int) -> None:
         """Make the item stop counting, by whatever means the vendor allows.
@@ -356,6 +385,22 @@ class GiteaForge:
 
     def state(self, number: int) -> str:
         return self._api('GET', f'/repos/{self.repo}/issues/{number}')['state']
+
+    def set_status(self, sha: str, *, state: str, context: str, description: str) -> None:
+        """POST a commit status. Gitea's states are the neutral words already, so nothing is mapped.
+
+        The description is TRUNCATED rather than rejected: a gate summary is long, and a status that
+        fails to publish because its prose was verbose would block a merge for a reason no reader
+        would connect to the text.
+        """
+        if state not in STATUS_STATES:
+            msg = f'state must be one of {sorted(STATUS_STATES)}, got {state!r}'
+            raise ForgeError(msg)
+        self._api('POST', f'/repos/{self.repo}/statuses/{sha}', {
+            'state': state,
+            'context': context,
+            'description': description[:_STATUS_DESCRIPTION_LIMIT],
+        })
 
     def retire_work_item(self, number: int) -> None:
         """Close and retitle. This deployment is not configured to let the API delete an issue, and
@@ -593,6 +638,9 @@ class GitHubForge:
 
     def state(self, number: int) -> str:
         raise self._unmeasured('state')
+
+    def set_status(self, sha: str, *, state: str, context: str, description: str) -> None:
+        raise self._unmeasured(f'set_status({context}={state})')
 
     def retire_work_item(self, number: int) -> None:
         raise self._unmeasured('retire_work_item')
