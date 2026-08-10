@@ -35,6 +35,7 @@ from agent_swarm.job import Job, JobKind
 from agent_swarm.loop import Box, Executor, Outcome, run_one
 from agent_swarm.roadmap import Roadmap
 from agent_swarm.spool import Publisher, Spool, SpooledStore
+from agent_swarm.status import StatusPublisher
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,10 @@ class Fleet:
     publisher: Publisher
     executors: dict[JobKind, Executor]
     owner: str
+    #: Optional, and OPTIONAL IS THE POINT: only a box holding the verifier credential may publish a
+    #: commit status, so most boxes have none and must still be able to take a turn. `None` means
+    #: this box answers jobs but does not mark commits, which is a legitimate fleet member.
+    status: StatusPublisher | None = None
 
     def __post_init__(self) -> None:
         if self.submitter.role is not Role.SUBMITTER or self.runner.role is not Role.RUNNER:
@@ -103,7 +108,9 @@ def completed_keys(fleet: Fleet) -> frozenset[str]:
     return frozenset(item.key for item in fleet.roadmap.items if fleet.runner.verdict(item.job) == 'PASS')
 
 
-def tick(fleet: Fleet, box: Box, *, now: float | None = None, retry: bool = False) -> TickReport:
+def tick(
+    fleet: Fleet, box: Box, *, now: float | None = None, retry: bool = False, sha: str | None = None
+) -> TickReport:
     """One pass: rank what is runnable, take the first thing this box may have, answer it, publish.
 
     THE ORDER IS THE ONLY THING THIS FUNCTION CONTRIBUTES, and each step is somebody else's decision:
@@ -113,6 +120,17 @@ def tick(fleet: Fleet, box: Box, *, now: float | None = None, retry: bool = Fals
         allocator.rank   -> which order, and what this box may start (admission)
         run_one          -> claim, execute, record, release
         spool.drain      -> publish what was recorded
+        status.publish   -> mark the COMMIT, which is what a protected branch waits on
+
+    THE SHA IS THE RUNNER'S, NOT THE JOB'S. A `Job` carries no commit and should not: its identity
+    is a testkey, and the same testkey is answered against many commits over a fleet's life. What a
+    verdict is ABOUT is where this box's checkout stands at this tick -- one checkout, one commit,
+    one answer -- so the caller passes it and nothing has to guess.
+
+    NO SHA AND NO PUBLISHER BOTH MEAN "DO NOT MARK", and they are different situations: a box
+    without the verifier credential cannot mark, and a box running work not tied to a commit has
+    nothing to mark. Neither is an error, and neither is allowed to skip the verdict itself -- the
+    job's answer is recorded regardless, because the store and the commit are separate audiences.
 
     IT WALKS THE RANKED LIST RATHER THAN TAKING THE HEAD. `rank` returns every runnable job on
     purpose: losing a claim race is ordinary, and a box that gave up on a collision would convert
@@ -134,6 +152,11 @@ def tick(fleet: Fleet, box: Box, *, now: float | None = None, retry: bool = Fals
     )
     spooled = SpooledStore(fleet.runner, fleet.spool)
 
+    #: The job this tick actually ANSWERED, remembered where it is known rather than looked up
+    #: afterwards: `candidates` holds Candidates and `rank` yields Jobs, and re-deriving one from
+    #: the other is a second definition of the mapping, free to drift from the first.
+    answered: Job | None = None
+
     for job in rank(candidates, box, now=moment):
         report.considered.append(job.claim_key())
         outcome = run_one(
@@ -146,11 +169,24 @@ def tick(fleet: Fleet, box: Box, *, now: float | None = None, retry: bool = Fals
         )
         report.outcomes[job.claim_key()] = outcome
         if outcome in (Outcome.ANSWERED, Outcome.CRASHED):
+            # CRASHED is not marked. It DID record an INCONCLUSIVE verdict, and that verdict is the
+            # job's answer -- but a crash is this box failing, not a judgement about the commit, and
+            # marking it would attribute an executor's traceback to somebody's change.
+            answered = job if outcome is Outcome.ANSWERED else None
             break
 
     drained = fleet.spool.drain(fleet.publisher)
     report.published = drained.published
     report.drain_failures = drained.failed
+
+    # AFTER the spool, never before: the status is the LOUDEST signal in the system -- it decides
+    # whether a merge proceeds -- and publishing it before the verdict is durable would let a crash
+    # leave a green commit with no recorded answer behind it. The store's verdict is the record; the
+    # status is a projection of it, so the record goes first.
+    if fleet.status is not None and sha and answered is not None:
+        verdict = fleet.runner.verdict(answered)
+        if verdict is not None:
+            fleet.status.publish(sha, verdict=verdict, detail=f'{answered.claim_key()}: {verdict}')
     return report
 
 
