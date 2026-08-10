@@ -120,8 +120,19 @@ class RecordingForge:
         self.retired: list[int] = []
 
     def list_work_items(self) -> list[WorkItem]:
+        """NEWEST FIRST, and the reversal is the point.
+
+        A real forge promises no ordering on a list endpoint -- Gitea and GitHub both default to
+        recently-updated first, and either may change. Returning insertion order made this double
+        BETTER BEHAVED THAN REALITY, and it cost a real hole: with items ascending, "take the first
+        match" and "take the lowest-numbered match" are the same function, so the tie-break that
+        makes two observers converge on one item was indistinguishable from an arbitrary pick.
+
+        Reversing is not a random shuffle on purpose: a shuffled double fails intermittently, which
+        reads as flakiness and gets retried away. A fixed adverse order fails every time.
+        """
         with self._lock:
-            return list(self.items.values())
+            return list(reversed(self.items.values()))
 
     def work_item(self, number: int) -> WorkItem | None:
         """BY NUMBER, and therefore fresh even in `StaleListForge` -- which is the measured shape."""
@@ -895,6 +906,40 @@ class TestTheDuplicateSubmitterReconciler:
             store.reconcile_duplicates()
         alive = [i for i in recording_forge.list_work_items() if i.title == title]
         assert [i.number for i in alive] == [numbers[0]]
+
+    def test_a_LOOKUP_converges_on_the_lowest_BEFORE_the_reconciler_ever_runs(self, recording_forge):
+        """THE TIE-BREAK ON THE READ PATH, which every other test here was covering for.
+
+        Found by scoring a prediction rather than by review. `_lowest_numbered`'s `min` was changed
+        to `max` and **all 412 offline tests stayed green** -- because single-writer registration
+        means our own code never creates two items with one title, so every lookup sees exactly one
+        match and `min` equals `max`. Elimination alibied the tie-break. The reconciler's own
+        `min` IS tested, but only AFTER `reconcile_duplicates` has already retired the losers.
+
+        The reconciler is a manual sweep, so there is always a window where duplicates are live and
+        lookups are happening. In that window the tie-break is the ONLY thing making two observers
+        with different visibility name the same item -- and disagreeing there means two runners
+        claim on two issues and both win, which is hole 1 from the claim-protocol measurement,
+        reached by a different road.
+
+        The duplicates are planted directly on the double: our submitter cannot produce this state,
+        so no test derived from our write path could ever have separated the two `min`s.
+        """
+        job = Job(id='dup', kind=TEST_RUN)
+        title = f'[swarm] ns/{job.claim_key()}'
+        for _ in range(4):
+            recording_forge.create_work_item(title=title, body='planted')
+        numbers = sorted(i.number for i in recording_forge.list_work_items() if i.title == title)
+        assert len(numbers) == 4, 'the plant did not take -- the rest of this test would be vacuous'
+
+        # Two independent observers, both cold: neither has the creation response in hand.
+        first = ForgeStore('ns', recording_forge, role=Role.RUNNER).work_item_number(job)
+        second = ForgeStore('ns', recording_forge, role=Role.SUBMITTER).work_item_number(job)
+
+        assert first == second == numbers[0], (
+            f'observers named {first} and {second} out of {numbers} -- a lookup that does not '
+            'take the lowest lets two runners claim two issues and both win'
+        )
 
     def test_it_is_LOUD_about_every_retirement(self, recording_forge):
         """Silent dedup hides a submitter racing itself forever, and an hourly tidy-up would make
