@@ -226,9 +226,19 @@ class RecordingForge:
             ids = set(self.repo_labels.get(name, []))
             self.item_labels[number] = [(i, n) for i, n in self.item_labels[number] if i not in ids]
 
-    def close_work_item(self, number: int) -> None:
+    def close_work_item(self, number: int, *, labels: Sequence[str] | None = None) -> None:
+        """Closes, and REPLACES the label set when one is given -- one operation, as the client does.
+
+        A double that closed and then applied labels separately would model two operations where
+        the client performs one, and the write amplification this parameter removes would be
+        invisible to every test that used it.
+        """
+        resolved = None if labels is None else [(self.label_id(name), name) for name in labels]
         with self._lock:
-            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='closed')
+            item = self.items[number]
+            self.items[number] = WorkItem(number=number, title=item.title, state='closed')
+            if resolved is not None:
+                self.item_labels[number] = resolved
 
     def reopen_work_item(self, number: int) -> None:
         """NOT part of the `Forge` protocol -- deliberately.

@@ -230,7 +230,19 @@ class Forge(Protocol):
 
     def remove_label(self, number: int, name: str) -> None: ...
 
-    def close_work_item(self, number: int) -> None: ...
+    def close_work_item(self, number: int, *, labels: Sequence[str] | None = None) -> None:
+        """Close the item, optionally REPLACING its labels in the same call.
+
+        `labels` is the COMPLETE final set, not an addition. That is deliberate and it is why the
+        caller must read the current set first: an "add these" verb cannot also remove the stale
+        verdict label a reopened item still carries, so it would need a second call anyway and the
+        round trip would come straight back.
+
+        Closing is the last act of every job, so this is a write path the whole fleet traverses --
+        measured at 4 round trips per verdict before this parameter existed. `None` means "do not
+        touch the labels", which keeps every caller that only wants to close at one call.
+        """
+        ...
 
     def state(self, number: int) -> str: ...
 
@@ -402,8 +414,14 @@ class GiteaForge:
         created the label it was asked to remove would be a write on a read-only intent."""
         return [x['id'] for x in self._api('GET', f'/repos/{self.repo}/labels?limit=100') or [] if x['name'] == name]
 
-    def close_work_item(self, number: int) -> None:
-        self._api('PATCH', f'/repos/{self.repo}/issues/{number}', {'state': 'closed'})
+    def close_work_item(self, number: int, *, labels: Sequence[str] | None = None) -> None:
+        """One PATCH. Gitea's issue edit takes `state` and `labels` together, and its `labels` is a
+        REPLACEMENT -- which is exactly the semantics the protocol declares, so nothing is
+        translated here beyond names to ids."""
+        payload: dict[str, Any] = {'state': 'closed'}
+        if labels is not None:
+            payload['labels'] = [self._label_id(name) for name in labels]
+        self._api('PATCH', f'/repos/{self.repo}/issues/{number}', payload)
 
     def state(self, number: int) -> str:
         return self._api('GET', f'/repos/{self.repo}/issues/{number}')['state']
@@ -655,8 +673,8 @@ class GitHubForge:
     def remove_label(self, number: int, name: str) -> None:
         raise self._unmeasured('remove_label')
 
-    def close_work_item(self, number: int) -> None:
-        raise self._unmeasured('close_work_item')
+    def close_work_item(self, number: int, *, labels: Sequence[str] | None = None) -> None:
+        raise self._unmeasured(f'close_work_item(labels={labels})')
 
     def state(self, number: int) -> str:
         raise self._unmeasured('state')

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_swarm.forge_store import ForgeStore, Role
+from agent_swarm.forge_store import _LABEL_TO_VERDICT, READY_LABEL, ForgeStore, Role
 from agent_swarm.job import TEST_RUN, Job
 from agent_swarm.testing import RecordingForge
 
@@ -146,3 +146,59 @@ def test_the_write_cost_does_not_grow_with_the_number_registered():
     """A per-job constant, not an amortised average: a cache that helps only after the first item
     would still make the hundredth agent's registration cheap and the first fleet's expensive."""
     assert _register_cost(1) == _register_cost(50)
+
+
+def _verdict_cost() -> int:
+    forge = _Counting()
+    store = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    job = Job(id='g/v', kind=TEST_RUN)
+    store.register(job)
+    forge.calls = 0
+    store.record_verdict(job, verdict='PASS', detail='d')
+    return forge.calls
+
+
+def test_recording_a_verdict_costs_THREE_round_trips():
+    """Closing is the last act of EVERY job, so this is a write path the whole fleet traverses.
+
+    It was 4 -- comment, read labels, add label, close -- and 5 when a reopened item still carried a
+    stale verdict label. The label read stays, and that is not an oversight: only the current set
+    says which stale labels to drop, and an "add this one" verb cannot drop them, so it would need a
+    second call regardless. What collapsed is add+close into one PATCH, which is what Gitea's issue
+    edit actually offers.
+    """
+    assert _verdict_cost() == 3
+
+
+def test_the_verdict_close_PRESERVES_every_other_label():
+    """The thing this optimisation could silently break, and the reason it is asserted separately.
+
+    `close_work_item(labels=...)` REPLACES the set. Passing only the verdict label would strip the
+    handover label and anything a human attached -- and the loss would surface not as an error but
+    as work that quietly stopped being offered, which is the failure mode this whole session keeps
+    finding.
+    """
+    forge = RecordingForge()
+    store = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    job = Job(id='g/keep', kind=TEST_RUN)
+    number = store.register(job)
+    forge.add_label(number, 'human:please-review')
+
+    store.record_verdict(job, verdict='PASS', detail='d')
+    after = set(forge.labels(number))
+    assert 'human:please-review' in after, 'a human label was stripped by recording a verdict'
+    assert READY_LABEL in after, 'the handover label was stripped by recording a verdict'
+
+
+def test_a_STALE_verdict_label_is_replaced_not_accumulated():
+    """The reopened case, which is why the read exists. Two verdict labels on one item would make
+    `verdict()` answer by whichever the forge happened to list first."""
+    forge = RecordingForge()
+    store = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    job = Job(id='g/reopened', kind=TEST_RUN)
+    number = store.register(job)
+
+    store.record_verdict(job, verdict='FAIL', detail='first')
+    store.record_verdict(job, verdict='PASS', detail='second')
+    verdict_labels = [name for name in forge.labels(number) if name in _LABEL_TO_VERDICT]
+    assert len(verdict_labels) == 1, f'accumulated {verdict_labels}'

@@ -461,11 +461,17 @@ class ForgeStore:
 
         # Exactly one verdict label at a time. A retry after INCONCLUSIVE that merely ADDED `pass`
         # would leave the job both inconclusive and green, and nothing downstream can act on that.
-        for existing in self.forge.labels(number):
-            if existing in _LABEL_TO_VERDICT:
-                self.forge.remove_label(number, existing)
-        self.forge.add_label(number, VERDICT_LABELS[verdict])
-        self.forge.close_work_item(number)
+        # THE FINAL LABEL SET, COMPUTED HERE AND APPLIED WITH THE CLOSE. Closing is the last act
+        # of every job, so this is a write path the whole fleet traverses -- it cost 4 round trips
+        # (comment, read, add, close), or 5 when a reopened item still carried a stale verdict
+        # label. Reading stays: only the current set says which stale labels to drop, and an
+        # "add this one" verb cannot drop them, so it would need a second call regardless.
+        #
+        # Everything that is not a verdict label is PRESERVED. Replacing the set with just the
+        # verdict would silently strip the handover label and anything a human attached, and the
+        # loss would surface only as work that quietly stopped being offered.
+        keep = [name for name in self.forge.labels(number) if name not in _LABEL_TO_VERDICT]
+        self.forge.close_work_item(number, labels=[*keep, VERDICT_LABELS[verdict]])
 
     def verdict(self, job: Job) -> str | None:
         number = self._item_number(job)
