@@ -13,9 +13,24 @@ stopped matching anything is how a whole tier disappears without a single line o
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
+
+#: WHICH REPO THE LIVE TIER WRITES TO. It lives here, in the SUITE, because the package no longer
+#: knows -- `default_forge` requires `repo` and has no default, so a caller that omits it gets a
+#: `TypeError` rather than a stranger's issue tracker. A test suite is a caller like any other and
+#: has to name its target somewhere; what matters is that the name is not baked into shipped code.
+#:
+#: Overridable, because this tier writes REAL issues: pointing it at a scratch repo is the
+#: difference between running these safely and not running them at all.
+LIVE_REPO = os.environ.get('SWARM_REPO') or 'Tianjie-Zou-Team/motronics-studio'
+
+#: The gate check name the OFFLINE tests use. DELIBERATELY NOT THIS PROJECT'S: a suite that used the
+#: real one would pass just as happily against a package that still had the real one hard-coded, so
+#: the decoupling would be untested by the very tests written to prove it.
+TEST_CONTEXT = 'someproject/gate'
 
 #: Every tier that reaches off this box. Two, now: a forge over HTTP and a session fleet over
 #: fabric's own transport. They fail for different reasons and are deselected together.

@@ -1,7 +1,7 @@
 """The last wire: a tick that answers a job also marks the COMMIT a merge waits on.
 
 `tick` already did claim -> execute -> record -> spool -> publish. What it did not do was publish a
-COMMIT STATUS, so the `motronics/gate` context a protected branch requires had no producer anywhere
+COMMIT STATUS, so the gate context a protected branch requires had no producer anywhere
 in the running system. Turning protection on in that state freezes `main` -- every merge waiting on
 a check nobody writes -- and the symptom reads as a broken gate rather than an absent one.
 
@@ -30,9 +30,10 @@ from agent_swarm.job import AGENT_TASK, TEST_RUN, Job
 from agent_swarm.loop import Box, Outcome
 from agent_swarm.roadmap import loads
 from agent_swarm.spool import ForgePublisher, Spool
-from agent_swarm.status import STATUS_CONTEXT, StatusPublisher
+from agent_swarm.status import StatusPublisher
 from agent_swarm.testing import RecordingForge
 from agent_swarm.tick import Fleet, submit, tick
+from conftest import TEST_CONTEXT as STATUS_CONTEXT
 
 #: This box's own status context. Per-writer keying means the published context carries it, so the
 #: tests must name it rather than assume the bare base -- see `status.py` on the shared-key defect.
@@ -93,7 +94,7 @@ def fleet_and_marks(tmp_path):
         publisher=ForgePublisher(ForgeStore(namespace, forge, role=Role.SUBMITTER, index=index)),
         executors={AGENT_TASK: gate, TEST_RUN: gate},
         owner='box-mark',
-        status=StatusPublisher(marker, runner=MARK_RUNNER),
+        status=StatusPublisher(marker, context=STATUS_CONTEXT, runner=MARK_RUNNER),
     )
     # The item must EXIST before a runner can take it: a runner store may not create work items,
     # which is the structural half of the duplicate-creation fix and not something to work around.

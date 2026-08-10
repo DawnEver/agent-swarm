@@ -39,6 +39,7 @@ from agent_swarm.provenance import running_provenance
 from agent_swarm.roadmap import loads
 from agent_swarm.spool import ForgePublisher, Spool
 from agent_swarm.tick import Fleet, submit, tick
+from conftest import LIVE_REPO
 
 ROADMAP = """
 version = 1
@@ -111,10 +112,12 @@ def rehearsal(tmp_path):
     index = ItemIndex(tmp_path / 'index.json')
     fleet = Fleet(
         roadmap=loads(ROADMAP),
-        submitter=ForgeStore(namespace, default_forge(), role=Role.SUBMITTER, index=index),
-        runner=ForgeStore(namespace, default_forge(), role=Role.RUNNER, index=index),
+        submitter=ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER, index=index),
+        runner=ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.RUNNER, index=index),
         spool=Spool(tmp_path / 'spool'),
-        publisher=ForgePublisher(ForgeStore(namespace, default_forge(), role=Role.SUBMITTER, index=index)),
+        publisher=ForgePublisher(
+            ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER, index=index)
+        ),
         # The roadmap only ever yields AGENT_TASK; TEST_RUN is configured too because a fleet
         # that could not run both kinds would not be testing the design's founding claim.
         executors={AGENT_TASK: StubGate(), TEST_RUN: StubGate()},
@@ -135,10 +138,12 @@ def _fleet_on(namespace: str, tmp_path, *, index_name: str) -> Fleet:
     index = ItemIndex(tmp_path / index_name)
     return Fleet(
         roadmap=loads(ROADMAP),
-        submitter=ForgeStore(namespace, default_forge(), role=Role.SUBMITTER, index=index),
-        runner=ForgeStore(namespace, default_forge(), role=Role.RUNNER, index=index),
+        submitter=ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER, index=index),
+        runner=ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.RUNNER, index=index),
         spool=Spool(tmp_path / 'spool2'),
-        publisher=ForgePublisher(ForgeStore(namespace, default_forge(), role=Role.SUBMITTER, index=index)),
+        publisher=ForgePublisher(
+            ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER, index=index)
+        ),
         executors={AGENT_TASK: StubGate(), TEST_RUN: StubGate()},
         owner='box-rehearsal',
     )
@@ -257,7 +262,7 @@ class TestTheLoopCloses:
 
         fresh = ForgeStore(
             rehearsal.runner.namespace,
-            default_forge(),
+            default_forge(repo=LIVE_REPO),
             role=Role.RUNNER,
             index=ItemIndex(tmp_path / 'index.json'),
         )

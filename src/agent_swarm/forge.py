@@ -84,8 +84,12 @@ STATUS_STATES = frozenset({'pending', 'success', 'failure', 'error'})
 #: Gitea rejects a description past this length. Truncated rather than refused -- see `set_status`.
 _STATUS_DESCRIPTION_LIMIT = 255
 
+#: The DEPLOYMENT this swarm runs on, and the reason there is still a default here when `repo` has
+#: none: a host is where the swarm itself lives, while a repo is WHICH PROJECT it schedules. A
+#: package that defaulted the project would silently write to a stranger's issue tracker; one that
+#: defaults its own host merely saves an argument. Overridable, so a second deployment is
+#: configuration rather than a source edit.
 DEFAULT_GITEA_BASE_URL = 'http://server.mingyangbao.site:9000'
-DEFAULT_REPO = 'Tianjie-Zou-Team/motronics-studio'
 
 #: Presentation, and therefore the vendor's business rather than the store's. A forge that needs a
 #: colour to create a label reads it here; a forge that does not, ignores it.
@@ -743,15 +747,24 @@ ROLE_ACCOUNTS = {
 }
 
 
-def default_forge(role: str = 'agent') -> Forge:
-    """The forge this project actually uses, acting as `role`. One place to change per forge.
+def default_forge(role: str = 'agent', *, repo: str, base_url: str = DEFAULT_GITEA_BASE_URL) -> Forge:
+    """The vendor this swarm uses, acting as `role`, against the repo the CALLER names.
 
     THE ROLE IS A PARAMETER WITH A DEFAULT, not a constant, and the default is the least privileged
     one that can do the common thing. A no-argument version returned a client whose identity was
     whatever the credential helper happened to hold for the host -- on the measured machine, an
     `OAUTH_USER` entry nothing in this system issued.
+
+    `repo` HAS NO DEFAULT, AND THAT IS THE POINT. It held one project's path, so every caller that
+    omitted the argument silently scheduled that project and nothing ever failed to reveal it -- the
+    coupling was invisible precisely because the default worked. A second consumer would have found
+    out by writing to somebody else's issue tracker. Removing the CONSTANT without removing the
+    DEFAULT would have fixed the grep and not the defect.
+
+    Raises:
+        ForgeError: `role` is not one of `ROLE_ACCOUNTS`, or `base_url` is not an http(s) URL.
     """
     if role not in ROLE_ACCOUNTS:
         msg = f'role must be one of {sorted(ROLE_ACCOUNTS)}, got {role!r}'
         raise ForgeError(msg)
-    return GiteaForge(DEFAULT_GITEA_BASE_URL, DEFAULT_REPO, username=ROLE_ACCOUNTS[role])
+    return GiteaForge(base_url, repo, username=ROLE_ACCOUNTS[role])

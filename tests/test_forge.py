@@ -30,6 +30,7 @@ from agent_swarm.forge import (
     WorkItem,
     default_forge,
 )
+from conftest import LIVE_REPO
 
 #: Every method the store may call. Derived from the protocol rather than typed out, so a method
 #: added to `Forge` tomorrow is covered by these tests today.
@@ -86,7 +87,7 @@ class TestTheSeamCoversWhatTheStoreNeeds:
         assert isinstance(GitHubForge('o/r'), Forge)
 
     def test_the_default_forge_is_a_forge(self):
-        assert isinstance(default_forge(), Forge)
+        assert isinstance(default_forge(repo=LIVE_REPO), Forge)
 
     def test_no_REF_operation_survives_anywhere_in_the_seam(self):
         """Refs are abandoned entirely (user directive), so the seam must not offer one -- not even

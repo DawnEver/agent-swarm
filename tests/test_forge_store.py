@@ -50,6 +50,7 @@ from agent_swarm.forge_store import (
 from agent_swarm.job import TEST_RUN, Job, JobKind
 from agent_swarm.store import VERDICTS, Store
 from agent_swarm.testing import DOUBLE_MODEL_VERSION, RecordingForge
+from conftest import LIVE_REPO
 
 # Imported under private names ON PURPOSE: a name starting with `Test` is COLLECTED wherever it is
 # bound, so importing them plainly would re-run the in-memory suite here -- against a `store`
@@ -75,12 +76,12 @@ def _race_one_round(namespace: str, job: Job, *, racers: int) -> list[str]:
     which is exactly the kind of "safe for now" that a later edit turns into a race inside the test
     for races.
     """
-    ForgeStore(namespace, default_forge(), role=Role.SUBMITTER).register(job)
+    ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER).register(job)
 
     winners: list[str] = []
     lock = threading.Lock()
     barrier = threading.Barrier(racers)
-    stores = [ForgeStore(namespace, default_forge(), role=Role.RUNNER) for _ in range(racers)]
+    stores = [ForgeStore(namespace, default_forge(repo=LIVE_REPO), role=Role.RUNNER) for _ in range(racers)]
 
     def attempt(n: int) -> None:
         barrier.wait()
@@ -403,7 +404,7 @@ def server_store():
     job id. Two runs of this file at once would otherwise contend for one work item, and each would
     report the other's claim as a contract violation.
     """
-    store = ForgeStore(f'probe-p3-{uuid.uuid4().hex[:10]}', default_forge(), role=Role.SUBMITTER)
+    store = ForgeStore(f'probe-p3-{uuid.uuid4().hex[:10]}', default_forge(repo=LIVE_REPO), role=Role.SUBMITTER)
     try:
         yield store
     finally:
@@ -457,9 +458,11 @@ class TestWhatOnlyTheRealServerCanSettle:
         contend at all.
         """
         job = Job(id='fresh-item', kind=TEST_RUN)
-        submitted = ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER).register(job)
+        submitted = ForgeStore(server_store.namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER).register(job)
 
-        stores = [ForgeStore(server_store.namespace, default_forge(), role=Role.RUNNER) for _ in range(16)]
+        stores = [
+            ForgeStore(server_store.namespace, default_forge(repo=LIVE_REPO), role=Role.RUNNER) for _ in range(16)
+        ]
         winners: list[int] = []
         lock = threading.Lock()
         barrier = threading.Barrier(16)
@@ -485,7 +488,7 @@ class TestWhatOnlyTheRealServerCanSettle:
         server-assigned and increasing, a later racer could carry a lower key -- which is precisely
         the `ci_tick` defect this replaces, reintroduced by the storage layer.
         """
-        forge = default_forge()
+        forge = default_forge(repo=LIVE_REPO)
         number = forge.create_work_item(title=f'[swarm] {server_store.namespace}/idprobe', body='probe')
         posted: list[int] = []
         lock = threading.Lock()
@@ -514,12 +517,16 @@ class TestWhatOnlyTheRealServerCanSettle:
         assert server_store.claim_owner(JOB) == 'runner-a'
 
     def test_an_EXPIRED_claim_is_taken_over(self, server_store):
-        dying = ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER, lease_seconds=0.5)
+        dying = ForgeStore(
+            server_store.namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER, lease_seconds=0.5
+        )
         assert dying.try_claim(JOB, owner='runner-dead') is True
         time.sleep(0.8)
         assert dying.claim_owner(JOB) is None
         assert (
-            ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER).try_claim(JOB, owner='runner-b')
+            ForgeStore(server_store.namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER).try_claim(
+                JOB, owner='runner-b'
+            )
             is True
         )
 
@@ -528,7 +535,10 @@ class TestWhatOnlyTheRealServerCanSettle:
         contract suite while storing nothing on the server.
         """
         server_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
-        assert ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER).verdict(JOB) == 'INCONCLUSIVE'
+        assert (
+            ForgeStore(server_store.namespace, default_forge(repo=LIVE_REPO), role=Role.SUBMITTER).verdict(JOB)
+            == 'INCONCLUSIVE'
+        )
 
     def test_the_detail_is_recorded_where_a_HUMAN_will_read_it(self, server_store):
         """gate.py's output is the evidence behind the verdict; a verdict without it is a claim."""
@@ -743,7 +753,7 @@ class TestEditingAgainstTheRealForge:
         `comment does not exist` once it is gone. Both halves, because a heartbeat that could not
         tell them apart would report liveness for a runner nobody can see.
         """
-        forge = default_forge()
+        forge = default_forge(repo=LIVE_REPO)
         number = forge.create_work_item(title=f'[swarm] {server_store.namespace}/beat', body='probe')
         beat = forge.add_comment(number, 'BEAT 1')
         forge.update_comment(number, beat, 'BEAT 2')

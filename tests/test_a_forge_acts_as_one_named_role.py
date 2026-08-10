@@ -37,6 +37,9 @@ import pytest
 
 from agent_swarm.forge import ROLE_ACCOUNTS, ForgeError, GiteaForge, default_forge
 
+#: Any repo. The point of these tests is the ROLE, and the package no longer supplies a project.
+REPO = 'owner/name'
+
 
 @pytest.fixture
 def git_stdin(monkeypatch) -> list[str]:
@@ -129,20 +132,20 @@ def test_every_role_maps_to_its_own_account():
 
 
 def test_default_forge_takes_a_role():
-    assert default_forge('verifier').username == ROLE_ACCOUNTS['verifier']
+    assert default_forge('verifier', repo=REPO).username == ROLE_ACCOUNTS['verifier']
 
 
 def test_default_forge_refuses_an_unknown_role():
     """A typo must not become a fifth identity that nothing enrolled and nothing grants."""
     with pytest.raises(ForgeError, match='role must be one of'):
-        default_forge('verifiers')
+        default_forge('verifiers', repo=REPO)
 
 
 def test_the_default_role_is_the_least_privileged_one_that_can_work():
     """A decision, not whichever name sorted first: the common caller is a worker, and a default of
     `integrator` would hand merge rights to every unconfigured process.
     """
-    assert default_forge().username == ROLE_ACCOUNTS['agent']
+    assert default_forge(repo=REPO).username == ROLE_ACCOUNTS['agent']
 
 
 def test_the_missing_credential_message_names_the_role_and_the_fix(monkeypatch):

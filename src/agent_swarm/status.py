@@ -45,6 +45,20 @@ rule can no longer wait on one literal context. It must require the PATTERN `<co
 deployment must be checked to block a merge when NOTHING matches that pattern -- `merge_decision`
 states that rule on this side, and a server that admitted a merge on zero matching contexts would
 disagree with it in the unsafe direction.
+
+WHY THIS MODULE NO LONGER KNOWS THE CHECK'S NAME
+================================================
+
+It held `STATUS_CONTEXT = '<project>/gate'` with a comment warning that a second copy lived in the
+consumer's `swarmctl` and that the two must not drift. That comment described a real failure -- a
+branch protected against a check nobody publishes reads exactly like a broken gate -- and then
+proposed vigilance as the remedy for it. Two copies kept in step by a comment is two definitions.
+
+ONE DEFINITION MEANS ONE OWNER, not two spellings that agree. The fact "this project's gate check is
+called X" belongs to whatever configures that project's branch protection, which is the consumer.
+So this package holds no copy at all and takes the name as an argument, and `swarmctl`'s value stops
+being the duplicate and becomes the definition.
+`tests/test_this_package_names_no_specific_project.py` fails if a project name comes back.
 """
 
 from __future__ import annotations
@@ -54,11 +68,6 @@ from dataclasses import dataclass
 
 from agent_swarm.forge import ROLE_ACCOUNTS, Forge, ForgeError
 from agent_swarm.store import VERDICTS
-
-#: The status context a merge waits on. ONE SPELLING, shared with `swarmctl`'s branch-protection
-#: writer: a name agreed in two places is two definitions of one fact, and the failure -- a branch
-#: protected against a check nobody publishes -- looks exactly like a broken gate.
-STATUS_CONTEXT = 'motronics/gate'
 
 #: verdict word -> forge status state.
 #:
@@ -91,6 +100,11 @@ _ADMITS_MERGE = frozenset({VERDICT_STATES['PASS']})
 #: verbatim by the branch rule, and a name with a space in it is one nobody can type into that rule
 #: correctly.
 _RUNNER_FORBIDDEN = ('/', '*', '?', '[', ']')
+
+#: The same list minus `/`, which a context legitimately contains: `<owner>/gate` is the usual shape
+#: and the branch rule matches it verbatim. Derived rather than spelled twice, so a metacharacter
+#: added to one list cannot be forgotten in the other.
+_CONTEXT_FORBIDDEN = tuple(c for c in _RUNNER_FORBIDDEN if c != '/')
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +182,7 @@ class StatusPublisher:
             a fresh name per run would leave every superseded answer standing forever.
     """
 
-    def __init__(self, forge: Forge, *, context: str = STATUS_CONTEXT, runner: str) -> None:
+    def __init__(self, forge: Forge, *, context: str, runner: str) -> None:
         # THE RUNNER NAME IS VALIDATED AT CONSTRUCTION, alongside the role and for the same reason:
         # a commit status cannot be deleted, so a name producing a colliding or unmatchable context
         # would be permanent. Neither check does any I/O.
@@ -177,6 +191,16 @@ class StatusPublisher:
             raise ForgeError(msg)
         if any(c in runner for c in _RUNNER_FORBIDDEN):
             msg = f'runner must not contain any of {"".join(_RUNNER_FORBIDDEN)!r}, got {runner!r}'
+            raise ForgeError(msg)
+        # THE CONTEXT IS OPERATOR INPUT NOW that this package no longer holds a copy, so it gets the
+        # same treatment as the runner name. `/` is legal INSIDE it -- `<owner>/gate` is the usual
+        # shape -- but not at either end, where it would produce a doubled or empty path segment
+        # that the branch rule's glob does not match.
+        if not context or any(c.isspace() for c in context) or context.strip('/') != context:
+            msg = f'context must be a non-empty name with no whitespace and no leading/trailing "/", got {context!r}'
+            raise ForgeError(msg)
+        if any(c in context for c in _CONTEXT_FORBIDDEN):
+            msg = f'context must not contain any of {"".join(_CONTEXT_FORBIDDEN)!r}, got {context!r}'
             raise ForgeError(msg)
         username = getattr(forge, 'username', None)
         if username != ROLE_ACCOUNTS['verifier']:

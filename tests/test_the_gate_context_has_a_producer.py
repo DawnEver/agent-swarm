@@ -1,4 +1,4 @@
-"""The `motronics/gate` status a protected branch waits on is actually produced by something.
+"""The gate status a protected branch waits on is actually produced by something.
 
 WHAT WAS MISSING. `set_status` shipped, was measured against a real Gitea, and was called by
 NOTHING. Verdicts went into work items and stopped there, so the context a protected branch would
@@ -22,8 +22,9 @@ from __future__ import annotations
 import pytest
 
 from agent_swarm.forge import ROLE_ACCOUNTS, ForgeError, GiteaForge
-from agent_swarm.status import STATUS_CONTEXT, VERDICT_STATES, StatusPublisher
+from agent_swarm.status import VERDICT_STATES, StatusPublisher
 from agent_swarm.store import VERDICTS
+from conftest import TEST_CONTEXT as STATUS_CONTEXT
 
 #: A stand-in box name. The context a publisher writes carries it -- see `status.py` on why one
 #: shared key across three verifier boxes was a correctness defect and not merely a tidiness one.
@@ -47,7 +48,7 @@ class _Recording:
 def test_a_verdict_becomes_a_commit_status():
     """THE GAP ITSELF: before this, nothing turned a verdict into the check a merge waits for."""
     forge = _Recording()
-    StatusPublisher(forge, runner=RUNNER).publish('abc123', verdict='PASS', detail='gate green')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner=RUNNER).publish('abc123', verdict='PASS', detail='gate green')
     assert forge.published == [('abc123', 'success', f'{STATUS_CONTEXT}/{RUNNER}', 'gate green')]
 
 
@@ -57,7 +58,7 @@ def test_every_verdict_has_a_state(verdict: str):
     the gate has already run, which is the most expensive place to discover it.
     """
     forge = _Recording()
-    StatusPublisher(forge, runner=RUNNER).publish('abc123', verdict=verdict, detail='d')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner=RUNNER).publish('abc123', verdict=verdict, detail='d')
     assert forge.published[0][1] == VERDICT_STATES[verdict]
 
 
@@ -75,12 +76,16 @@ def test_no_verdict_maps_to_a_state_that_lets_a_merge_through():
     assert [word for word, state in VERDICT_STATES.items() if state == 'success'] == ['PASS']
 
 
-def test_the_context_matches_the_one_branch_protection_requires():
-    """Two spellings of one name is two definitions of one fact, and the failure -- a branch
-    protected against a check nobody publishes -- is exactly what this file exists to prevent.
-    `swarmctl`'s STATUS_CONTEXT is the other copy; they must not drift.
+def test_the_context_is_the_CALLER_S_and_this_package_holds_no_copy():
+    """This used to assert the package's constant equalled the project's check name, with a comment
+    saying `swarmctl` held the other copy and the two must not drift. Two copies kept in step by a
+    comment is two definitions of one fact; the remedy is one OWNER, and the owner is whatever
+    configures the branch protection. So the value arrives as an argument and comes back out
+    verbatim, and the consumer's spelling is the only one there is.
     """
-    assert STATUS_CONTEXT == 'motronics/gate'
+    forge = _Recording()
+    StatusPublisher(forge, context='anything/at-all', runner=RUNNER).publish('abc', verdict='PASS', detail='d')
+    assert forge.published[0][2] == f'anything/at-all/{RUNNER}'
 
 
 # --------------------------------------------------------------------------- only the verifier
@@ -92,14 +97,16 @@ def test_a_non_verifier_forge_is_REFUSED_at_construction():
     only place the role can be checked at all.
     """
     with pytest.raises(ForgeError, match='verifier'):
-        StatusPublisher(_Recording(username=ROLE_ACCOUNTS['agent']), runner=RUNNER)
+        StatusPublisher(_Recording(username=ROLE_ACCOUNTS['agent']), context=STATUS_CONTEXT, runner=RUNNER)
 
 
 def test_the_verifier_forge_is_accepted():
     """The discriminating half: a check that refused everything would leave the context with no
     producer again, which is the defect this file is about.
     """
-    assert StatusPublisher(_Recording(), runner=RUNNER).forge.username == ROLE_ACCOUNTS['verifier']
+    assert (
+        StatusPublisher(_Recording(), context=STATUS_CONTEXT, runner=RUNNER).forge.username == ROLE_ACCOUNTS['verifier']
+    )
 
 
 def test_a_forge_with_no_username_at_all_is_refused():
@@ -107,7 +114,7 @@ def test_a_forge_with_no_username_at_all_is_refused():
     `getattr` and publish as whoever the credential helper happened to hand back.
     """
     with pytest.raises(ForgeError):
-        StatusPublisher(object(), runner=RUNNER)  # type: ignore[arg-type]
+        StatusPublisher(object(), context=STATUS_CONTEXT, runner=RUNNER)  # type: ignore[arg-type]
 
 
 def test_the_refusal_happens_before_any_publish():
@@ -117,7 +124,7 @@ def test_the_refusal_happens_before_any_publish():
     """
     forge = _Recording(username=ROLE_ACCOUNTS['integrator'])
     with pytest.raises(ForgeError):
-        StatusPublisher(forge, runner=RUNNER)
+        StatusPublisher(forge, context=STATUS_CONTEXT, runner=RUNNER)
     assert forge.published == []
 
 
@@ -130,7 +137,7 @@ def test_an_unknown_verdict_raises_BEFORE_any_io():
     """
     forge = _Recording()
     with pytest.raises(ValueError, match='verdict must be one of'):
-        StatusPublisher(forge, runner=RUNNER).publish('abc123', verdict='GREEN', detail='d')
+        StatusPublisher(forge, context=STATUS_CONTEXT, runner=RUNNER).publish('abc123', verdict='GREEN', detail='d')
     assert forge.published == []
 
 
@@ -140,7 +147,7 @@ def test_an_empty_sha_raises():
     """
     forge = _Recording()
     with pytest.raises(ValueError, match='commit sha'):
-        StatusPublisher(forge, runner=RUNNER).publish('', verdict='PASS', detail='d')
+        StatusPublisher(forge, context=STATUS_CONTEXT, runner=RUNNER).publish('', verdict='PASS', detail='d')
     assert forge.published == []
 
 
@@ -149,4 +156,4 @@ def test_a_real_gitea_forge_satisfies_the_publisher():
     accepted the test stand-in would be untested against the thing it actually runs on.
     """
     forge = GiteaForge('http://127.0.0.1:1', 'o/r', username=ROLE_ACCOUNTS['verifier'])
-    assert StatusPublisher(forge, runner=RUNNER).context == f'{STATUS_CONTEXT}/{RUNNER}'
+    assert StatusPublisher(forge, context=STATUS_CONTEXT, runner=RUNNER).context == f'{STATUS_CONTEXT}/{RUNNER}'

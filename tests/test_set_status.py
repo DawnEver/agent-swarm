@@ -34,11 +34,11 @@ def gitea():
 
 
 def test_the_status_is_posted_against_the_SHA(gitea):
-    gitea.set_status('a' * 40, state='success', context='motronics/gate', description='PASS')
+    gitea.set_status('a' * 40, state='success', context='someproject/gate', description='PASS')
     method, path, body = gitea.sent[-1]
     assert method == 'POST'
     assert path.endswith(f'/statuses/{"a" * 40}')
-    assert body == {'state': 'success', 'context': 'motronics/gate', 'description': 'PASS'}
+    assert body == {'state': 'success', 'context': 'someproject/gate', 'description': 'PASS'}
 
 
 @pytest.mark.parametrize('state', sorted(STATUS_STATES))
@@ -66,8 +66,8 @@ def test_a_long_description_is_TRUNCATED_not_refused(gitea):
 def test_the_context_is_sent_verbatim(gitea):
     """It must match the branch rule EXACTLY. Any normalisation here would silently publish a check
     the rule is not waiting on, and the branch would stay frozen with a green status visible."""
-    gitea.set_status('e' * 40, state='success', context='Motronics/Gate', description='d')
-    assert gitea.sent[-1][2]['context'] == 'Motronics/Gate'
+    gitea.set_status('e' * 40, state='success', context='SomeProject/Gate', description='d')
+    assert gitea.sent[-1][2]['context'] == 'SomeProject/Gate'
 
 
 # --------------------------------------------------------------------------- the double

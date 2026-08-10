@@ -42,8 +42,9 @@ from __future__ import annotations
 import pytest
 
 from agent_swarm.forge import ROLE_ACCOUNTS, ForgeError
-from agent_swarm.status import STATUS_CONTEXT, StatusPublisher, merge_decision
+from agent_swarm.status import StatusPublisher, merge_decision
 from agent_swarm.testing import RecordingForge
+from conftest import TEST_CONTEXT as STATUS_CONTEXT
 
 SHA = 'deadbeefcafe'
 
@@ -63,12 +64,12 @@ def _states(forge: RecordingForge, sha: str) -> dict[str, str]:
 def test_a_pass_from_one_verifier_cannot_erase_a_fail_from_another():
     """THE DEFECT ITSELF, in the order that used to lose the FAIL: fail first, pass second.
 
-    Before per-writer keys both POSTs landed on ('sha', 'motronics/gate') and the second one won, so
-    this assertion read `{'motronics/gate': 'success'}` -- a green merge gate over a red gate run.
+    Before per-writer keys both POSTs landed on ('sha', <the bare context>) and the second one won,
+    so this assertion read one entry holding 'success' -- a green merge gate over a red gate run.
     """
     forge = _verifier()
-    StatusPublisher(forge, runner='ws1').publish(SHA, verdict='FAIL', detail='gate red')
-    StatusPublisher(forge, runner='ws2').publish(SHA, verdict='PASS', detail='gate green')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1').publish(SHA, verdict='FAIL', detail='gate red')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws2').publish(SHA, verdict='PASS', detail='gate green')
 
     states = _states(forge, SHA)
     assert states == {f'{STATUS_CONTEXT}/ws1': 'failure', f'{STATUS_CONTEXT}/ws2': 'success'}
@@ -80,8 +81,8 @@ def test_the_other_order_blocks_too():
     held when the FAIL arrived second would be a race dressed as a guarantee.
     """
     forge = _verifier()
-    StatusPublisher(forge, runner='ws2').publish(SHA, verdict='PASS', detail='gate green')
-    StatusPublisher(forge, runner='ws1').publish(SHA, verdict='FAIL', detail='gate red')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws2').publish(SHA, verdict='PASS', detail='gate green')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1').publish(SHA, verdict='FAIL', detail='gate red')
     assert not merge_decision(_states(forge, SHA), context=STATUS_CONTEXT).allowed
 
 
@@ -90,8 +91,10 @@ def test_an_inconclusive_from_one_verifier_blocks_a_pass_from_another():
     proceed -- and its `error` state is exactly as blocking as `failure`.
     """
     forge = _verifier()
-    StatusPublisher(forge, runner='ws1').publish(SHA, verdict='INCONCLUSIVE', detail='node down')
-    StatusPublisher(forge, runner='ws2').publish(SHA, verdict='PASS', detail='gate green')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1').publish(
+        SHA, verdict='INCONCLUSIVE', detail='node down'
+    )
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws2').publish(SHA, verdict='PASS', detail='gate green')
     decision = merge_decision(_states(forge, SHA), context=STATUS_CONTEXT)
     assert not decision.allowed
     assert decision.blocking == (f'{STATUS_CONTEXT}/ws1',)
@@ -102,8 +105,8 @@ def test_agreement_still_admits_a_merge():
     freeze `main` -- the exact failure `status.py` was written to prevent.
     """
     forge = _verifier()
-    StatusPublisher(forge, runner='ws1').publish(SHA, verdict='PASS', detail='green')
-    StatusPublisher(forge, runner='ws2').publish(SHA, verdict='PASS', detail='green')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1').publish(SHA, verdict='PASS', detail='green')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws2').publish(SHA, verdict='PASS', detail='green')
     assert merge_decision(_states(forge, SHA), context=STATUS_CONTEXT).allowed
 
 
@@ -115,7 +118,7 @@ def test_a_runner_republishing_replaces_its_OWN_answer():
     retry after a lost response, or a re-run that changes its mind, must not accumulate contexts.
     """
     forge = _verifier()
-    publisher = StatusPublisher(forge, runner='ws1')
+    publisher = StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1')
     publisher.publish(SHA, verdict='PASS', detail='first')
     publisher.publish(SHA, verdict='FAIL', detail='on reflection')
     assert _states(forge, SHA) == {f'{STATUS_CONTEXT}/ws1': 'failure'}
@@ -127,8 +130,8 @@ def test_two_publishers_with_the_same_runner_name_share_a_key():
     why the runner name must be the box's, not a per-run token.
     """
     forge = _verifier()
-    StatusPublisher(forge, runner='ws1').publish(SHA, verdict='FAIL', detail='a')
-    StatusPublisher(forge, runner='ws1').publish(SHA, verdict='PASS', detail='b')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1').publish(SHA, verdict='FAIL', detail='a')
+    StatusPublisher(forge, context=STATUS_CONTEXT, runner='ws1').publish(SHA, verdict='PASS', detail='b')
     assert _states(forge, SHA) == {f'{STATUS_CONTEXT}/ws1': 'success'}
 
 
@@ -190,7 +193,7 @@ def test_a_runner_name_that_would_break_the_key_is_refused_at_construction(runne
     namespace, and a `*` is a glob metacharacter in the branch rule that reads this.
     """
     with pytest.raises(ForgeError, match='runner'):
-        StatusPublisher(_verifier(), runner=runner)
+        StatusPublisher(_verifier(), context=STATUS_CONTEXT, runner=runner)
 
 
 def test_the_runner_name_is_required():
@@ -198,7 +201,7 @@ def test_the_runner_name_is_required():
     again -- arrived at by convenience rather than by design, which is the harder version to see.
     """
     with pytest.raises(TypeError):
-        StatusPublisher(_verifier())  # type: ignore[call-arg]
+        StatusPublisher(_verifier(), context=STATUS_CONTEXT)  # type: ignore[call-arg]
 
 
 def test_a_non_verifier_is_still_refused():
@@ -206,11 +209,11 @@ def test_a_non_verifier_is_still_refused():
     another; they say nothing about who may write at all.
     """
     with pytest.raises(ForgeError, match='verifier'):
-        StatusPublisher(RecordingForge(username=ROLE_ACCOUNTS['agent']), runner='ws1')
+        StatusPublisher(RecordingForge(username=ROLE_ACCOUNTS['agent']), context=STATUS_CONTEXT, runner='ws1')
 
 
 def test_the_published_context_is_reported_by_the_publisher():
     """The operator configuring branch protection needs the exact spelling, and re-deriving it by
     hand is how the two copies of `STATUS_CONTEXT` drifted in the first place.
     """
-    assert StatusPublisher(_verifier(), runner='ws1').context == f'{STATUS_CONTEXT}/ws1'
+    assert StatusPublisher(_verifier(), context=STATUS_CONTEXT, runner='ws1').context == f'{STATUS_CONTEXT}/ws1'
