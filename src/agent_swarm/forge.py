@@ -327,20 +327,32 @@ class GiteaForge:
         if self._token is not None:
             return self._token
         host = urllib.parse.urlsplit(self.base_url)
-        filled = subprocess.run(
-            ['git', 'credential', 'fill'],
-            input=f'protocol={host.scheme}\nhost={host.netloc}\n\n',
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
-        )
+        filled = self._run_credential_helper(host.scheme, host.netloc)
         for line in filled.stdout.splitlines():
             if line.startswith('password='):
                 self._token = line[len('password=') :]
                 return self._token
         msg = f'no stored credential for {host.netloc}'
         raise ForgeError(msg)
+
+    def _run_credential_helper(self, scheme: str, netloc: str) -> subprocess.CompletedProcess[str]:
+        """Shell out to `git credential fill`. A SEAM, extracted so the cache above it is testable.
+
+        The caching in `_credential` exists ONLY to avoid this subprocess -- it is a pure cost
+        optimisation -- and with the call inlined there was no way to observe whether it worked. A
+        component whose entire reason to exist is COST, with no test that can see cost, is green
+        whether it works or is inert; that is the class the index bug belonged to. This seam is what
+        lets a test COUNT the calls instead of trusting the code, and creating it was cheaper than
+        continuing to hope.
+        """
+        return subprocess.run(
+            ['git', 'credential', 'fill'],
+            input=f'protocol={scheme}\nhost={netloc}\n\n',
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
+        )
 
 
 #: MEASURED on a real GitHub repo (`DawnEver/optimi-lab`, 2026-08-09). What SURVIVED the second
