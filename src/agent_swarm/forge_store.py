@@ -461,19 +461,29 @@ class ForgeStore:
         assert not isinstance(number, NotVisible)
         self.forge.add_comment(number, f'**{verdict}**\n\n```\n{detail}\n```')
 
-        # Exactly one verdict label at a time. A retry after INCONCLUSIVE that merely ADDED `pass`
-        # would leave the job both inconclusive and green, and nothing downstream can act on that.
-        # THE FINAL LABEL SET, COMPUTED HERE AND APPLIED WITH THE CLOSE. Closing is the last act
-        # of every job, so this is a write path the whole fleet traverses -- it cost 4 round trips
-        # (comment, read, add, close), or 5 when a reopened item still carried a stale verdict
-        # label. Reading stays: only the current set says which stale labels to drop, and an
-        # "add this one" verb cannot drop them, so it would need a second call regardless.
+        # THE VERDICT LABEL LANDS BEFORE THE CLOSE, and the order is load-bearing twice over.
         #
-        # Everything that is not a verdict label is PRESERVED. Replacing the set with just the
-        # verdict would silently strip the handover label and anything a human attached, and the
-        # loss would surface only as work that quietly stopped being offered.
-        keep = [name for name in self.forge.labels(number) if name not in _LABEL_TO_VERDICT]
-        self.forge.close_work_item(number, labels=[*keep, VERDICT_LABELS[verdict]])
+        # It used to ride ALONG WITH the close, as a `labels` replacement on one PATCH -- 3 round
+        # trips instead of 4. REFUTED against the live server 2026-08-10: the PATCH returned 200,
+        # the item closed, and the label was never attached. So the verdict was unreadable while
+        # the job was already unclaimable -- the silent-loss state this method is ordered to avoid.
+        #
+        # Now: comment, read labels, drop a stale verdict, add this one, close. Every write except
+        # the last leaves the item OPEN, so a crash anywhere leaves work that is still claimable and
+        # gets re-run, at the cost of one duplicate comment. Closing LAST is what makes that true.
+        #
+        # Exactly one verdict label at a time: a retry after INCONCLUSIVE that merely ADDED `pass`
+        # would leave the job both inconclusive and green, and nothing downstream can act on that.
+        # The removal costs a round trip only when there IS a stale one, which is the retry path.
+        #
+        # Everything that is not a verdict label is PRESERVED -- the handover label and anything a
+        # human attached. The old replacement set had to rebuild them, and getting that list wrong
+        # would have surfaced only as work that quietly stopped being offered.
+        for name in self.forge.labels(number):
+            if name in _LABEL_TO_VERDICT:
+                self.forge.remove_label(number, name)
+        self.forge.add_label(number, VERDICT_LABELS[verdict])
+        self.forge.close_work_item(number)
 
     def verdict(self, job: Job) -> str | None:
         number = self._item_number(job)

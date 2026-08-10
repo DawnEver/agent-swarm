@@ -68,19 +68,29 @@ def test_create_applies_labels_in_the_same_call(live):
 
 
 @pytest.mark.live_forge
-def test_close_replaces_labels_in_the_same_call(live):
-    """The verdict's 4 -> 3, and BOTH halves of the replacement semantics: the verdict label must
-    arrive, and the handover label must survive. A server whose `labels` on PATCH appended instead
-    of replacing would accumulate verdict labels across retries."""
+def test_the_verdict_label_and_the_close_both_land(live):
+    """THIS TEST REFUTED A COST CLAIM, and it is kept pointed at the outcome rather than the route.
+
+    It used to assert the verdict's 4 -> 3: that Gitea applies `state` and `labels` on one PATCH.
+    Run against the live server 2026-08-10, the PATCH returned 200, the item closed, and the label
+    was never attached -- confirmed in the server's own database. The saving was a verdict that
+    silently did not land, and the reason no unit test caught it is that the in-memory double
+    implemented the replacement.
+
+    So it now asserts the STATE THE FLEET DEPENDS ON -- verdict readable, handover label intact,
+    item closed -- and says nothing about how many calls got there. The count is measured next door
+    against the double, where it can be counted; what only the real server can answer is whether the
+    writes actually took, and that is this file's job.
+    """
     forge, store, _ = live
     job = Job(id='group/close', kind=TEST_RUN)
     number = store.register(job)
     store.record_verdict(job, verdict='PASS', detail='contract probe')
 
     after = set(forge.labels(number))
-    assert VERDICT_LABELS['PASS'] in after, 'the verdict label did not arrive with the close'
-    assert READY_LABEL in after, 'the close stripped a label it was told to keep'
-    assert forge.state(number) == 'closed', 'the state did not change in the same call'
+    assert VERDICT_LABELS['PASS'] in after, 'the verdict label did not land'
+    assert READY_LABEL in after, 'recording the verdict stripped a label it must preserve'
+    assert forge.state(number) == 'closed', 'the item did not close'
 
 
 @pytest.mark.live_forge
@@ -131,7 +141,7 @@ def test_the_live_tests_are_marked_so_they_do_not_run_by_accident():
     for name in (
         'test_the_listing_carries_labels_inline',
         'test_create_applies_labels_in_the_same_call',
-        'test_close_replaces_labels_in_the_same_call',
+        'test_the_verdict_label_and_the_close_both_land',
         'test_a_sweep_really_is_one_request',
     ):
         assert name in live, f'{name} would run against the real forge in every ordinary suite'

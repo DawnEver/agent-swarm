@@ -42,7 +42,7 @@ from agent_swarm.forge import STATUS_STATES, Comment, CommentGone, ForgeError, W
 #: older, gentler double while this repo's suite passes against the newer one -- two repos, one
 #: contract, two versions of the instrument. Asserting this constant makes a stale pin RED instead
 #: of quietly agreeable.
-DOUBLE_MODEL_VERSION = 3
+DOUBLE_MODEL_VERSION = 4
 
 
 class RecordingForge:
@@ -238,19 +238,18 @@ class RecordingForge:
             ids = set(self.repo_labels.get(name, []))
             self.item_labels[number] = [(i, n) for i, n in self.item_labels[number] if i not in ids]
 
-    def close_work_item(self, number: int, *, labels: Sequence[str] | None = None) -> None:
-        """Closes, and REPLACES the label set when one is given -- one operation, as the client does.
+    def close_work_item(self, number: int) -> None:
+        """Closes. TOUCHES NO LABELS, because the measured server does not.
 
-        A double that closed and then applied labels separately would model two operations where
-        the client performs one, and the write amplification this parameter removes would be
-        invisible to every test that used it.
+        This used to take a `labels` replacement set and apply it -- modelling Gitea's issue edit as
+        applying `state` and `labels` in one PATCH. Measured against the live server 2026-08-10: the
+        PATCH returns 200, the item closes, and the labels are NOT applied. So the double was better
+        behaved than reality on the exact axis a cost claim rested on, and every test through it
+        agreed that a verdict cost 3 round trips when it costs 4.
         """
-        resolved = None if labels is None else [(self.label_id(name), name) for name in labels]
         with self._lock:
             item = self.items[number]
             self.items[number] = WorkItem(number=number, title=item.title, state='closed')
-            if resolved is not None:
-                self.item_labels[number] = resolved
 
     def reopen_work_item(self, number: int) -> None:
         """NOT part of the `Forge` protocol -- deliberately.

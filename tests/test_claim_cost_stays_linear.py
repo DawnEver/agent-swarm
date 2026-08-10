@@ -172,25 +172,32 @@ def _verdict_cost() -> int:
     return forge.calls
 
 
-def test_recording_a_verdict_costs_THREE_round_trips():
+def test_recording_a_verdict_costs_FOUR_round_trips():
     """Closing is the last act of EVERY job, so this is a write path the whole fleet traverses.
 
-    It was 4 -- comment, read labels, add label, close -- and 5 when a reopened item still carried a
-    stale verdict label. The label read stays, and that is not an oversight: only the current set
-    says which stale labels to drop, and an "add this one" verb cannot drop them, so it would need a
-    second call regardless. What collapsed is add+close into one PATCH, which is what Gitea's issue
-    edit actually offers.
+    FOUR: comment, read labels, add the verdict label, close. Five when a reopened item still
+    carries a stale verdict label and it has to be removed.
+
+    THIS NUMBER WAS 3 FOR ONE DAY AND IT WAS WRONG. The claim was that Gitea's issue edit applies
+    `state` and `labels` in one PATCH, collapsing add+close. Measured against the live server
+    2026-08-10: the PATCH returned 200, the item closed, and the label was NEVER ATTACHED --
+    confirmed in the server's own database, where the item held only the handover label. So the
+    "saving" was a verdict that silently did not land.
+
+    Every test agreed with the 3 because `RecordingForge` IMPLEMENTED the replacement -- a double
+    better behaved than reality on exactly the axis the cost claim rested on. The double no longer
+    touches labels on close, which is why this test now measures what the fleet will actually pay.
     """
-    assert _verdict_cost() == 3
+    assert _verdict_cost() == 4
 
 
 def test_the_verdict_close_PRESERVES_every_other_label():
-    """The thing this optimisation could silently break, and the reason it is asserted separately.
+    """Kept from the replacement-set design, and it still discriminates.
 
-    `close_work_item(labels=...)` REPLACES the set. Passing only the verdict label would strip the
-    handover label and anything a human attached -- and the loss would surface not as an error but
-    as work that quietly stopped being offered, which is the failure mode this whole session keeps
-    finding.
+    The replacement form could strip the handover label and anything a human attached by rebuilding
+    the set wrongly; the add/remove form can strip it by removing too broadly. Different mechanism,
+    same loss -- and the loss surfaces not as an error but as work that quietly stopped being
+    offered, which is why it is asserted separately from the count above.
     """
     forge = RecordingForge()
     store = ForgeStore('bench', forge, role=Role.SUBMITTER)

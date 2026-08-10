@@ -59,8 +59,8 @@ class _Crashing(RecordingForge):
         self._note('add_comment')  # AFTER the write: the write landed, then we died.
         return out
 
-    def close_work_item(self, number: int, *, labels=None) -> None:
-        super().close_work_item(number, labels=labels)
+    def close_work_item(self, number: int) -> None:
+        super().close_work_item(number)
         self._note('close_work_item')
 
 
