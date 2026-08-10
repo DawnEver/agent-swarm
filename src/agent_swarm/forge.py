@@ -578,7 +578,12 @@ class GiteaForge:
         """
         return subprocess.run(
             ['git', 'credential', 'fill'],
-            input=f'protocol={scheme}\nhost={netloc}\n\n',
+            # THE USERNAME MUST BE IN THE QUERY, not merely in this function's signature. Measured
+            # 2026-08-10: it was threaded through the parameter and never written into the input, so
+            # the fill stayed host-only and returned `swarm-verifier` while the client believed it
+            # was `swarm-agent`. The live contract test then 403'd with
+            # `token scope=write:repository` -- the verifier's scope set, named in its own error.
+            input=f'protocol={scheme}\nhost={netloc}\nusername={username}\n\n',
             capture_output=True,
             text=True,
             check=False,

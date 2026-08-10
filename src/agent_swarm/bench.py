@@ -131,7 +131,9 @@ def spread(runs: Sequence[Measurement]) -> str:
     good = [v for v in values if v is not None]
     if not good:
         return 'INCONCLUSIVE -- no repeat produced a successful operation'
-    return f'p50 across {len(runs)} repeats: {min(good):.3f}s .. {max(good):.3f}s (median {statistics.median(good):.3f}s)'
+    return (
+        f'p50 across {len(runs)} repeats: {min(good):.3f}s .. {max(good):.3f}s (median {statistics.median(good):.3f}s)'
+    )
 
 
 # --------------------------------------------------------------------------- the three probes
@@ -140,7 +142,8 @@ def spread(runs: Sequence[Measurement]) -> str:
 def bench_create(forge: Forge, *, concurrency: int, prefix: str) -> Measurement:
     """WRITE RATE: cost of creating one work item, under contention."""
     return measure(
-        'create', lambda i: forge.create_work_item(title=f'{prefix}/create-{i}', body='bench'),
+        'create',
+        lambda i: forge.create_work_item(title=f'{prefix}/create-{i}', body='bench'),
         concurrency=concurrency,
     )
 

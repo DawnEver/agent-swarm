@@ -646,9 +646,7 @@ class ForgeStore:
         # registered job -- measured at 2.0 calls per job against a create-only 1.0, i.e. half the
         # registration throughput spent on a label -- and it left a window in which the item existed
         # WITHOUT the label that makes it claimable.
-        number = self.forge.create_work_item(
-            title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL]
-        )
+        number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL])
         self._item_numbers[title] = number
         for requested in sorted(set(requests)):
             if not requested:
@@ -735,9 +733,7 @@ class ForgeStore:
             # NO RE-READ. The creation response is authoritative and fresh on every forge, and
             # asking the list to confirm what we just made is the `created-blind` failure: measured
             # on GitHub, the re-read did not return the reader's OWN issue 24 of 24 times.
-            mine = self.forge.create_work_item(
-                title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL]
-            )
+            mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL])
             self._item_numbers[title] = mine
             self._remember(job, mine)
             return mine
@@ -806,8 +802,7 @@ class ForgeStore:
         let a caller confuse them.
         """
         for state in ('open', 'all'):
-            matches = [item.number for item in self.forge.list_work_items(state=state)
-                       if item.title == title]
+            matches = [item.number for item in self.forge.list_work_items(state=state) if item.title == title]
             if matches:
                 return min(matches)
         return None

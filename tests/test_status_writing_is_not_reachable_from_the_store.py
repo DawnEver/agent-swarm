@@ -42,9 +42,7 @@ def _calls_in(source: str) -> set[str]:
     """Every attribute called anywhere in the module, by attribute name."""
     tree = ast.parse(source)
     return {
-        node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
 
 

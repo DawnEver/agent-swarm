@@ -121,8 +121,12 @@ class RecordingForge:
             # omitted them would leave the store's per-item fetch looking necessary, and the N+1
             # this parameter removes would be invisible to every test using it.
             items = [
-                WorkItem(number=x.number, title=x.title, state=x.state,
-                         labels=tuple(name for _id, name in self.item_labels.get(x.number, [])))
+                WorkItem(
+                    number=x.number,
+                    title=x.title,
+                    state=x.state,
+                    labels=tuple(name for _id, name in self.item_labels.get(x.number, [])),
+                )
                 for x in self.items.values()
                 if state == 'all' or x.state == state
             ]

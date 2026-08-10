@@ -42,11 +42,24 @@ from agent_swarm.testing import RecordingForge
 #: Every method that costs a round trip against a real forge. Named explicitly rather than "every
 #: public method": a helper that only reads local state must not inflate the count and make a
 #: regression look like an improvement.
-_IO_METHODS = frozenset({
-    'add_comment', 'comments', 'delete_comment', 'labels', 'add_label', 'remove_label',
-    'list_work_items', 'work_item', 'state', 'create_work_item', 'update_comment',
-    'close_work_item', 'retire_work_item', 'set_status',
-})
+_IO_METHODS = frozenset(
+    {
+        'add_comment',
+        'comments',
+        'delete_comment',
+        'labels',
+        'add_label',
+        'remove_label',
+        'list_work_items',
+        'work_item',
+        'state',
+        'create_work_item',
+        'update_comment',
+        'close_work_item',
+        'retire_work_item',
+        'set_status',
+    }
+)
 
 
 class _Counting(RecordingForge):
@@ -60,6 +73,7 @@ class _Counting(RecordingForge):
     def __getattribute__(self, name: str):
         attr = object.__getattribute__(self, name)
         if name in _IO_METHODS and callable(attr):
+
             def wrapped(*args, **kwargs):
                 object.__setattr__(self, 'calls', object.__getattribute__(self, 'calls') + 1)
                 return attr(*args, **kwargs)

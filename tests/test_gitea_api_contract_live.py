@@ -128,6 +128,10 @@ def test_the_live_tests_are_marked_so_they_do_not_run_by_accident():
 
     module = inspect.getmodule(test_the_listing_carries_labels_inline)
     live = [n for n, f in vars(module).items() if n.startswith('test_') and hasattr(f, 'pytestmark')]
-    for name in ('test_the_listing_carries_labels_inline', 'test_create_applies_labels_in_the_same_call',
-                 'test_close_replaces_labels_in_the_same_call', 'test_a_sweep_really_is_one_request'):
+    for name in (
+        'test_the_listing_carries_labels_inline',
+        'test_create_applies_labels_in_the_same_call',
+        'test_close_replaces_labels_in_the_same_call',
+        'test_a_sweep_really_is_one_request',
+    ):
         assert name in live, f'{name} would run against the real forge in every ordinary suite'
