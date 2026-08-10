@@ -41,6 +41,7 @@ from agent_swarm.forge_store import (
     VERDICT_LABELS,
     ForgeStore,
     NotVisible,
+    Role,
     decode_claim,
     encode_claim,
 )
@@ -69,7 +70,7 @@ def _race_one_round(namespace: str, job: Job, *, racers: int) -> list[str]:
     winners: list[str] = []
     lock = threading.Lock()
     barrier = threading.Barrier(racers)
-    stores = [ForgeStore(namespace, default_forge()) for _ in range(racers)]
+    stores = [ForgeStore(namespace, default_forge(), role=Role.SUBMITTER) for _ in range(racers)]
 
     def attempt(n: int) -> None:
         barrier.wait()
@@ -112,6 +113,11 @@ class RecordingForge:
     def list_work_items(self) -> list[WorkItem]:
         with self._lock:
             return list(self.items.values())
+
+    def work_item(self, number: int) -> WorkItem | None:
+        """BY NUMBER, and therefore fresh even in `StaleListForge` -- which is the measured shape."""
+        with self._lock:
+            return self.items.get(number)
 
     def create_work_item(self, *, title: str, body: str) -> int:
         with self._lock:
@@ -171,7 +177,7 @@ def recording_forge():
 
 @pytest.fixture
 def memory_store(recording_forge):
-    return ForgeStore('ns', recording_forge)
+    return ForgeStore('ns', recording_forge, role=Role.SUBMITTER)
 
 
 # --------------------------------------------------------------------------------------------
@@ -288,8 +294,8 @@ class TestNoVendorLEAKEDIntoTheLogic:
         assert recording_forge.retired == [1]
 
     def test_purging_cannot_reach_ANOTHER_namespace(self, recording_forge):
-        ForgeStore('ns-a', recording_forge).record_verdict(JOB, verdict='PASS', detail='')
-        ForgeStore('ns-b', recording_forge).purge_namespace()
+        ForgeStore('ns-a', recording_forge, role=Role.SUBMITTER).record_verdict(JOB, verdict='PASS', detail='')
+        ForgeStore('ns-b', recording_forge, role=Role.SUBMITTER).purge_namespace()
         assert recording_forge.retired == []
 
 
@@ -325,11 +331,11 @@ class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
         """A machine that dies must not park a job forever. There is deliberately no separate
         takeover path: the dead claim stops counting and ordinary arbitration elects the next one.
         """
-        dying = ForgeStore('ns', recording_forge, lease_seconds=0.05)
+        dying = ForgeStore('ns', recording_forge, role=Role.SUBMITTER, lease_seconds=0.05)
         assert dying.try_claim(JOB, owner='runner-dead') is True
         time.sleep(0.15)
         assert dying.claim_owner(JOB) is None, 'an expired claim must read as unheld'
-        assert ForgeStore('ns', recording_forge).try_claim(JOB, owner='runner-b') is True
+        assert ForgeStore('ns', recording_forge, role=Role.SUBMITTER).try_claim(JOB, owner='runner-b') is True
 
     def test_a_LIVE_claim_is_never_taken_over(self, memory_store):
         assert memory_store.try_claim(JOB, owner='runner-a') is True
@@ -341,7 +347,7 @@ class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
         silently never runs -- which reads as healthy contention rather than as a bug.
         """
         with pytest.raises(ValueError, match='lease_seconds'):
-            ForgeStore('ns', recording_forge, lease_seconds=0.0)
+            ForgeStore('ns', recording_forge, role=Role.SUBMITTER, lease_seconds=0.0)
 
     def test_the_verdict_detail_is_not_a_CLAIM_comment(self, memory_store):
         """Claims and verdicts share one comment stream. A job claimed after its verdict would
@@ -365,7 +371,7 @@ class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
         lowest one and retires its own duplicate instead of leaving it in the list.
         """
         job = Job(id='fresh-item', kind=TEST_RUN)
-        stores = [ForgeStore('ns', recording_forge) for _ in range(8)]
+        stores = [ForgeStore('ns', recording_forge, role=Role.SUBMITTER) for _ in range(8)]
         winners: list[int] = []
         lock = threading.Lock()
         barrier = threading.Barrier(8)
@@ -407,7 +413,7 @@ class TestTheVerdictVocabularyIsClosedBEFOREAnyIO:
         that validated after the comment was posted would leave one behind for a verdict it then
         rejected.
         """
-        store = ForgeStore('probe-never-contacted', GiteaForge('http://127.0.0.1:1', 'o/r'))
+        store = ForgeStore('probe-never-contacted', GiteaForge('http://127.0.0.1:1', 'o/r'), role=Role.SUBMITTER)
         with pytest.raises(ValueError, match='verdict'):
             store.record_verdict(JOB, verdict='ERROR', detail='')
 
@@ -460,7 +466,7 @@ def server_store():
     job id. Two runs of this file at once would otherwise contend for one work item, and each would
     report the other's claim as a contract violation.
     """
-    store = ForgeStore(f'probe-p3-{uuid.uuid4().hex[:10]}', default_forge())
+    store = ForgeStore(f'probe-p3-{uuid.uuid4().hex[:10]}', default_forge(), role=Role.SUBMITTER)
     try:
         yield store
     finally:
@@ -514,7 +520,7 @@ class TestWhatOnlyTheRealServerCanSettle:
         this counts the ITEMS.
         """
         job = Job(id='fresh-item', kind=TEST_RUN)
-        stores = [ForgeStore(server_store.namespace, default_forge()) for _ in range(16)]
+        stores = [ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER) for _ in range(16)]
         winners: list[int] = []
         lock = threading.Lock()
         barrier = threading.Barrier(16)
@@ -569,18 +575,21 @@ class TestWhatOnlyTheRealServerCanSettle:
         assert server_store.claim_owner(JOB) == 'runner-a'
 
     def test_an_EXPIRED_claim_is_taken_over(self, server_store):
-        dying = ForgeStore(server_store.namespace, default_forge(), lease_seconds=0.5)
+        dying = ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER, lease_seconds=0.5)
         assert dying.try_claim(JOB, owner='runner-dead') is True
         time.sleep(0.8)
         assert dying.claim_owner(JOB) is None
-        assert ForgeStore(server_store.namespace, default_forge()).try_claim(JOB, owner='runner-b') is True
+        assert (
+            ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER).try_claim(JOB, owner='runner-b')
+            is True
+        )
 
     def test_the_verdict_survives_a_FRESH_store_object(self, server_store):
         """The point of a backing store. An in-process cache would pass every verdict test in the
         contract suite while storing nothing on the server.
         """
         server_store.record_verdict(JOB, verdict='INCONCLUSIVE', detail='node down')
-        assert ForgeStore(server_store.namespace, default_forge()).verdict(JOB) == 'INCONCLUSIVE'
+        assert ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER).verdict(JOB) == 'INCONCLUSIVE'
 
     def test_the_detail_is_recorded_where_a_HUMAN_will_read_it(self, server_store):
         """gate.py's output is the evidence behind the verdict; a verdict without it is a claim."""
@@ -663,15 +672,15 @@ class TestAListQueryCannotSayABSENT:
         written against a value that is never None -- and a comment saying so would have been prose
         the code never consults.
         """
-        store = ForgeStore('ns', StaleListForge(RecordingForge(), staleness=60.0))
+        store = ForgeStore('ns', StaleListForge(RecordingForge(), staleness=60.0), role=Role.SUBMITTER)
         answer = store.work_item_number(JOB)
         assert answer is not None
         assert isinstance(answer, NotVisible)
 
     def test_a_hidden_item_reads_as_NOT_VISIBLE_rather_than_absent(self):
         forge = StaleListForge(RecordingForge(), staleness=60.0)
-        ForgeStore('ns', forge).register(JOB)
-        assert isinstance(ForgeStore('ns', forge).work_item_number(JOB), NotVisible)
+        ForgeStore('ns', forge, role=Role.SUBMITTER).register(JOB)
+        assert isinstance(ForgeStore('ns', forge, role=Role.SUBMITTER).work_item_number(JOB), NotVisible)
 
     def test_NOT_VISIBLE_is_falsy_but_is_not_None(self):
         """A visible item number is never 0 -- forges number from 1 -- so the falsy case is exactly
@@ -720,7 +729,7 @@ class TestConcurrentCreationAgainstALAGGINGList:
         about the cause, eight items is not.
         """
         forge = StaleListForge(RecordingForge(), staleness=30.0)
-        resolved = self._race(lambda: ForgeStore('ns', forge, list_staleness_seconds=0.0))
+        resolved = self._race(lambda: ForgeStore('ns', forge, role=Role.SUBMITTER, list_staleness_seconds=0.0))
         assert len(resolved) > 1, 'the harness is not reproducing the lag it exists to reproduce'
         assert len(resolved) == 8, f'expected every racer on its own item, got {sorted(resolved)}'
 
@@ -730,7 +739,7 @@ class TestConcurrentCreationAgainstALAGGINGList:
         which is why the constant carries its measurement and is not a knob to tune until green.
         """
         forge = StaleListForge(RecordingForge(), staleness=0.3)
-        resolved = self._race(lambda: ForgeStore('ns', forge, list_staleness_seconds=0.8))
+        resolved = self._race(lambda: ForgeStore('ns', forge, role=Role.SUBMITTER, list_staleness_seconds=0.8))
         assert len(resolved) == 1, f'racers arbitrated on different work items: {sorted(resolved)}'
 
     def test_REGISTER_deletes_the_race_without_any_window_at_all(self):
@@ -740,7 +749,7 @@ class TestConcurrentCreationAgainstALAGGINGList:
         """
         forge = StaleListForge(RecordingForge(), staleness=30.0)
         job = Job(id='fresh', kind=TEST_RUN)
-        number = ForgeStore('ns', forge).register(job)
+        number = ForgeStore('ns', forge, role=Role.SUBMITTER).register(job)
 
         title = f'[swarm] ns/{job.claim_key()}'
         items = [i for i in forge.inner.list_work_items() if i.title == title]
@@ -753,7 +762,7 @@ class TestConcurrentCreationAgainstALAGGINGList:
         it was measured to fail outright: the re-read missed the reader's own issue 24 of 24 times.
         """
         forge = StaleListForge(RecordingForge(), staleness=30.0)
-        store = ForgeStore('ns', forge)
+        store = ForgeStore('ns', forge, role=Role.SUBMITTER)
         before = forge.list_calls
         store.register(Job(id='fresh', kind=TEST_RUN))
         assert forge.list_calls == before, 'register consulted the list it must not trust'

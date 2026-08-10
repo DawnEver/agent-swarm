@@ -27,12 +27,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_swarm import spool as spool_module
+from agent_swarm import durable as durable_module
+from agent_swarm.durable import DIRECTORY_FSYNC_AVAILABLE
 from agent_swarm.forge import Comment
-from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore
+from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore, Role
 from agent_swarm.job import TEST_RUN, Job
 from agent_swarm.spool import (
-    DIRECTORY_FSYNC_AVAILABLE,
     DrainReport,
     ForgePublisher,
     PublishedTextReader,
@@ -61,7 +61,7 @@ def forge() -> RecordingForge:
 
 @pytest.fixture
 def publisher(forge) -> ForgePublisher:
-    return ForgePublisher(ForgeStore('ns', forge))
+    return ForgePublisher(ForgeStore('ns', forge, role=Role.SUBMITTER))
 
 
 class CountingPublisher:
@@ -176,8 +176,8 @@ class TestDrainingPublishesAndMarks:
     def test_the_verdict_reaches_the_forge(self, spool, publisher, forge):
         spool.record(JOB, verdict='FAIL', detail='3 failed, 10643 passed')
         spool.drain(publisher)
-        assert ForgeStore('ns', forge).verdict(JOB) == 'FAIL'
-        assert '3 failed, 10643 passed' in ForgeStore('ns', forge).verdict_detail(JOB)
+        assert ForgeStore('ns', forge, role=Role.SUBMITTER).verdict(JOB) == 'FAIL'
+        assert '3 failed, 10643 passed' in ForgeStore('ns', forge, role=Role.SUBMITTER).verdict_detail(JOB)
 
     def test_a_FAILED_publish_leaves_the_entry_pending(self, spool):
         """The whole point. The verdict must outlive the forge being down."""
@@ -242,7 +242,7 @@ class TestReplayIsIdempotent:
         second = spool.record(JOB, verdict='PASS', detail='green on retry')
         assert publisher.is_published(second) is False
         spool.drain(publisher)
-        assert ForgeStore('ns', forge).verdict(JOB) == 'PASS'
+        assert ForgeStore('ns', forge, role=Role.SUBMITTER).verdict(JOB) == 'PASS'
         assert first.id != second.id
 
     def test_CRASH_AFTER_COMMENT_BEFORE_LABEL_is_repaired_not_repeated(self, spool, publisher, forge):
@@ -254,7 +254,7 @@ class TestReplayIsIdempotent:
         of posting a second comment.
         """
         entry = spool.record(JOB, verdict='PASS', detail='green')
-        store = ForgeStore('ns', forge)
+        store = ForgeStore('ns', forge, role=Role.SUBMITTER)
         number = store.work_item_number(entry.job, create=True)
         forge.add_comment(number, f'**PASS**\n\n```\ngreen\n```\n\n{entry.marker()}')
         # dead here: comment posted, no label, still open.
@@ -278,7 +278,7 @@ class TestReplayIsIdempotent:
         spool.record(JOB, verdict='PASS', detail='green')
         spool.drain(CountingPublisher(fail=True))
         spool.drain(publisher)
-        assert ForgeStore('ns', forge).verdict(JOB) == 'PASS'
+        assert ForgeStore('ns', forge, role=Role.SUBMITTER).verdict(JOB) == 'PASS'
         assert len([c for c in forge.comments(1) if '**PASS**' in c.body]) == 1
 
 
@@ -494,6 +494,6 @@ class TestTheDurabilityLimitIsNAMED:
 
     def test_the_no_op_is_documented_AS_a_no_op(self):
         """A hole that is named is a different defect from a hole the docs imply does not exist."""
-        doc = spool_module._fsync_directory.__doc__
+        doc = durable_module._fsync_directory.__doc__
         assert 'DOES NOTHING' in doc
         assert 'power cut' in doc.lower()

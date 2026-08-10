@@ -81,11 +81,13 @@ verdict label may be attached -- is decided here, once, for every vendor.
 
 from __future__ import annotations
 
+import enum
 import time
 from dataclasses import dataclass
 from typing import ClassVar, Self
 
 from agent_swarm.forge import Forge
+from agent_swarm.item_index import IndexCorruptError, ItemIndex, NotIndexed
 from agent_swarm.job import Job
 from agent_swarm.store import VERDICTS
 
@@ -110,6 +112,24 @@ VERDICT_LABELS = {
 _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 
 _ITEM_TITLE_ROOT = '[swarm]'
+
+
+class Role(enum.Enum):
+    """Who this store is, and therefore what it is ALLOWED to do.
+
+    A RUNNER MAY NOT CREATE A WORK ITEM. Concurrent creation is a race that no re-read closes on a
+    forge whose list lags, so the only reliable fix is that exactly one writer creates -- and a rule
+    that lives in a docstring is a rule the code never consults. This makes it structural: a
+    runner-mode store RAISES rather than creating, so the eight-item race is not merely unlikely,
+    it is unreachable from that role.
+
+    THERE IS NO DEFAULT, DELIBERATELY. A defaulted role is a policy that is quietly opt-out, and a
+    caller who never thought about creation would get the permissive half for free -- which is the
+    exact shape that produced the bug this enum exists to prevent.
+    """
+
+    SUBMITTER = 'submitter'
+    RUNNER = 'runner'
 
 
 class NotVisible:
@@ -236,9 +256,13 @@ class ForgeStore:
         namespace: str,
         forge: Forge,
         *,
+        role: Role,
+        index: ItemIndex | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
         list_staleness_seconds: float = DEFAULT_LIST_STALENESS_SECONDS,
     ) -> None:
+        self.role = role
+        self.index = index
         self.list_staleness_seconds = list_staleness_seconds
         if lease_seconds <= 0:
             # Refused at construction rather than at the claim: a zero lease makes `try_claim`
@@ -389,6 +413,9 @@ class ForgeStore:
         Returns the number from the creation response, which is authoritative and fresh on every
         forge. It does not re-read to find what it just made; see `_item_number`.
         """
+        if self.role is Role.RUNNER:
+            msg = f'a {Role.RUNNER.value} store may not register work items; submitting is not its job'
+            raise PermissionError(msg)
         title = self._item_title(job)
         number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
         self._item_numbers[title] = number
@@ -400,14 +427,31 @@ class ForgeStore:
         if cached is not None:
             return cached
 
+        remembered = self._from_index(job, title)
+        if remembered is not None:
+            self._item_numbers[title] = remembered
+            return remembered
+
         found = self._lowest_numbered(title)
         if found is not None:
             self._item_numbers[title] = found
+            self._remember(job, found)
             return found
         if not create:
             # NOT `None`. The list said "I cannot see it", and the caller must not be able to read
             # that as "it is not there" -- which is the exact substitution that produced duplicates.
             return NOT_VISIBLE
+
+        if self.role is Role.RUNNER:
+            # STRUCTURAL, not conventional. A runner reaching here has read a list that cannot see
+            # the item -- which on a lagging forge means "not replicated yet" far more often than
+            # "never submitted" -- and creating one is how eight runners produce eight items.
+            msg = (
+                f'a {Role.RUNNER.value} store may not create a work item for {job.claim_key()!r}: '
+                f'either it has not been submitted yet, or the list is stale. The submitter creates '
+                f'it exactly once via ForgeStore.register().'
+            )
+            raise PermissionError(msg)
 
         # THE CREATION RESPONSE IS THE ONLY FRESH ANSWER. `POST /issues` returns the number in its
         # 201 body: authoritative, immediate, free. Any code that creates and then lists to find
@@ -417,7 +461,48 @@ class ForgeStore:
 
         winner = self._converge(title, mine)
         self._item_numbers[title] = winner
+        self._remember(job, winner)
         return winner
+
+    def _from_index(self, job: Job, title: str) -> int | None:
+        """Turn a remembered number into an authoritative answer, or `None` to fall through.
+
+        A HIT IS A HYPOTHESIS. It is confirmed by a read BY NUMBER -- the only read measured fresh on
+        both forges -- and the confirmation is what makes this a shortcut rather than a second
+        source of truth.
+
+        Three outcomes, and the third is the one that must not be quiet:
+
+        * the item exists and its title matches  -> authoritative, and it cost one fresh read
+        * the number no longer exists            -> an ordinary stale entry: FORGET it and fall
+          through to the list, so a cold cache costs re-reads and never correctness
+        * the number exists with a DIFFERENT title -> two keys have been crossed. That is
+          corruption, not a miss. The entry is forgotten (self-correcting, so the retry is clean)
+          and then it RAISES (loud), because a store that carried on would write this job's verdict
+          onto somebody else's work item.
+        """
+        if self.index is None:
+            return None
+        remembered = self.index.get(job.claim_key())
+        if isinstance(remembered, NotIndexed):
+            return None
+        item = self.forge.work_item(remembered.number)
+        if item is None:
+            self.index.forget(job.claim_key())
+            return None
+        if item.title != title:
+            self.index.forget(job.claim_key())
+            msg = (
+                f'work-item index is corrupt: {job.claim_key()!r} pointed at #{remembered.number}, '
+                f'which is titled {item.title!r}, not {title!r}. The entry has been dropped; a '
+                f'retry will resolve cleanly, but find out what crossed the two keys.'
+            )
+            raise IndexCorruptError(msg)
+        return item.number
+
+    def _remember(self, job: Job, number: int) -> None:
+        if self.index is not None:
+            self.index.put(job.claim_key(), number)
 
     def _converge(self, title: str, mine: int) -> int:
         """Agree with concurrent creators on ONE item, as far as the backend permits.

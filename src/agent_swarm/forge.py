@@ -110,6 +110,16 @@ class Forge(Protocol):
         """Every item, open and closed. Paginated by the vendor client, not by the caller."""
         ...
 
+    def work_item(self, number: int) -> WorkItem | None:
+        """One item BY NUMBER, or ``None`` if there is no such number.
+
+        THE ONLY READ MEASURED FRESH ON BOTH FORGES -- a primary-key read rather than a filter
+        (GitHub 0/22 stale, Gitea fresh). It is what lets `item_index` turn a remembered number into
+        an authoritative answer, and it is the reason a "does not exist" conclusion is legitimate
+        here where it never is from a list.
+        """
+        ...
+
     def create_work_item(self, *, title: str, body: str) -> int: ...
 
     def add_comment(self, number: int, body: str) -> int:
@@ -191,6 +201,15 @@ class GiteaForge:
             if len(batch) < limit:
                 return out
             page += 1
+
+    def work_item(self, number: int) -> WorkItem | None:
+        try:
+            raw = self._api('GET', f'/repos/{self.repo}/issues/{number}')
+        except ForgeError as exc:
+            if ' -> 404' in str(exc):
+                return None
+            raise
+        return WorkItem(number=raw['number'], title=raw['title'], state=raw['state'])
 
     def create_work_item(self, *, title: str, body: str) -> int:
         return self._api('POST', f'/repos/{self.repo}/issues', {'title': title, 'body': body})['number']
@@ -394,6 +413,9 @@ class GitHubForge:
 
     def list_work_items(self) -> list[WorkItem]:
         raise self._unmeasured('list_work_items')
+
+    def work_item(self, number: int) -> WorkItem | None:
+        raise self._unmeasured('work_item')
 
     def create_work_item(self, *, title: str, body: str) -> int:
         raise self._unmeasured('create_work_item')

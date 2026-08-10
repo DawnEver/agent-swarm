@@ -45,7 +45,7 @@ worse than none:
 * **Power loss, as distinct from process death.** Entries are written with `fsync` and swapped with
   `os.replace`, which closes `kill -9` completely. Surviving a power cut additionally requires the
   directory entry itself to be durable, and **Windows has no directory fsync at all** -- see
-  :data:`DIRECTORY_FSYNC_AVAILABLE`, which is `False` there. Our runners are Windows.
+  :data:`durable.DIRECTORY_FSYNC_AVAILABLE`, which is `False` there. Our runners are Windows.
 * **Two boxes spooling the same job.** The claim protocol is what prevents that. If it is bypassed,
   two spools will each publish, and the later drain wins with no arbitration.
 
@@ -83,6 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from agent_swarm.durable import atomic_write
 from agent_swarm.forge_store import VERDICT_LABELS, ForgeStore, NotVisible
 from agent_swarm.job import Job, JobKind
 from agent_swarm.store import VERDICTS
@@ -247,7 +248,7 @@ class Spool:
         # millisecond must not overwrite each other, and each one's `record` returned successfully
         # so the loss would be invisible.
         entry = SpoolEntry(id=uuid.uuid4().hex, job=job, verdict=verdict, detail=detail, recorded_at=time.time())
-        _atomic_write(self.pending_dir / f'{entry.id}{_ENTRY_SUFFIX}', _encode(entry))
+        atomic_write(self.pending_dir / f'{entry.id}{_ENTRY_SUFFIX}', _encode(entry))
         return entry
 
     def pending(self) -> list[SpoolEntry]:
@@ -447,53 +448,3 @@ def _decode(path: Path) -> SpoolEntry:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         msg = f'unreadable spool entry {path}: {exc}'
         raise SpoolCorruptError(msg) from exc
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Write `path` so that no reader ever sees a partial one.
-
-    The scratch file carries a suffix the reader does not glob, so a crash mid-write leaves litter
-    rather than a truncated entry -- and litter is not corruption, so it must not trip the alarm.
-    """
-    scratch = path.with_name(path.name.replace(_ENTRY_SUFFIX, _SCRATCH_SUFFIX))
-    with open(scratch, 'wb') as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(scratch, path)
-    _fsync_directory(path.parent)
-
-
-#: Can this platform make a DIRECTORY entry durable? False on Windows, which has no directory
-#: fsync at all. Exported rather than hidden inside the helper so that a caller deciding how much to
-#: trust this spool can READ the answer instead of inferring it from a silent `except OSError`.
-DIRECTORY_FSYNC_AVAILABLE = os.name != 'nt'
-
-
-def _fsync_directory(directory: Path) -> None:
-    """Make the directory entry itself durable -- ON PLATFORMS THAT HAVE THAT OPERATION.
-
-    **ON WINDOWS THIS FUNCTION DOES NOTHING, and that is not a bug to be fixed here.** Windows
-    exposes no directory fsync; `os.open` on a directory fails outright. The early return is
-    deliberate and is named, because the alternative -- letting the call fall into a bare
-    `except OSError: pass` -- would look like an attempt that happened to fail rather than an
-    operation the platform does not have. A reader skimming for durability would see an fsync call
-    and believe it.
-
-    CONSEQUENCE, stated at the code rather than only in the module docstring: on Windows the spool
-    survives `kill -9` completely (the file contents are fsync'd and `os.replace` is atomic) but a
-    POWER CUT can lose the directory entry of a just-recorded verdict. Our runners are Windows, so
-    this is a live limit and not a theoretical one.
-    """
-    if not DIRECTORY_FSYNC_AVAILABLE:
-        return
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)

@@ -38,6 +38,7 @@ FORGE_METHODS = sorted(name for name in Forge.__protocol_attrs__ if not name.sta
 #: than silently going untested.
 ARITY = {
     'list_work_items': 0,
+    'work_item': 1,
     'create_work_item': 0,  # keyword-only
     'add_comment': 2,
     'comments': 1,
