@@ -551,7 +551,7 @@ class ForgeStore:
         """
         prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
         jobs: list[Job] = []
-        for item in self.forge.list_work_items():
+        for item in self.forge.list_work_items(state='open'):
             if item.state != 'open' or not item.title.startswith(prefix):
                 continue
             job = decode_claim_key(item.title[len(prefix) :], kind=kind)
@@ -600,7 +600,7 @@ class ForgeStore:
         """
         prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
         best: tuple[int, Job] | None = None
-        for item in self.forge.list_work_items():
+        for item in self.forge.list_work_items(state='open'):
             if item.state != 'open' or not item.title.startswith(prefix):
                 continue
             job = decode_claim_key(item.title[len(prefix) :], kind=kind)
@@ -829,7 +829,7 @@ class ForgeStore:
 
         prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
         by_title: dict[str, list[int]] = {}
-        for item in self.forge.list_work_items():
+        for item in self.forge.list_work_items(state='open'):
             # OPEN ITEMS ONLY, and that is what makes this sweep IDEMPOTENT rather than an alarm
             # that fires forever. Retirement closes the item, so a second pass has nothing to find.
             # Filtering on the vendor's retirement DECORATION instead would mean knowing what each

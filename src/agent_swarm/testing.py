@@ -78,7 +78,7 @@ class RecordingForge:
         self._next_label_id = 1000
         self.retired: list[int] = []
 
-    def list_work_items(self) -> list[WorkItem]:
+    def list_work_items(self, *, state: str = 'all') -> list[WorkItem]:
         """DETERMINISTICALLY SCRAMBLED. Neither first nor last correlates with the number.
 
         A real forge promises no ordering on a list endpoint -- Gitea and GitHub both default to
@@ -105,9 +105,13 @@ class RecordingForge:
 
         Not `random.shuffle` and not `hash()`: an intermittent double fails intermittently, which
         reads as flakiness and gets retried away, and `hash()` is salted per process.
+
+        FILTERING HAPPENS HERE, not in the caller, because the whole point of the parameter is that
+        the VENDOR does not send what was not asked for. A double that returned everything and let
+        the store filter would make a cost control that transmits nothing look like it works.
         """
         with self._lock:
-            items = list(self.items.values())
+            items = [x for x in self.items.values() if state == 'all' or x.state == state]
         half = len(items) // 2
         return items[half:] + items[:half]
 

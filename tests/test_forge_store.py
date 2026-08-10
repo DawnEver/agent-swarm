@@ -1023,7 +1023,7 @@ class TestClaimableFindsWorkARunnerCouldTake:
         scheduler has already been through once.
         """
 
-        def _boom():
+        def _boom(**_kwargs):
             raise ForgeError('the control plane is unreachable')
 
         monkeypatch.setattr(memory_store.forge, 'list_work_items', _boom)
@@ -1192,7 +1192,7 @@ class TestTheREADDecidesWhichCandidateIsCurrent:
         """Same asymmetry as `claimable` and `live_runners`. `None` here would read as "no candidate
         on this branch" and the scheduler would idle through an outage reporting healthy."""
 
-        def _boom():
+        def _boom(**_kwargs):
             raise ForgeError('the control plane is unreachable')
 
         monkeypatch.setattr(memory_store.forge, 'list_work_items', _boom)

@@ -138,8 +138,20 @@ class Forge(Protocol):
     contested claim -- it belongs in the store, where it is written once and tested once.
     """
 
-    def list_work_items(self) -> list[WorkItem]:
-        """Every item, open and closed. Paginated by the vendor client, not by the caller."""
+    def list_work_items(self, *, state: str = 'all') -> list[WorkItem]:
+        """Items in `state` (`'all'` or `'open'`). Paginated by the vendor client, not the caller.
+
+        THE PARAMETER IS A COST CONTROL, not a convenience, and the cost it controls GROWS WITHOUT
+        BOUND. A closed item is never deleted -- this deployment's API refuses it and GitHub has no
+        endpoint at all -- so `'all'` pages through every job the swarm has ever run, on every
+        sweep, on every runner. At a hundred agents that is the dominant read, and it gets slower
+        every day the system works correctly.
+
+        Most sweeps only act on open items and say so in their own filters; they must not pay for
+        history. `'all'` stays the DEFAULT because a caller that needs closed items and forgets to
+        ask would silently conclude "no such item" -- the expensive direction is slow, the cheap
+        direction is wrong.
+        """
         ...
 
     def work_item(self, number: int) -> WorkItem | None:
@@ -250,7 +262,7 @@ class GiteaForge:
         self._token: str | None = None
         self._label_ids: dict[str, int] = {}
 
-    def list_work_items(self) -> list[WorkItem]:
+    def list_work_items(self, *, state: str = 'all') -> list[WorkItem]:
         """A plain listing, NOT `?q=`.
 
         `GET /issues?q=<title>` returned ZERO hits for an issue that demonstrably existed on this
@@ -261,7 +273,7 @@ class GiteaForge:
         out: list[WorkItem] = []
         page, limit = 1, 50
         while True:
-            batch = self._api('GET', f'/repos/{self.repo}/issues?state=all&type=issues&limit={limit}&page={page}') or []
+            batch = self._api('GET', f'/repos/{self.repo}/issues?state={state}&type=issues&limit={limit}&page={page}') or []
             out.extend(WorkItem(number=x['number'], title=x['title'], state=x['state']) for x in batch)
             if len(batch) < limit:
                 return out
@@ -546,8 +558,8 @@ class GitHubForge:
             f'and these remain unmeasured and blocking:\n  - {blocking}'
         )
 
-    def list_work_items(self) -> list[WorkItem]:
-        raise self._unmeasured('list_work_items')
+    def list_work_items(self, *, state: str = 'all') -> list[WorkItem]:
+        raise self._unmeasured(f'list_work_items(state={state})')
 
     def work_item(self, number: int) -> WorkItem | None:
         raise self._unmeasured('work_item')
