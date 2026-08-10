@@ -54,25 +54,23 @@ LABEL_COLORS = {
 }
 _DEFAULT_LABEL_COLOR = '#ededed'
 
-#: MEASURED: how long a freshly created issue can stay invisible to a plain LIST query, per backend.
-#: This is the number `forge_store.ForgeStore(list_staleness_seconds=...)` wants, and it lives here
-#: because it is a fact about a VENDOR, not about the scheduler.
-#:
-#:     Gitea 1.26.4   plain list   0/25 stale                       -> 0.0
-#:     GitHub         plain list  22/22 stale, 0.42 s .. 6.36 s max -> 8.0 (measured max + margin)
-#:
-#: The GitHub number was NOT predicted: an 8-thread x 3-round integrated race left 8 duplicate work
-#: items every round, and the mode was `created-blind` -- the convergence re-read did not return
-#: even the reader's OWN just-created issue, 24 of 24 times. A mitigation that reads from the same
-#: stale view that caused the problem cannot work, which is why `ForgeStore.register` exists.
-LIST_STALENESS_SECONDS = {
-    'gitea': 0.0,
-    'github': 8.0,
-}
-
 
 class ForgeError(RuntimeError):
     """The forge refused something. Carries the status and body, NEVER the credential."""
+
+
+class CommentGone(ForgeError):
+    """The comment being edited no longer exists.
+
+    A SEPARATE TYPE BECAUSE THE TWO OUTCOMES NEED DIFFERENT RESPONSES, and telling them apart is the
+    whole reason `update_comment` is not allowed to be quiet. A heartbeat is one comment per runner
+    EDITED IN PLACE; if that comment has been pruned, an edit that failed silently would leave the
+    runner believing it had beaten while the fleet saw it as dead. It must learn to RE-CREATE.
+
+    Measured on Gitea 1.26.4: `PATCH /issues/comments/{id}` for a deleted comment returns 404 with
+    `comment does not exist [id: ...]`, so the distinction is available at the wire and does not
+    have to be inferred from a later read.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +130,22 @@ class Forge(Protocol):
 
     def comments(self, number: int) -> list[Comment]:
         """Every comment, oldest first, carrying its server id."""
+        ...
+
+    def update_comment(self, number: int, comment_id: int, body: str) -> None:
+        """Replace one comment's body IN PLACE.
+
+        EDITED, NOT APPENDED, and that is a requirement rather than a preference. A heartbeat is one
+        comment per runner: an appended beat keeps advertising a capability that has been WITHDRAWN
+        (a vendor tool uninstalled between beats stays visible forever), and an append-only stream
+        grows without bound against the 500-comment recycle limit. One shared body for the whole
+        fleet is the other alternative and is worse still -- a shared mutable slot on an API with no
+        compare-and-swap, where at a hundred runners one beat erases another.
+
+        Raises:
+            CommentGone: the comment no longer exists. NOT swallowed: a runner whose comment was
+                pruned must re-create it rather than silently believe it beat.
+        """
         ...
 
     def delete_comment(self, number: int, comment_id: int) -> None:
@@ -220,6 +234,18 @@ class GiteaForge:
     def comments(self, number: int) -> list[Comment]:
         raw = self._api('GET', f'/repos/{self.repo}/issues/{number}/comments') or []
         return [Comment(id=c['id'], body=c['body']) for c in raw]
+
+    def update_comment(self, number: int, comment_id: int, body: str) -> None:
+        """MEASURED: 200 and the comment count is unchanged (a real in-place edit, not a
+        replace-by-delete); 37-57 ms per beat on this deployment, against the 2510 ms ref push it
+        replaces. A deleted comment answers 404 `comment does not exist`."""
+        try:
+            self._api('PATCH', f'/repos/{self.repo}/issues/comments/{comment_id}', {'body': body})
+        except ForgeError as exc:
+            if ' -> 404' in str(exc):
+                msg = f'comment {comment_id} on item {number} no longer exists; re-create it'
+                raise CommentGone(msg) from None
+            raise
 
     def delete_comment(self, number: int, comment_id: int) -> None:
         # Comment ids are repo-scoped here, so the issue number is not in the path. The store still
@@ -425,6 +451,9 @@ class GitHubForge:
 
     def comments(self, number: int) -> list[Comment]:
         raise self._unmeasured('comments')
+
+    def update_comment(self, number: int, comment_id: int, body: str) -> None:
+        raise self._unmeasured('update_comment')
 
     def delete_comment(self, number: int, comment_id: int) -> None:
         raise self._unmeasured('delete_comment')

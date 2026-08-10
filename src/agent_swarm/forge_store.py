@@ -45,24 +45,28 @@ the fix** -- it bounds how long a duplicated claim persists, it does not prevent
 comes, `.claude/memory/2026/08/09/measurement-a-pure-issue-claim-protocol-that-holds-comment-id-
 arbitration.md` is where to look, and `GITHUB_UNMEASURED` names the probe.
 
-CREATION IS A RACE TOO
-======================
+CREATION IS A RACE, AND IT IS DELETED RATHER THAN MITIGATED
+==========================================================
 
 The protocol above says "the job's work item" as though it exists. When it does not, sixteen runners
 read an empty list, create sixteen items, and each arbitrates its claim on its own -- sixteen
-winners, with the claim protocol working perfectly on each of sixteen wrong issues. Measured that
-way against the real server before it was fixed. `_item_number` therefore applies the SAME rule one
-level up: an issue number is server-assigned and monotonic too, so create, re-read, and take the
-lowest-numbered item with this title.
+winners, with the claim protocol working perfectly on each of sixteen wrong issues.
 
-THAT FIX HAS A MEASURED LIMIT AND IT IS NOT PORTABLE YET. It assumes the list read is fresh -- that
-an item created moments ago is visible to the next reader. True on our Gitea. On GitHub the
-`?labels=` filter was measured STALE for 4.0-6.6 s (20/20), the exact inverse of Gitea, and the
-resulting rule is that NO "does not exist" conclusion may be drawn from a list query on either
-forge. `_item_number` draws exactly that conclusion before it creates. Whether the plain issues list
-is fresh on GitHub is the first entry in `forge.GITHUB_UNMEASURED`, and it is why no GitHub client
-is written: if that list lags, two runners create two items and the sixteen-winner bug returns on
-the second forge.
+The first fix was convergence: create, re-read, take the lowest. **That is now DELETED, because it
+was measured not to work.** On GitHub the plain list is stale 22/22 (0.42-6.36 s) and the re-read
+did not return even the reader's OWN just-created issue, 24 of 24 times -- `created-blind`. A
+mitigation that reads from the same stale view that caused the problem cannot work, and one that
+works on Gitea alone is worse than none: it makes the forge we test against unrepresentative of the
+forge we ship to.
+
+What replaces it is structural. `Role.RUNNER` may not create at all, so the only creator is the
+submitter, and a submitter has the 201 body and never needs to ask a list about its own work. There
+is no window to tune and no constant to get wrong.
+
+THE RESIDUAL, NAMED: two concurrent SUBMITTERS still duplicate, and nothing here detects it. The
+contract is one submitter per job -- `register` is that call -- and it is enforced by role for
+runners and by convention for submitters. If that convention ever needs enforcing, the place is a
+lock outside this class, not another re-read inside it.
 
 WHY A LOSER DELETES ITS OWN COMMENT
 ===================================
@@ -82,6 +86,7 @@ verdict label may be attached -- is decided here, once, for every vendor.
 from __future__ import annotations
 
 import enum
+import threading
 import time
 from dataclasses import dataclass
 from typing import ClassVar, Self
@@ -165,20 +170,6 @@ class NotVisible:
 
 #: "The list cannot see it." Never "it does not exist".
 NOT_VISIBLE = NotVisible()
-
-#: How long a freshly created work item may stay invisible to a LIST query on this backend.
-#:
-#: THE VALUE IS A VENDOR FACT AND LIVES WITH THE VENDOR -- see `forge.LIST_STALENESS_SECONDS`, which
-#: carries the measurements. This module keeps only the neutral default, because a per-backend
-#: number spelled here would put a vendor name in the one file that must not have one, and the test
-#: that tokenises this module for vendor names is what caught the first attempt.
-#:
-#: It is a **probability improvement, never a guarantee**: the window belongs to the forge's
-#: replication and the forge may change it tomorrow. NOT A KNOB TO TUNE UNTIL A TEST PASSES -- if a
-#: value has to grow to make something go green, the thing to change is the design. See `register`.
-DEFAULT_LIST_STALENESS_SECONDS = 0.0
-
-
 # --------------------------------------------------------------------------------------------
 # The claim comment -- pure, so it is testable without a network or a forge.
 # --------------------------------------------------------------------------------------------
@@ -259,11 +250,16 @@ class ForgeStore:
         role: Role,
         index: ItemIndex | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
-        list_staleness_seconds: float = DEFAULT_LIST_STALENESS_SECONDS,
     ) -> None:
         self.role = role
         self.index = index
-        self.list_staleness_seconds = list_staleness_seconds
+        # ONE STORE CREATES AT MOST ONE ITEM PER TITLE, even with sixteen threads inside it. This is
+        # not the re-read mitigation coming back: it reads no list and asks the forge nothing. It
+        # closes the window between "the cache is empty" and "the cache is filled" WITHIN a process,
+        # which is the window the contract's sixteen-thread race drives straight through.
+        # Across processes there is no such lock and none is possible -- that is the named residual,
+        # and `register` plus the runner role is what answers it.
+        self._create_lock = threading.Lock()
         if lease_seconds <= 0:
             # Refused at construction rather than at the claim: a zero lease makes `try_claim`
             # return False forever, which reads as healthy contention rather than as a bug.
@@ -457,12 +453,19 @@ class ForgeStore:
         # 201 body: authoritative, immediate, free. Any code that creates and then lists to find
         # what it just created is strictly worse, and is a bug on BOTH forges even though only one
         # exposes it.
-        mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
-
-        winner = self._converge(title, mine)
-        self._item_numbers[title] = winner
-        self._remember(job, winner)
-        return winner
+        with self._create_lock:
+            # Re-check inside the lock: another thread of THIS store may have created it while we
+            # waited, and creating a second would be the same duplicate by a shorter route.
+            already = self._item_numbers.get(title)
+            if already is not None:
+                return already
+            # NO RE-READ. The creation response is authoritative and fresh on every forge, and
+            # asking the list to confirm what we just made is the `created-blind` failure: measured
+            # on GitHub, the re-read did not return the reader's OWN issue 24 of 24 times.
+            mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
+            self._item_numbers[title] = mine
+            self._remember(job, mine)
+            return mine
 
     def _from_index(self, job: Job, title: str) -> int | None:
         """Turn a remembered number into an authoritative answer, or `None` to fall through.
@@ -503,27 +506,6 @@ class ForgeStore:
     def _remember(self, job: Job, number: int) -> None:
         if self.index is not None:
             self.index.put(job.claim_key(), number)
-
-    def _converge(self, title: str, mine: int) -> int:
-        """Agree with concurrent creators on ONE item, as far as the backend permits.
-
-        A PROBABILITY IMPROVEMENT, NOT A GUARANTEE, and the docstring says so because the code
-        cannot. Issue numbers are server-assigned and monotonic, so "lowest wins" converges IF every
-        racer can see the others. When the list lags, they cannot, and each keeps its own -- which is
-        precisely the measured GitHub failure. `list_staleness_seconds` buys a window; it does not
-        close one, and a caller that needs a guarantee must use `register` instead.
-        """
-        if self.list_staleness_seconds > 0:
-            # Sleeping is ugly and it is the honest shape: the delay belongs to the forge's
-            # replication, and pretending otherwise would put the lie in the code instead of here.
-            time.sleep(self.list_staleness_seconds)
-        found = self._lowest_numbered(title)
-        if found is None or found >= mine:
-            return mine
-        # Someone earlier exists and is visible. Retire our duplicate so the list heals rather than
-        # accumulating; retirement is the FORGE's business, which is why it is not spelled out here.
-        self.forge.retire_work_item(mine)
-        return found
 
     def _lowest_numbered(self, title: str) -> int | None:
         """The lowest-numbered VISIBLE item with this title, or ``None`` for "none visible".

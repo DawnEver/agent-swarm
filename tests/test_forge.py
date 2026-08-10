@@ -41,6 +41,7 @@ ARITY = {
     'work_item': 1,
     'create_work_item': 0,  # keyword-only
     'add_comment': 2,
+    'update_comment': 3,
     'comments': 1,
     'delete_comment': 2,
     'labels': 1,
@@ -87,6 +88,16 @@ class TestTheSeamCoversWhatTheStoreNeeds:
         method here would be a per-vendor correctness argument -- two of them, only one ever raced.
         """
         assert not any('claim' in name or 'winner' in name for name in FORGE_METHODS)
+
+    def test_the_heartbeat_can_be_EDITED_in_place(self):
+        """One comment per runner, edited -- not appended, and not a shared body.
+
+        An APPENDED beat keeps advertising a capability that has been withdrawn: a vendor tool
+        uninstalled between beats stays visible in the older comment forever, and the stream grows
+        without bound against the 500-comment recycle limit. A SHARED body is worse -- a mutable
+        slot on an API with no compare-and-swap, where at a hundred runners one beat erases another.
+        """
+        assert 'update_comment' in FORGE_METHODS
 
     def test_a_comment_carries_the_SERVER_id(self):
         """The id is the claim protocol's whole ordering key. A `Comment` without one would leave

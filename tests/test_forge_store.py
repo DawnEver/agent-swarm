@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 
 from agent_swarm import forge_store as forge_store_module
-from agent_swarm.forge import Comment, Forge, GiteaForge, WorkItem, default_forge
+from agent_swarm.forge import Comment, CommentGone, Forge, ForgeError, GiteaForge, WorkItem, default_forge
 from agent_swarm.forge_store import (
     NOT_VISIBLE,
     VERDICT_LABELS,
@@ -59,7 +59,12 @@ JOB = Job(id='j1', kind=TEST_RUN)
 
 
 def _race_one_round(namespace: str, job: Job, *, racers: int) -> list[str]:
-    """Release `racers` threads at one job from a barrier; return everyone who believed they won.
+    """Register the job, then release `racers` RUNNERS at it; return everyone who believed they won.
+
+    THE PRODUCTION SHAPE, and it is the shape because the alternative was measured not to work. The
+    submitter creates the work item exactly once; runners may not create at all. Racing N separate
+    SUBMITTERS -- which this used to do -- tests a configuration the design now forbids, and it
+    would be asserting the convergence that was deleted for failing on GitHub.
 
     A FUNCTION AND NOT AN INLINE LOOP BODY: the closure captures the barrier, lock and winner list,
     and rebinding those per round inside a loop makes the thread bodies share whichever objects the
@@ -67,10 +72,12 @@ def _race_one_round(namespace: str, job: Job, *, racers: int) -> list[str]:
     which is exactly the kind of "safe for now" that a later edit turns into a race inside the test
     for races.
     """
+    ForgeStore(namespace, default_forge(), role=Role.SUBMITTER).register(job)
+
     winners: list[str] = []
     lock = threading.Lock()
     barrier = threading.Barrier(racers)
-    stores = [ForgeStore(namespace, default_forge(), role=Role.SUBMITTER) for _ in range(racers)]
+    stores = [ForgeStore(namespace, default_forge(), role=Role.RUNNER) for _ in range(racers)]
 
     def attempt(n: int) -> None:
         barrier.wait()
@@ -140,6 +147,17 @@ class RecordingForge:
     def comments(self, number: int) -> list[Comment]:
         with self._lock:
             return list(self._comments[number])
+
+    def update_comment(self, number: int, comment_id: int, body: str) -> None:
+        with self._lock:
+            existing = self._comments[number]
+            if not any(c.id == comment_id for c in existing):
+                # THE DOUBLE MUST BE AS UNFORGIVING AS THE FORGE HERE. Gitea answers 404 for an edit
+                # of a pruned comment, and a fake that silently no-op'd would let a runner believe
+                # it had beaten -- the exact failure the distinction exists to prevent.
+                msg = f'comment {comment_id} on item {number} no longer exists; re-create it'
+                raise CommentGone(msg)
+            self._comments[number] = [Comment(id=c.id, body=body) if c.id == comment_id else c for c in existing]
 
     def delete_comment(self, number: int, comment_id: int) -> None:
         with self._lock:
@@ -510,17 +528,19 @@ class TestWhatOnlyTheRealServerCanSettle:
             assert len(winners) == 1, f'round {round_number}: {len(winners)} believed they won: {winners}'
             assert server_store.claim_owner(job) == winners[0]
 
-    def test_concurrent_claimants_converge_on_ONE_work_item(self, server_store):
-        """THE BUG THE FOUR-ROUND RACE CAUGHT, pinned with the assertion that names it.
+    def test_runners_all_arbitrate_on_the_SUBMITTERS_item(self, server_store):
+        """The creation race, in the shape that eliminates it rather than the shape that mitigated
+        it. The submitter registers once; sixteen runners then discover and claim, and none of them
+        can create even if the list cannot see the item -- the role refuses.
 
-        The protocol arbitrates comments on "the job's work item" -- and when that item does not
-        exist yet, creating it is itself an unarbitrated race. Sixteen runners read an empty list,
-        create sixteen issues, and each then arbitrates perfectly on its OWN: 16/16 winners, with
-        every individual claim correct. Counting winners alone would leave the cause ambiguous, so
-        this counts the ITEMS.
+        This assertion is about the ITEM, not the winner: sixteen winners is ambiguous about the
+        cause, sixteen items is not, and one item is the property that makes their claim comments
+        contend at all.
         """
         job = Job(id='fresh-item', kind=TEST_RUN)
-        stores = [ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER) for _ in range(16)]
+        submitted = ForgeStore(server_store.namespace, default_forge(), role=Role.SUBMITTER).register(job)
+
+        stores = [ForgeStore(server_store.namespace, default_forge(), role=Role.RUNNER) for _ in range(16)]
         winners: list[int] = []
         lock = threading.Lock()
         barrier = threading.Barrier(16)
@@ -537,8 +557,8 @@ class TestWhatOnlyTheRealServerCanSettle:
         for t in threads:
             t.join()
 
-        resolved = {store._item_number(job) for store in stores}
-        assert len(resolved) == 1, f'racers arbitrated on different work items: {resolved}'
+        resolved = {store.work_item_number(job) for store in stores}
+        assert resolved == {submitted}, f'runners left the submitter item: {resolved}'
         assert len(winners) == 1, f'{len(winners)} runners believed they won: {winners}'
 
     def test_comment_ids_come_back_MONOTONIC_under_concurrency(self, server_store):
@@ -691,20 +711,17 @@ class TestAListQueryCannotSayABSENT:
 
 
 class TestConcurrentCreationAgainstALAGGINGList:
-    """THE DISCRIMINATING HARNESS. All of this fails against the design that shipped this morning,
-    and none of it needs a network."""
+    """The race, and the fact that it is now DELETED rather than narrowed.
+
+    Convergence -- create, re-read, take the lowest -- used to live here. It is gone, because it was
+    measured not to work: on GitHub the re-read did not return even the reader's own just-created
+    issue, 24 of 24 times. A mitigation that reads from the same stale view that caused the problem
+    cannot work, and one that works on Gitea alone is worse than none, because it makes the forge we
+    test against unrepresentative of the forge we ship to.
+    """
 
     @staticmethod
     def _race(store_factory, racers: int = 8) -> set[int]:
-        """Race `racers` claimants at a job with no work item, and return the set of item numbers
-        they ended up arbitrating on.
-
-        CONVERGENCE IS THE VENDOR-NEUTRAL PROPERTY, not the raw item count: whether a retired
-        duplicate still matches a title search is the FORGE's business (this deployment retitles,
-        another hard-deletes), and asserting it here would put a vendor behaviour in a
-        vendor-agnostic test. What must hold everywhere is that every racer ended up on the SAME
-        item -- because that is what makes their claim comments contend at all.
-        """
         job = Job(id='fresh', kind=TEST_RUN)
         stores = [store_factory() for _ in range(racers)]
         barrier = threading.Barrier(racers)
@@ -720,27 +737,17 @@ class TestConcurrentCreationAgainstALAGGINGList:
             t.join()
         return {store.work_item_number(job) for store in stores}
 
-    def test_an_UNDECLARED_staleness_reproduces_the_measured_GitHub_failure(self):
-        """The bug, held still. Eight racers, a list that lags, a store that believes the list:
-        many work items, each racer then arbitrating flawlessly on its own -- which is exactly what
-        the real probe reported and exactly what a fresh double can never show.
+    def test_concurrent_SUBMITTERS_still_duplicate_and_that_is_the_named_residual(self):
+        """THE HONEST RESIDUAL, held still rather than implied absent.
 
-        The assertion is about the ITEM COUNT, not the winner count: eight winners is ambiguous
-        about the cause, eight items is not.
+        Eight submitter-mode stores racing at one unsubmitted job produce eight work items, and
+        nothing detects it. The contract is one submitter per job -- `register` is that call -- and
+        it is enforced by ROLE for runners and by CONVENTION for submitters. This test exists so
+        that the convention is visible as a convention, not mistaken for a guarantee.
         """
         forge = StaleListForge(RecordingForge(), staleness=30.0)
-        resolved = self._race(lambda: ForgeStore('ns', forge, role=Role.SUBMITTER, list_staleness_seconds=0.0))
-        assert len(resolved) > 1, 'the harness is not reproducing the lag it exists to reproduce'
-        assert len(resolved) == 8, f'expected every racer on its own item, got {sorted(resolved)}'
-
-    def test_a_DECLARED_staleness_converges_on_one_item(self):
-        """The mitigation, and it is ONLY a mitigation: it works because the declared window is
-        larger than this fake's lag. Declare it too small and the previous test is what you get --
-        which is why the constant carries its measurement and is not a knob to tune until green.
-        """
-        forge = StaleListForge(RecordingForge(), staleness=0.3)
-        resolved = self._race(lambda: ForgeStore('ns', forge, role=Role.SUBMITTER, list_staleness_seconds=0.8))
-        assert len(resolved) == 1, f'racers arbitrated on different work items: {sorted(resolved)}'
+        resolved = self._race(lambda: ForgeStore('ns', forge, role=Role.SUBMITTER))
+        assert len(resolved) == 8, f'expected every submitter on its own item, got {sorted(resolved)}'
 
     def test_REGISTER_deletes_the_race_without_any_window_at_all(self):
         """THE ACTUAL FIX. A single writer creates once; runners only discover and claim. No sleep,
@@ -766,3 +773,58 @@ class TestConcurrentCreationAgainstALAGGINGList:
         before = forge.list_calls
         store.register(Job(id='fresh', kind=TEST_RUN))
         assert forge.list_calls == before, 'register consulted the list it must not trust'
+
+
+class TestEditingAComment:
+    """`update_comment` exists for the heartbeat: one comment per runner, edited in place."""
+
+    def test_an_edit_replaces_rather_than_appends(self, recording_forge):
+        number = recording_forge.create_work_item(title='t', body='b')
+        first = recording_forge.add_comment(number, 'BEAT 1')
+        recording_forge.update_comment(number, first, 'BEAT 2')
+        assert [c.body for c in recording_forge.comments(number)] == ['BEAT 2']
+
+    def test_the_comment_ID_is_stable_across_an_edit(self, recording_forge):
+        """A beat that changed its own id would be a new comment wearing the old one's name, and the
+        fleet's view of "who is alive" is keyed on that id.
+        """
+        number = recording_forge.create_work_item(title='t', body='b')
+        first = recording_forge.add_comment(number, 'BEAT 1')
+        recording_forge.update_comment(number, first, 'BEAT 2')
+        assert [c.id for c in recording_forge.comments(number)] == [first]
+
+    def test_editing_a_PRUNED_comment_is_distinguishable_from_success(self, recording_forge):
+        """THE ONE THE HEARTBEAT TURNS ON. A runner whose comment was pruned must learn it has to
+        RE-CREATE. An edit that failed silently would leave it believing it had beaten while the
+        fleet counted it dead -- and nothing anywhere would error.
+        """
+        number = recording_forge.create_work_item(title='t', body='b')
+        first = recording_forge.add_comment(number, 'BEAT 1')
+        recording_forge.delete_comment(number, first)
+        with pytest.raises(CommentGone, match='re-create'):
+            recording_forge.update_comment(number, first, 'BEAT 2')
+
+    def test_CommentGone_is_a_forge_error_not_a_new_error_family(self):
+        """A caller that already handles ForgeError keeps working; one that wants the distinction
+        asks for it. A parallel hierarchy would make every existing handler subtly incomplete.
+        """
+        assert issubclass(CommentGone, ForgeError)
+
+
+@pytest.mark.live_forge
+class TestEditingAgainstTheRealForge:
+    def test_an_edit_is_in_place_and_a_pruned_comment_404s(self, server_store):
+        """MEASURED HERE, not assumed: 200 with the comment count unchanged, and 404
+        `comment does not exist` once it is gone. Both halves, because a heartbeat that could not
+        tell them apart would report liveness for a runner nobody can see.
+        """
+        forge = default_forge()
+        number = forge.create_work_item(title=f'[swarm] {server_store.namespace}/beat', body='probe')
+        beat = forge.add_comment(number, 'BEAT 1')
+        forge.update_comment(number, beat, 'BEAT 2')
+        bodies = [c.body for c in forge.comments(number)]
+        assert bodies == ['BEAT 2'], f'the edit was not in place: {bodies}'
+
+        forge.delete_comment(number, beat)
+        with pytest.raises(CommentGone):
+            forge.update_comment(number, beat, 'BEAT 3')
