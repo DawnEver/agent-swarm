@@ -34,6 +34,11 @@ from agent_swarm.status import STATUS_CONTEXT, StatusPublisher
 from agent_swarm.testing import RecordingForge
 from agent_swarm.tick import Fleet, submit, tick
 
+#: This box's own status context. Per-writer keying means the published context carries it, so the
+#: tests must name it rather than assume the bare base -- see `status.py` on the shared-key defect.
+MARK_RUNNER = 'box-mark'
+MARK_CONTEXT = f'{STATUS_CONTEXT}/{MARK_RUNNER}'
+
 ROADMAP = """
 version = 1
 
@@ -64,10 +69,8 @@ class _Gate:
 class _Statuses(RecordingForge):
     """The verifier's forge: records what was marked, and answers to the verifier username."""
 
-    username = ROLE_ACCOUNTS['verifier']
-
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(username=ROLE_ACCOUNTS['verifier'])
         self.marks: list[tuple[str, str, str]] = []
 
     def set_status(self, sha: str, *, state: str, context: str, description: str) -> None:
@@ -90,7 +93,7 @@ def fleet_and_marks(tmp_path):
         publisher=ForgePublisher(ForgeStore(namespace, forge, role=Role.SUBMITTER, index=index)),
         executors={AGENT_TASK: gate, TEST_RUN: gate},
         owner='box-mark',
-        status=StatusPublisher(marker),
+        status=StatusPublisher(marker, runner=MARK_RUNNER),
     )
     # The item must EXIST before a runner can take it: a runner store may not create work items,
     # which is the structural half of the duplicate-creation fix and not something to work around.
@@ -110,7 +113,7 @@ def test_answering_a_job_marks_the_commit(fleet_and_marks):
     fleet, marker, _gate = fleet_and_marks
     report = tick(fleet, BOX, sha='deadbeef')
     assert _answered(report)
-    assert [(sha, state, ctx) for sha, state, ctx in marker.marks] == [('deadbeef', 'success', STATUS_CONTEXT)]
+    assert [(sha, state, ctx) for sha, state, ctx in marker.marks] == [('deadbeef', 'success', MARK_CONTEXT)]
 
 
 def test_a_failing_verdict_marks_the_commit_RED(fleet_and_marks):
@@ -121,7 +124,7 @@ def test_a_failing_verdict_marks_the_commit_RED(fleet_and_marks):
     fleet, marker, gate = fleet_and_marks
     gate.verdict = 'FAIL'
     tick(fleet, BOX, sha='deadbeef')
-    assert marker.marks == [('deadbeef', 'failure', STATUS_CONTEXT)]
+    assert marker.marks == [('deadbeef', 'failure', MARK_CONTEXT)]
 
 
 def test_an_inconclusive_run_marks_the_commit_ERROR(fleet_and_marks):
@@ -131,7 +134,7 @@ def test_an_inconclusive_run_marks_the_commit_ERROR(fleet_and_marks):
     fleet, marker, gate = fleet_and_marks
     gate.verdict = 'INCONCLUSIVE'
     tick(fleet, BOX, sha='deadbeef')
-    assert marker.marks == [('deadbeef', 'error', STATUS_CONTEXT)]
+    assert marker.marks == [('deadbeef', 'error', MARK_CONTEXT)]
 
 
 # --------------------------------------------------------------------------- and when it must not

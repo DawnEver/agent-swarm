@@ -17,6 +17,11 @@ wrong first:
   impossibility. `remove_label` detaching one id left items carrying two verdicts at once.
 * **The model is PINNED by tests**, because collapsing `labels()` back to a set made every test pass
   again with the modelled reality gone.
+* **A forge CARRIES AN IDENTITY.** `GiteaForge` requires a `username` and the whole
+  "only the verifier marks a commit green" boundary rests on it, since Gitea has no scope for commit
+  status. A double with no identity cannot be on the wrong side of that boundary, so every test
+  written through it agreed the boundary held -- an identity-free double is an assertion that a
+  role confusion is impossible.
 
 A double that cannot represent a failure is not a neutral simplification; it is an assertion that
 the failure is impossible. These three were all such assertions, and all three were refuted by
@@ -31,7 +36,7 @@ from collections.abc import Sequence
 
 import threading
 
-from agent_swarm.forge import STATUS_STATES, Comment, CommentGone, ForgeError, WorkItem
+from agent_swarm.forge import ROLE_ACCOUNTS, STATUS_STATES, Comment, CommentGone, ForgeError, WorkItem
 
 #: Bumped whenever this double's MODEL of the forge changes -- a new adverse property, a corrected
 #: identity, a refuted simplification.
@@ -42,7 +47,7 @@ from agent_swarm.forge import STATUS_STATES, Comment, CommentGone, ForgeError, W
 #: older, gentler double while this repo's suite passes against the newer one -- two repos, one
 #: contract, two versions of the instrument. Asserting this constant makes a stale pin RED instead
 #: of quietly agreeable.
-DOUBLE_MODEL_VERSION = 4
+DOUBLE_MODEL_VERSION = 5
 
 
 class RecordingForge:
@@ -60,7 +65,12 @@ class RecordingForge:
     it is a second genuine backend, which is what makes the vendor-neutrality claim checkable.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, username: str = ROLE_ACCOUNTS['agent']) -> None:
+        #: WHICH ROLE this forge acts as, mirroring `GiteaForge.username`. It defaults to the LEAST
+        #: PRIVILEGED account, as `default_forge` does: a double that defaulted to the verifier would
+        #: let every test through the one seam where the role is checked at all, and the seam would
+        #: be green because the instrument was privileged rather than because the code was right.
+        self.username = username
         self._lock = threading.Lock()
         self._next_id = 1
         self.items: dict[int, WorkItem] = {}
