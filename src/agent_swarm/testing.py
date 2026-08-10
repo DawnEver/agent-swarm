@@ -117,7 +117,15 @@ class RecordingForge:
         the store filter would make a cost control that transmits nothing look like it works.
         """
         with self._lock:
-            items = [x for x in self.items.values() if state == 'all' or x.state == state]
+            # Labels attached HERE, as the real listing endpoint returns them. A double that
+            # omitted them would leave the store's per-item fetch looking necessary, and the N+1
+            # this parameter removes would be invisible to every test using it.
+            items = [
+                WorkItem(number=x.number, title=x.title, state=x.state,
+                         labels=tuple(name for _id, name in self.item_labels.get(x.number, [])))
+                for x in self.items.values()
+                if state == 'all' or x.state == state
+            ]
         half = len(items) // 2
         return items[half:] + items[:half]
 

@@ -124,13 +124,19 @@ def test_a_verdict_label_still_wins_over_a_ready_label(store, forge):
 # --------------------------------------------------------------------------- one observation
 
 
-def test_labels_are_read_once_per_item(store, forge, monkeypatch):
-    """Two fetches would be two observations of a mutable thing: an item whose label is removed
-    between them reads as claimable on one line and withdrawn on the next, and which one wins is a
-    race nobody chose."""
+def test_the_sweep_fetches_NO_labels_per_item(store, forge, monkeypatch):
+    """STRENGTHENED from "once per item" to "not at all".
+
+    Once-per-item was already the right property for consistency -- two fetches are two
+    observations of a mutable thing, and an item whose label vanished between them reads as
+    claimable on one line and withdrawn on the next. But once per item is still N+1 round trips per
+    sweep, measured at 101 calls for 100 open items, per runner. The listing endpoint already
+    carries the labels, so the correct count is ZERO: one observation for the whole sweep, taken
+    from the same response that decided which items exist.
+    """
     _register(store)
     calls: list[int] = []
     original = forge.labels
     monkeypatch.setattr(forge, 'labels', lambda n: (calls.append(n), original(n))[1])
     store.claimable(TEST_RUN)
-    assert len(calls) == len(set(calls)) == 1
+    assert calls == [], f'the sweep fetched labels per item: {calls}'

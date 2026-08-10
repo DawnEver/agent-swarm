@@ -202,3 +202,36 @@ def test_a_STALE_verdict_label_is_replaced_not_accumulated():
     store.record_verdict(job, verdict='PASS', detail='second')
     verdict_labels = [name for name in forge.labels(number) if name in _LABEL_TO_VERDICT]
     assert len(verdict_labels) == 1, f'accumulated {verdict_labels}'
+
+
+def _sweep_cost(open_items: int) -> int:
+    forge = _Counting()
+    submitter = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    for i in range(open_items):
+        submitter.register(Job(id=f'g/j{i}', kind=TEST_RUN))
+    runner = ForgeStore('bench', forge, role=Role.RUNNER)
+    forge.calls = 0
+    runner.claimable(TEST_RUN)
+    return forge.calls
+
+
+@pytest.mark.parametrize('n', [1, 5, 20, 100])
+def test_a_sweep_costs_ONE_round_trip_however_much_work_is_open(n: int):
+    """THE SCALING DEFECT OF THE SESSION, and I had it backwards.
+
+    I measured read cost against CLOSED items, found it flat, and said read cost does not grow. It
+    does -- against OPEN ones. `claimable` fetched labels per candidate: 101 calls for 100 open
+    items, per runner, per sweep. Open work grows WITH fleet size, so at a hundred agents that is
+    ten thousand calls a round to re-ask what the first response already contained.
+
+    The listing endpoint carries labels inline on Gitea, so the answer is one call at every size.
+    The bar is exactly 1: any per-item work here is N+1 again, and a bound like "under 10" would
+    pass for a sweep that is linear in the fleet.
+    """
+    assert _sweep_cost(n) == 1
+
+
+def test_the_sweep_cost_does_not_move_between_one_item_and_a_hundred():
+    """The shape, not the constant: a per-item cost that happened to be cheap would still be the
+    defect, and comparing the ends is what says so."""
+    assert _sweep_cost(1) == _sweep_cost(100)

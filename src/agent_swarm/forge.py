@@ -117,11 +117,22 @@ class CommentGone(ForgeError):
 
 @dataclass(frozen=True, slots=True)
 class WorkItem:
-    """One issue, in vendor-neutral terms. `state` is 'open' or 'closed' and nothing else."""
+    """One issue, in vendor-neutral terms. `state` is 'open' or 'closed' and nothing else.
+
+    `labels` CARRIES WHAT THE LIST ENDPOINT ALREADY RETURNED. Before it existed, a sweep read the
+    list and then fetched labels per item -- N+1 round trips, MEASURED at 101 calls for 100 open
+    items, per runner, per sweep. Open items grow with fleet size, so at a hundred agents that is
+    ten thousand calls a round to answer a question the first response already contained.
+
+    Names only: label ids are a Gitea concept and stop at this boundary. Empty means "the vendor
+    sent none", which for a listing endpoint is a fact, not an unknown -- an implementation that
+    cannot supply them must fetch them rather than report absence.
+    """
 
     number: int
     title: str
     state: str
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,7 +342,15 @@ class GiteaForge:
         page, limit = 1, 50
         while True:
             batch = self._api('GET', f'/repos/{self.repo}/issues?state={state}&type=issues&limit={limit}&page={page}') or []
-            out.extend(WorkItem(number=x['number'], title=x['title'], state=x['state']) for x in batch)
+            # LABELS COME FREE HERE. Gitea's issue objects carry them inline, so taking them
+            # costs nothing and removes the per-item fetch the store used to do.
+            out.extend(
+                WorkItem(
+                    number=x['number'], title=x['title'], state=x['state'],
+                    labels=tuple(lb['name'] for lb in x.get('labels') or ()),
+                )
+                for x in batch
+            )
             if len(batch) < limit:
                 return out
             page += 1

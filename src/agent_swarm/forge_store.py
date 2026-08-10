@@ -564,7 +564,10 @@ class ForgeStore:
             if job is None:
                 continue
             self._item_numbers[item.title] = item.number
-            labels = self.forge.labels(item.number)
+            # FROM THE LISTING, not a per-item fetch. That fetch was N+1 -- 101 calls for 100
+            # open items, per runner, per sweep -- to re-ask something the list response already
+            # carried.
+            labels = item.labels
             if any(label in _LABEL_TO_VERDICT for label in labels):
                 continue
             # DEFAULT DENY. Read from the SAME label fetch as the verdict check -- a second call
