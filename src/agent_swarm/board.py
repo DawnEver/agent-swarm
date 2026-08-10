@@ -23,6 +23,32 @@ module's signature -- a visible edit rather than one more line inside a function
 `tests/test_the_board_is_a_one_way_projection.py` fails if any mutating forge method is so much as
 NAMED in this file, with "mutating" derived from the protocol rather than hand-listed.
 
+WHY NOTHING HERE PUSHES TO A GITEA PROJECT
+==========================================
+
+**GITEA HAS NO REST API FOR PROJECT BOARDS, and that is why this module ends at a value instead of
+at a call.** Checked 2026-08-10 against public sources only -- the shared server was not contacted:
+
+* go-gitea/gitea issue #36824, "feat: REST API for repository project boards", opened 2026-03-04 and
+  still OPEN, states it outright: "Gitea has no REST API for repository project boards. This makes
+  it impossible to manage projects programmatically or integrate them with external tooling." It
+  PROPOSES the nine endpoints that would be needed -- `GET/POST /repos/{owner}/{repo}/projects`,
+  `.../projects/{id}/columns`, `POST .../projects/columns/{id}/issues` -- which is only worth
+  proposing because none of them exist.
+* Its linked PR #36008 has NOT merged and has been idle since December 2025.
+* go-gitea/gitea issue #37151 separately asks for kanban issue ORDERING to be exposed, for the same
+  reason: it is not readable from outside the web UI.
+
+So a writer against a Gitea project board cannot be written today, and a reader cannot be either --
+which incidentally makes the one-way property easy to hold and worth stating anyway, because the API
+is expected to arrive and the refusal must outlive its absence.
+
+WHAT IS NOT KNOWN, and is not assumed: whether Gitea's columns have any relationship to LABELS. The
+proposed API assigns an issue to a column explicitly, which suggests columns are an independent
+concept, but that is an inference from a design proposal rather than a measurement. This module
+therefore projects labels into columns of ITS OWN naming and claims nothing about how a Gitea board
+would be populated from them.
+
 WHY IN PROGRESS IS AN ARGUMENT AND NOT A LABEL
 ==============================================
 
