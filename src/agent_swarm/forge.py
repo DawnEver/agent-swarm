@@ -267,7 +267,33 @@ class GiteaForge:
         self._api('POST', f'/repos/{self.repo}/issues/{number}/labels', {'labels': [self._label_id(name)]})
 
     def remove_label(self, number: int, name: str) -> None:
-        self._api('DELETE', f'/repos/{self.repo}/issues/{number}/labels/{self._label_id(name)}')
+        """Detach EVERY label id sharing this name, not just the one `_label_id` converges on.
+
+        MEASURED 2026-08-10 -- this removed one id and the docstring on `_label_id` claimed the
+        layer above "addresses labels by name anyway". False for removal, and it is a claim about a
+        GUARD'S SCOPE: `ForgeStore.record_verdict` strips existing verdict labels before adding the
+        new one precisely so a retry after INCONCLUSIVE cannot leave a job both inconclusive and
+        green. With a duplicate definition attached under a higher id, the strip missed it and
+        produced exactly that state -- a verdict reading green on an item still carrying
+        INCONCLUSIVE, or the reverse, decided by whichever order the list endpoint returned.
+
+        Duplicates are not hypothetical here: `POST /labels` accepted twelve identical names from
+        twelve concurrent racers on this deployment. Our own writer always attaches the lowest id,
+        so the higher one arrives from a human in the web UI, an older client, or the racer that
+        lost -- the discriminating state is one our code cannot produce, which is why no test found
+        this until the offline double stopped modelling labels as name-keyed.
+
+        DELETING EVERY MATCH RATHER THAN THE LOWEST: the caller asked for the NAME to be gone, and
+        leaving a same-named id attached does not satisfy that under any reading. `_label_id` still
+        converges on the lowest for ATTACHMENT, which is what keeps runners agreeing.
+        """
+        for label_id in self._label_ids_for(name):
+            self._api('DELETE', f'/repos/{self.repo}/issues/{number}/labels/{label_id}')
+
+    def _label_ids_for(self, name: str) -> list[int]:
+        """EVERY repo label id carrying `name`, or empty. Never creates one -- a removal that
+        created the label it was asked to remove would be a write on a read-only intent."""
+        return [x['id'] for x in self._api('GET', f'/repos/{self.repo}/labels?limit=100') or [] if x['name'] == name]
 
     def close_work_item(self, number: int) -> None:
         self._api('PATCH', f'/repos/{self.repo}/issues/{number}', {'state': 'closed'})

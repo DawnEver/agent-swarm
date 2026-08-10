@@ -116,7 +116,18 @@ class RecordingForge:
         self.items: dict[int, WorkItem] = {}
         self.bodies: dict[int, str] = {}
         self._comments: dict[int, list[Comment]] = {}
-        self.item_labels: dict[int, list[str]] = {}
+        # LABELS ARE (id, name) PAIRS, and the id is what a real removal targets.
+        #
+        # This double used to key labels by NAME, which made it gentler than reality on exactly the
+        # axis reality has already been MEASURED to differ: `POST /labels` accepted twelve identical
+        # names from twelve concurrent racers on this Gitea, so a name maps to a LIST of ids. A
+        # name-keyed double cannot express a duplicate at all, so every test written through it
+        # agreed that removal by name removes everything -- which is what `remove_label` does here
+        # and is NOT what the vendor does.
+        self.item_labels: dict[int, list[tuple[int, str]]] = {}
+        #: Repo-level label definitions: name -> the ids sharing it. Non-unique BY MEASUREMENT.
+        self.repo_labels: dict[str, list[int]] = {}
+        self._next_label_id = 1000
         self.retired: list[int] = []
 
     def list_work_items(self) -> list[WorkItem]:
@@ -195,16 +206,60 @@ class RecordingForge:
             self._comments[number] = [c for c in self._comments[number] if c.id != comment_id]
 
     def labels(self, number: int) -> list[str]:
+        """NAMES, because that is what the `Forge` protocol promises. Ids stop at this boundary --
+        and the fact that a name can appear TWICE in this list is the whole point of the change."""
         with self._lock:
-            return list(self.item_labels[number])
+            return [name for _id, name in self.item_labels[number]]
+
+    def label_id(self, name: str) -> int:
+        """The LOWEST id for `name`, created if absent -- `GiteaForge._label_id`'s rule.
+
+        Mirrored deliberately rather than simplified: it is the rule that makes every runner
+        converge on one id without coordinating, and a double that picked differently would make
+        the store's convergence untestable.
+        """
+        with self._lock:
+            ids = self.repo_labels.get(name)
+            if not ids:
+                self._next_label_id += 1
+                self.repo_labels[name] = [self._next_label_id]
+                return self._next_label_id
+            return min(ids)
+
+    def define_duplicate_label(self, name: str) -> int:
+        """Create a SECOND repo label with an existing name and a higher id, and return it.
+
+        NOT PART OF THE `Forge` PROTOCOL. It reproduces a state the vendor reaches and our code
+        cannot: a losing racer's label, a human adding one in the web UI, an older client. Twelve
+        of these were created on the real server in the CAS measurement, so this is reproduction,
+        not invention.
+        """
+        with self._lock:
+            self._next_label_id += 1
+            self.repo_labels.setdefault(name, []).append(self._next_label_id)
+            return self._next_label_id
+
+    def attach_label_id(self, number: int, label_id: int, name: str) -> None:
+        """Attach a SPECIFIC label id. The escape hatch for planting the duplicate above."""
+        with self._lock:
+            self.item_labels[number].append((label_id, name))
 
     def add_label(self, number: int, name: str) -> None:
+        label_id = self.label_id(name)
         with self._lock:
-            self.item_labels[number].append(name)
+            self.item_labels[number].append((label_id, name))
 
     def remove_label(self, number: int, name: str) -> None:
+        """Detaches EVERY id sharing this name -- mirroring `GiteaForge.remove_label`.
+
+        Until 2026-08-10 both this and the vendor wrapper removed only the ONE id `_label_id`
+        converges on, so a same-named label attached under a higher id survived and left an item
+        carrying two verdicts at once. The double could not express that at all while it keyed
+        labels by name, which is why the bug lived behind a green suite.
+        """
         with self._lock:
-            self.item_labels[number] = [x for x in self.item_labels[number] if x != name]
+            ids = set(self.repo_labels.get(name, []))
+            self.item_labels[number] = [(i, n) for i, n in self.item_labels[number] if i not in ids]
 
     def close_work_item(self, number: int) -> None:
         with self._lock:
@@ -1408,3 +1463,80 @@ class TestTheSubmitterDECLARESWhatToRun:
 
         assert memory_store.requested_runs(self._job('aaa')) == frozenset({'fast'})
         assert memory_store.requested_runs(self._job('bbb')) == frozenset({'heavy'})
+
+
+class TestADuplicateLabelCannotProduceTwoVerdictsAtOnce:
+    """A work item carrying both `verdict:inconclusive` and `verdict:pass`, which nothing can act on.
+
+    `record_verdict` already tries to prevent this -- it removes every existing verdict label before
+    adding the new one, and its comment says why: "a retry after INCONCLUSIVE that merely ADDED
+    `pass` would leave the job both inconclusive and green". The removal is by NAME, and
+    `GiteaForge.remove_label` resolves a name to ONE id, the lowest. **A same-named label attached
+    under a higher id survives the loop**, so the guard's stated scope is wider than its real one --
+    the scope-lie variant, which makes a reader route around a working check rather than distrust it.
+
+    `_label_id`'s own docstring is where the claim lives: "everything above this line addresses
+    labels by name anyway". False for removal.
+
+    THE DISCRIMINATING STATE IS ONE OUR CODE CANNOT CREATE. Our writer always resolves through
+    `_label_id` and therefore always attaches the lowest id. A higher-id attachment comes from a
+    human in the web UI, an older client, or the racer that lost -- and duplicate label DEFINITIONS
+    are measured, not hypothetical: twelve identical names from twelve racers on this Gitea.
+    """
+
+    def _job(self):
+        return Job(id='dup-label', kind=JobKind.TEST_RUN)
+
+    def test_the_DOUBLE_reports_a_duplicated_name_TWICE(self, recording_forge):
+        """PINS THE DOUBLE'S OWN MODEL, and it needs pinning: collapsing `labels()` back to a set
+        made every test in this class pass again while the modelled reality was gone.
+
+        A double that cannot represent the failure is not a neutral simplification -- it is an
+        assertion that the failure is impossible, and this one was refuted by measurement before it
+        was written: twelve identical label names from twelve racers.
+        """
+        number = recording_forge.create_work_item(title='t', body='b')
+        recording_forge.add_label(number, 'verdict:pass')
+        stray = recording_forge.define_duplicate_label('verdict:pass')
+        recording_forge.attach_label_id(number, stray, 'verdict:pass')
+
+        assert recording_forge.labels(number) == ['verdict:pass', 'verdict:pass']
+
+    def test_a_duplicate_DEFINITION_gets_a_higher_id(self, recording_forge):
+        """The ordering is what makes the vendor's `min()` convergence meaningful; a double that
+        handed out a lower id would make the store agree with itself for the wrong reason."""
+        first = recording_forge.label_id('run:fast')
+        second = recording_forge.define_duplicate_label('run:fast')
+
+        assert second > first
+        assert recording_forge.label_id('run:fast') == first, 'attachment must still converge on the lowest'
+
+    def test_a_HIGHER_ID_verdict_label_does_not_survive_the_next_verdict(self, memory_store, recording_forge):
+        job = self._job()
+        number = memory_store.register(job)
+        memory_store.record_verdict(job, verdict='INCONCLUSIVE', detail='node down')
+        # The state our writer cannot reach: a second `verdict:inconclusive`, different id.
+        stray = recording_forge.define_duplicate_label('verdict:inconclusive')
+        recording_forge.attach_label_id(number, stray, 'verdict:inconclusive')
+
+        memory_store.record_verdict(job, verdict='PASS', detail='green on the retry')
+
+        assert recording_forge.labels(number).count('verdict:inconclusive') == 0, (
+            'the item carries both INCONCLUSIVE and PASS -- exactly the state record_verdict says '
+            'it prevents, and nothing downstream can act on it'
+        )
+
+    def test_the_reported_verdict_is_not_DECIDED_BY_LIST_ORDER(self, memory_store, recording_forge):
+        """The consequence, stated where it hurts. `verdict()` returns the FIRST label it maps, so
+        with two present the answer depends on the order the forge happens to return -- and a green
+        read off an item that also says INCONCLUSIVE is the worst failure this system can have.
+        """
+        job = self._job()
+        number = memory_store.register(job)
+        memory_store.record_verdict(job, verdict='INCONCLUSIVE', detail='node down')
+        stray = recording_forge.define_duplicate_label('verdict:inconclusive')
+        recording_forge.attach_label_id(number, stray, 'verdict:inconclusive')
+
+        memory_store.record_verdict(job, verdict='PASS', detail='green on the retry')
+
+        assert memory_store.verdict(job) == 'PASS'

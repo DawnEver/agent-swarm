@@ -217,3 +217,65 @@ class TestGitHubRefusesInsteadOfGuessing:
         joined = ' '.join(GITHUB_UNMEASURED).lower()
         for topic in ('pagination', 'rate', 'retire', 'project'):
             assert topic in joined, f'no experiment listed for {topic!r}'
+
+
+class TestRemovingALabelDetachesEveryIdSharingItsName:
+    """`GiteaForge.remove_label`, at the HTTP boundary, because nothing else covers it offline.
+
+    THIS CLASS EXISTS BECAUSE THE MUTANT SURVIVED. The duplicate-verdict bug was found and fixed in
+    both `GiteaForge` and `RecordingForge`, and the whole offline suite went red then green -- but
+    reverting the **vendor** fix left all 431 tests passing, because every offline test runs against
+    the double. Two implementations of one rule, one of them tested, and the untested one is the
+    one that talks to the server.
+
+    `_api` is stubbed rather than the network faked: the question here is precisely which requests
+    are issued, so the request list IS the assertion. This does not test Gitea -- the `live_forge`
+    tests do that -- it tests that we ask Gitea for the right thing.
+    """
+
+    def _forge_with_labels(self, monkeypatch, defined: list[dict]):
+        forge = GiteaForge('http://127.0.0.1:1', 'o/r')
+        calls: list[tuple[str, str]] = []
+
+        def fake_api(method: str, path: str, body: dict | None = None):
+            calls.append((method, path))
+            if method == 'GET' and path.startswith('/repos/o/r/labels'):
+                return defined
+            return None
+
+        monkeypatch.setattr(forge, '_api', fake_api)
+        return forge, calls
+
+    def test_BOTH_ids_are_deleted_when_a_name_is_duplicated(self, monkeypatch):
+        """The measured state: `POST /labels` accepted twelve identical names from twelve racers."""
+        forge, calls = self._forge_with_labels(
+            monkeypatch, [{'id': 7, 'name': 'verdict:pass'}, {'id': 9, 'name': 'verdict:pass'}]
+        )
+
+        forge.remove_label(3, 'verdict:pass')
+
+        deletes = [path for method, path in calls if method == 'DELETE']
+        assert deletes == ['/repos/o/r/issues/3/labels/7', '/repos/o/r/issues/3/labels/9'], (
+            'only one id was detached -- a same-named label survives and the item carries two verdicts'
+        )
+
+    def test_an_UNRELATED_name_is_left_alone(self, monkeypatch):
+        """The control: deleting every id in the repo would also pass the test above."""
+        forge, calls = self._forge_with_labels(
+            monkeypatch, [{'id': 7, 'name': 'verdict:pass'}, {'id': 8, 'name': 'verdict:fail'}]
+        )
+
+        forge.remove_label(3, 'verdict:pass')
+
+        assert [p for m, p in calls if m == 'DELETE'] == ['/repos/o/r/issues/3/labels/7']
+
+    def test_removing_an_ABSENT_label_creates_nothing(self, monkeypatch):
+        """`_label_id` CREATES a missing label; removal must not borrow that. A removal that created
+        the thing it was asked to remove is a write on a read-only intent -- and it would leave a
+        fresh unused label behind on every no-op cleanup."""
+        forge, calls = self._forge_with_labels(monkeypatch, [{'id': 7, 'name': 'verdict:pass'}])
+
+        forge.remove_label(3, 'verdict:inconclusive')
+
+        assert [m for m, _p in calls if m == 'POST'] == []
+        assert [p for m, p in calls if m == 'DELETE'] == []
