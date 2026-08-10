@@ -278,19 +278,33 @@ def test_the_claim_payload_is_measured_at_all():
     assert _fresh_runner_claim_payload(0) >= 1
 
 
-@pytest.mark.xfail(
-    reason='MEASURED 2026-08-10, and it is the 7x24 axis rather than the throughput one: a fresh '
-    'runner claiming ONE job transfers the WHOLE history -- 201 items behind 200 finished jobs, '
-    '51 behind 50. The REQUEST COUNT is 1, which is why counting calls never showed it; the cost '
-    'is bandwidth, pagination and server work, and closed items are never deleted (this '
-    'deployment refuses it, GitHub has no endpoint). After a year of 7x24 operation every claim '
-    'by every restarted runner pays for every job ever run. The lookup needs closed items for '
-    'dedupe, so the fix is not simply state=open -- it is a bounded query (by title, or a '
-    'since/limit window), which is a real change and is NOT being rushed at the end of a session.',
-    strict=True,
-)
-def test_a_fresh_runners_claim_does_not_transfer_the_whole_history():
-    """The target, stated as the assertion it will become. `strict=True`: when someone bounds the
-    query this goes green and MUST be un-xfailed, rather than quietly passing while still marked
-    as a known failure."""
-    assert _fresh_runner_claim_payload(200) <= _fresh_runner_claim_payload(10) * 2
+@pytest.mark.parametrize('history', [10, 50, 200])
+def test_a_fresh_runners_claim_does_not_transfer_the_whole_history(history: int):
+    """WAS A STRICT XFAIL FOR ONE COMMIT, and the strictness is what closed it: bounding the query
+    made it XPASS, which FAILED the suite and forced this conversion instead of letting a green
+    assertion sit under a "known failure" label.
+
+    MEASURED before: 201 items transferred behind 200 finished jobs, 51 behind 50 -- one REQUEST,
+    the whole history in its body. The lookup now asks for open items first and falls back to
+    everything only when that misses, so the hot path (claiming, deduping against live work) is
+    bounded by OPEN work rather than by everything ever run.
+
+    Compared against the empty-history cost rather than a constant: what must not happen is GROWTH,
+    and a fixed bar would silently accept a payload that got bigger but stayed under it.
+    """
+    assert _fresh_runner_claim_payload(history) == _fresh_runner_claim_payload(0)
+
+
+def test_a_CLOSED_item_is_still_findable_from_a_fresh_process():
+    """The correctness half of the narrowing, and the reason it is open-FIRST rather than open-ONLY.
+    A retired duplicate must stay findable, or `reconcile_duplicates` reports a clean tracker it
+    cannot actually see -- trading a bandwidth bill for a correctness hole."""
+    forge = _Weighing()
+    submitter = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    job = Job(id='g/done', kind=TEST_RUN)
+    number = submitter.register(job)
+    submitter.record_verdict(job, verdict='PASS', detail='d')
+
+    fresh = ForgeStore('bench', forge, role=Role.RUNNER)
+    title = next(i.title for i in forge.list_work_items() if i.number == number)
+    assert fresh._lowest_numbered(title) == number

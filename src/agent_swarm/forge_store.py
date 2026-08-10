@@ -781,16 +781,34 @@ class ForgeStore:
             self.index.put(job.claim_key(), number)
 
     def _lowest_numbered(self, title: str) -> int | None:
-        """The lowest-numbered VISIBLE item with this title, or ``None`` for "none visible".
+        """The lowest-numbered item with this exact title, or None if none is visible.
+
+        OPEN FIRST, EVERYTHING ONLY IF THAT MISSES. The scan used to ask for `state='all'` always,
+        and MEASURED 2026-08-10 that meant a fresh runner claiming ONE job transferred the WHOLE
+        history: 201 items behind 200 finished jobs. The request COUNT was 1, which is why counting
+        calls never showed it -- the cost is bandwidth, pagination and server work, and closed items
+        are never deleted, so after a year of 7x24 operation every claim by every restarted runner
+        paid for every job ever run.
+
+        Why open-first is CORRECT and not merely cheaper: an item worth finding is almost always an
+        open one -- you cannot claim a closed item, and registration only dedupes against live work.
+        The closed case is real (reading a finished job's verdict from a fresh process) and it still
+        works; it simply pays the full scan, which is the rare path rather than the hot one.
+
+        Why not open-ONLY: a retired duplicate must stay findable, or `reconcile_duplicates` reports
+        a clean tracker it cannot actually see. Narrowing without the fallback would trade a
+        bandwidth bill for a correctness hole.
 
         Private, and the ``None`` stays inside this class: at this depth "not visible" and "not
         there" are genuinely the same observation, and it is the PUBLIC boundary that must refuse to
         let a caller confuse them.
         """
-        matches = [item.number for item in self.forge.list_work_items() if item.title == title]
-        return min(matches) if matches else None
-
-    # -- housekeeping ------------------------------------------------------------------------
+        for state in ('open', 'all'):
+            matches = [item.number for item in self.forge.list_work_items(state=state)
+                       if item.title == title]
+            if matches:
+                return min(matches)
+        return None
 
     def reconcile_duplicates(self) -> list[RetiredDuplicate]:
         """Find every key with more than one work item, keep the LOWEST, retire the rest.

@@ -573,12 +573,15 @@ class StaleListForge:
         self.created_at: dict[int, float] = {}
         self.list_calls = 0
 
-    def list_work_items(self) -> list[WorkItem]:
+    def list_work_items(self, *, state: str = 'all') -> list[WorkItem]:
+        # `state` FORWARDED, not swallowed. A double that ignored it would answer the same for the
+        # narrowed query as for the full one, and the payload bound that narrowing buys would be
+        # invisible to every test running through here.
         self.list_calls += 1
         now = time.monotonic()
         return [
             item
-            for item in self.inner.list_work_items()
+            for item in self.inner.list_work_items(state=state)
             if now - self.created_at.get(item.number, 0.0) >= self.staleness
         ]
 
