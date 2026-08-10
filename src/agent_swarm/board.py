@@ -23,31 +23,48 @@ module's signature -- a visible edit rather than one more line inside a function
 `tests/test_the_board_is_a_one_way_projection.py` fails if any mutating forge method is so much as
 NAMED in this file, with "mutating" derived from the protocol rather than hand-listed.
 
-WHY NOTHING HERE PUSHES TO A GITEA PROJECT
-==========================================
+NOTHING RENDERS THIS BOARD TODAY. IT IS A VALUE, NOT A SCREEN.
+==============================================================
 
-**GITEA HAS NO REST API FOR PROJECT BOARDS, and that is why this module ends at a value instead of
-at a call.** Checked 2026-08-10 against public sources only -- the shared server was not contacted:
+**Read this before concluding a board exists somewhere.** `project` returns a `Board`, and no code
+anywhere publishes it to a forge, a UI or a file. That is DELIBERATE and externally forced rather
+than half-finished -- but a reader who assumed otherwise would be making this project's own named
+mistake, taking a flag that exists for a runner that runs. The hole is NAMED here, which is the
+difference between a decision and a defect.
 
-* go-gitea/gitea issue #36824, "feat: REST API for repository project boards", opened 2026-03-04 and
-  still OPEN, states it outright: "Gitea has no REST API for repository project boards. This makes
-  it impossible to manage projects programmatically or integrate them with external tooling." It
-  PROPOSES the nine endpoints that would be needed -- `GET/POST /repos/{owner}/{repo}/projects`,
-  `.../projects/{id}/columns`, `POST .../projects/columns/{id}/issues` -- which is only worth
-  proposing because none of them exist.
-* Its linked PR #36008 has NOT merged and has been idle since December 2025.
-* go-gitea/gitea issue #37151 separately asks for kanban issue ORDERING to be exposed, for the same
-  reason: it is not readable from outside the web UI.
+WHY IT CANNOT BE PUBLISHED. **No RELEASED Gitea has a Projects REST API.** Measured and
+source-verified 2026-08-10:
 
-So a writer against a Gitea project board cannot be written today, and a reader cannot be either --
-which incidentally makes the one-way property easy to hold and worth stating anyway, because the API
-is expected to arrive and the refusal must outlive its absence.
+* this deployment is Gitea **1.26.4** (`GET /api/v1/version`, measured by the coordinator);
+* `routers/api/v1/api.go` at tag v1.26.4 has no `/projects` route group at all -- its only two
+  "project" matches are error strings in a permission helper -- and at v1.27.1 the file has ZERO
+  matches. `templates/swagger/v1_json.tmpl` at v1.26.4 has no `/projects` path either; its
+  `has_projects` / `projects_mode` keys are repo UNIT TOGGLES, not board endpoints. So
+  `/api/v1/repos/{owner}/{repo}/projects` 404s against this host;
+* the routes exist on `main` ONLY -- `addProjectRoutes`, landed by PR #38691 "feat(api): add project
+  APIs" on 2026-08-08, **milestone 1.28.0, unreleased**. The earlier attempt PR #36008 stalled in
+  December 2025, and tracking issue #36824 states the position outright: "Gitea has no REST API for
+  repository project boards."
 
-WHAT IS NOT KNOWN, and is not assumed: whether Gitea's columns have any relationship to LABELS. The
-proposed API assigns an issue to a column explicitly, which suggests columns are an independent
-concept, but that is an inference from a design proposal rather than a measurement. This module
-therefore projects labels into columns of ITS OWN naming and claims nothing about how a Gitea board
-would be populated from them.
+Publishing this board is therefore blocked on a Gitea UPGRADE, which is a human action on a shared
+host and not something this package can route around.
+
+AND THE PART THAT SURVIVES THE UPGRADE -- READ THIS BEFORE WRITING THE PUBLISHER
+================================================================================
+
+**"Map labels to columns and get the board for free" is REFUTED, and not by the version.** In
+Gitea's model labels and columns are two INDEPENDENT relations: columns live in `project_column`
+linked through `project_issue`, labels are the separate `issue_label` relation, and
+`models/project/column.go` and `models/project/issue.go` contain no reference to labels at all.
+Moving a card changes no label; applying a label moves no card. `services/issue/status.go` closes
+the other half -- closing an issue touches no column, so an answered job's card stays where it was.
+The only automatic placement is the project's DEFAULT column.
+
+So even on 1.28 a board FOLLOWS nothing. A publisher must call the move endpoint explicitly for
+every card whose column changed, which makes it a WRITER with everything that implies: its own
+idempotence, its own failure handling, and above all it must move cards WITHOUT ever writing back to
+the work item, or it becomes the second writer this module exists to prevent. That is a component
+with a real design, not the free consequence the plan assumed.
 
 WHY IN PROGRESS IS AN ARGUMENT AND NOT A LABEL
 ==============================================
@@ -55,9 +72,9 @@ WHY IN PROGRESS IS AN ARGUMENT AND NOT A LABEL
 Four columns are label-derived. The fifth is not: a claim is a COMMENT, so nothing on the work item
 says "somebody is running this", and the labels a list endpoint returns cannot answer it. That is a
 real gap, and the way it is handled is `claimed` being REQUIRED. A default of `frozenset()` would
-render every running job as Pending -- unknown silently read as none, on the one column an operator
-opens a board to look at. The caller that schedules already reads claims and can answer honestly;
-one that cannot must say so rather than have this module guess on its behalf.
+render every running job as Pending -- unknown silently read as none, on the one column that
+distinguishes a busy fleet from an idle one. The caller that schedules already reads claims and can
+answer honestly; one that cannot must say so rather than have this module guess on its behalf.
 """
 
 from __future__ import annotations
@@ -76,17 +93,18 @@ COLUMNS = ('Pending', 'In Progress', 'PASS', 'FAIL', 'INCONCLUSIVE')
 #: THAT STATE IS REACHABLE AND OUR CODE CANNOT PRODUCE IT: `POST /labels` accepted twelve identical
 #: names from twelve concurrent racers on the measured deployment, and a duplicate definition
 #: attached under a higher id survived a strip -- an item carrying both PASS and FAIL at once, on
-#: record. Picking by list order would make the displayed verdict depend on whichever order the
-#: endpoint happened to return, which is a board that reads differently on each refresh.
+#: record. Picking by list order would make the projected verdict depend on whichever order the
+#: endpoint happened to return, so two calls on unchanged data could disagree.
 #:
-#: FAIL over INCONCLUSIVE over PASS: a view that can be wrong should be wrong in the direction that
-#: sends somebody to look.
+#: FAIL over INCONCLUSIVE over PASS: a projection that can be wrong should be wrong in the direction
+#: that sends somebody to look.
 _VERDICT_PRECEDENCE = ('FAIL', 'INCONCLUSIVE', 'PASS')
 
 
 @dataclass(frozen=True, slots=True)
 class Card:
-    """One work item's place on the board. A VALUE -- it carries no way to reach the item."""
+    """One work item's computed column. A VALUE -- it carries no way to reach the item, and no
+    claim that anything is rendering it; see the module docstring on why nothing does yet."""
 
     number: int
     title: str

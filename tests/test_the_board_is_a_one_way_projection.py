@@ -1,4 +1,9 @@
-"""The kanban board is a VIEW. It must have no path by which it can write a work item.
+"""The kanban board is a computed VALUE. It must have no path by which it can write a work item.
+
+NOTHING RENDERS IT TODAY -- no released Gitea has a Projects REST API (PR #38691, milestone 1.28.0,
+unreleased; this host is 1.26.4). `board.py`'s docstring carries the evidence and the consequence.
+These tests are therefore about the PROJECTION and its refusal to write, and none of them claims a
+board is visible anywhere.
 
 THE DIRECTIVE, and it is narrower than it sounds: "project 仅仅作为看板就行" -- the project is ONLY a
 kanban view. So the board shows where work stands and decides nothing, and the reason that matters is
@@ -24,7 +29,7 @@ WHY THE COLUMN IS NOT SIMPLY THE LABEL. Four of the five columns are label-deriv
 IS NOT: a claim is a comment, not a label, so nothing on the work item says "somebody is running
 this". That is a real gap and it is handled by making `claimed` a REQUIRED argument rather than one
 defaulting to empty. A default would render every running job as Pending -- unknown silently read as
-none, on the one column an operator looks at the board to see.
+none, on the one column that distinguishes a busy fleet from an idle one.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from pathlib import Path
 import pytest
 
 from agent_swarm import board
-from agent_swarm.board import COLUMNS, Board, project
+from agent_swarm.board import COLUMNS, Board, column_for, project
 from agent_swarm.forge import WorkItem
 from agent_swarm.forge_store import READY_LABEL, VERDICT_LABELS
 
@@ -209,9 +214,10 @@ def test_two_verdict_labels_resolve_to_the_UNSAFE_ONE_being_shown():
     names from twelve racers on the measured deployment, and a duplicate definition attached under a
     higher id survived a strip -- an item carrying both PASS and FAIL at once, on record.
 
-    The board must not pick by list order, which would make the displayed verdict depend on whichever
-    order the endpoint happened to return. FAIL wins over INCONCLUSIVE wins over PASS: a view that
-    can be wrong should be wrong in the direction that sends someone to look.
+    The projection must not pick by list order, which would make the answer depend on whichever
+    order the endpoint happened to return -- two calls on unchanged data disagreeing. FAIL wins over
+    INCONCLUSIVE wins over PASS: a projection that can be wrong should be wrong in the direction
+    that sends someone to look.
     """
     both = _item(1, READY_LABEL, VERDICT_LABELS['PASS'], VERDICT_LABELS['FAIL'])
     reversed_ = _item(2, READY_LABEL, VERDICT_LABELS['FAIL'], VERDICT_LABELS['PASS'])
@@ -226,6 +232,34 @@ def test_an_item_without_the_handover_label_is_not_on_the_board_at_all():
     board_ = project([_item(1), _item(2, READY_LABEL)], claimed=frozenset())
     assert [c.number for c in board_.column('Pending')] == [2]
     assert [c.number for c in board_.cards] == [2]
+
+
+@pytest.mark.parametrize('claimed', [frozenset(), frozenset({1})])
+def test_an_UNKNOWN_label_does_not_make_a_card_vanish(claimed: frozenset[int]):
+    """THE PROJECTION'S VERSION OF UNKNOWN-READ-AS-ZERO, pinned in the safe direction.
+
+    `run:femm`, `priority:1`, a human's `wontfix` -- none is a verdict and none is the handover
+    label. Written as a LOOKUP, `column_for` would answer `None` for these and the card would fall
+    off the board entirely, which reads as "that job does not exist" and is indistinguishable from
+    an empty queue. Written as a FALLTHROUGH, an unrecognised label is simply not evidence about the
+    column, and the card lands on the strength of what IS known.
+
+    Deliberately NOT symmetrical with the handover label: an item lacking `swarm:ready` IS dropped
+    (see above). The distinction is between "not swarm work at all" and "swarm work carrying a label
+    this module has no opinion about", and only the second may not cost a card.
+    """
+    board_ = project([_item(1, READY_LABEL, 'run:femm', 'priority:1', 'wontfix')], claimed=claimed)
+    assert len(board_.cards) == 1
+    assert board_.cards[0].column == ('In Progress' if claimed else 'Pending')
+
+
+def test_column_for_is_TOTAL_and_never_declines_to_answer():
+    """Asserted against the function rather than through the board, because it is a property of the
+    return: there is no label set for which a column is not produced.
+    """
+    for labels in ([], ['whatever'], [READY_LABEL], ['a', 'b', 'c']):
+        assert column_for(labels, claimed=False) in COLUMNS
+        assert column_for(labels, claimed=True) in COLUMNS
 
 
 def test_every_card_lands_in_a_declared_column():
@@ -260,7 +294,7 @@ def test_asking_for_a_column_that_does_not_exist_RAISES():
 
 def test_claimed_is_required():
     """No default. An empty default would render every running job as Pending: unknown read as none,
-    on the one column an operator opens the board to see.
+    on the one column that distinguishes a busy fleet from an idle one.
     """
     with pytest.raises(TypeError):
         project([])  # type: ignore[call-arg]
