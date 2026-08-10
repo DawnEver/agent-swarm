@@ -235,3 +235,62 @@ def test_the_sweep_cost_does_not_move_between_one_item_and_a_hundred():
     """The shape, not the constant: a per-item cost that happened to be cheap would still be the
     defect, and comparing the ends is what says so."""
     assert _sweep_cost(1) == _sweep_cost(100)
+
+
+# ---------------------------------------------------------------------------
+# THE 7x24 AXIS: call COUNT is not payload SIZE, and I had only been counting calls.
+
+
+class _Weighing(RecordingForge):
+    """Counts items TRANSFERRED, not requests made. One request for a thousand items is one call
+    and a thousand items of bandwidth, pagination and server work."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transferred = 0
+
+    def list_work_items(self, *, state: str = 'all'):
+        out = super().list_work_items(state=state)
+        self.transferred += len(out)
+        return out
+
+
+def _fresh_runner_claim_payload(history: int) -> int:
+    """Items transferred when a FRESH process claims one job, with `history` finished jobs behind
+    it. Fresh matters: the in-memory index makes the second lookup free and hides this entirely."""
+    forge = _Weighing()
+    submitter = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    for i in range(history):
+        old = Job(id=f'g/old{i}', kind=TEST_RUN)
+        submitter.register(old)
+        submitter.record_verdict(old, verdict='PASS', detail='d')
+    live = Job(id='g/live', kind=TEST_RUN)
+    submitter.register(live)
+
+    runner = ForgeStore('bench', forge, role=Role.RUNNER)
+    forge.transferred = 0
+    runner.try_claim(live, owner='w0')
+    return forge.transferred
+
+
+def test_the_claim_payload_is_measured_at_all():
+    """The control: a probe that transferred nothing would make the xfail below meaningless."""
+    assert _fresh_runner_claim_payload(0) >= 1
+
+
+@pytest.mark.xfail(
+    reason='MEASURED 2026-08-10, and it is the 7x24 axis rather than the throughput one: a fresh '
+    'runner claiming ONE job transfers the WHOLE history -- 201 items behind 200 finished jobs, '
+    '51 behind 50. The REQUEST COUNT is 1, which is why counting calls never showed it; the cost '
+    'is bandwidth, pagination and server work, and closed items are never deleted (this '
+    'deployment refuses it, GitHub has no endpoint). After a year of 7x24 operation every claim '
+    'by every restarted runner pays for every job ever run. The lookup needs closed items for '
+    'dedupe, so the fix is not simply state=open -- it is a bounded query (by title, or a '
+    'since/limit window), which is a real change and is NOT being rushed at the end of a session.',
+    strict=True,
+)
+def test_a_fresh_runners_claim_does_not_transfer_the_whole_history():
+    """The target, stated as the assertion it will become. `strict=True`: when someone bounds the
+    query this goes green and MUST be un-xfailed, rather than quietly passing while still marked
+    as a known failure."""
+    assert _fresh_runner_claim_payload(200) <= _fresh_runner_claim_payload(10) * 2
