@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_swarm.provenance import Provenance, read_provenance, running_provenance
+from agent_swarm.provenance import Provenance, read_provenance, redact_url_credentials, running_provenance
 
 #: The interpreter every gate on this box runs under. A LITERAL PATH, not discovery: the whole point
 #: is to assert about one specific environment, and a check that searched for "some venv" would pass
@@ -81,10 +81,15 @@ class TestReadingAnInstallsOrigin:
         (dist_info / 'direct_url.json').write_text('{"dir_info": ', encoding='utf-8')
         assert read_provenance(tmp_path).editable is True
 
-    def test_the_RAW_text_is_kept_for_a_gate_log(self, tmp_path):
+    def test_the_text_is_kept_NEAR_VERBATIM_for_a_gate_log(self, tmp_path):
         """`__version__` is `0.1.0` on every commit so far and distinguishes nothing, so a gate log
-        must print what pip wrote. Verbatim, because a summary is a place for a bug to hide and the
-        raw line is what another engineer can compare against their own box.
+        must print what pip wrote -- a summary is a place for a bug to hide, and the line itself is
+        what another engineer can compare against their own box.
+
+        NEAR-verbatim, not verbatim: the one edit is the credential redaction, and it is not
+        optional. See `TestTheProvenanceLineCannotCarryACredential` for why those two requirements
+        conflict and why removing exactly the credential settles it -- the credential is also the
+        only part of the URL that carries no comparison value.
         """
         _write_dist_info(tmp_path, editable=False)
         text = read_provenance(tmp_path).direct_url_text
@@ -203,3 +208,60 @@ class TestNoCredentialCanReachAReportOrALog:
         source = (Path(__file__).resolve().parents[1] / 'src' / 'agent_swarm' / 'forge.py').read_text(encoding='utf-8')
         message_line = next(line for line in source.splitlines() if 'exc.read()' in line)
         assert 'request' not in message_line
+
+
+class TestTheProvenanceLineCannotCarryACredential:
+    """The printing surface widened when `running_provenance()` started printing on EVERY timing,
+    and this is what that widening exposed.
+
+    `pip install https://<token>@github.com/...` records the token in `direct_url.json`. Printing
+    that file verbatim -- which is exactly what a gate log wants -- would put a credential in every
+    timed run. Our current install is a `file://` path and carries none, so nothing has leaked; the
+    CODE would have, which is the distinction between an incident and a defect.
+    """
+
+    def test_a_token_in_the_install_URL_is_REDACTED(self, tmp_path):
+        dist_info = tmp_path / 'agent_swarm-0.1.0.dist-info'
+        dist_info.mkdir()
+        (dist_info / 'direct_url.json').write_text(
+            '{"url": "https://oauth2:ghp_SUPERSECRET@github.com/DawnEver/agent-swarm.git", "dir_info": {}}',
+            encoding='utf-8',
+        )
+        text = read_provenance(tmp_path).direct_url_text
+        assert 'ghp_SUPERSECRET' not in text
+        assert '<redacted>' in text
+
+    def test_everything_ELSE_about_the_url_survives(self):
+        """The redaction must not cost the line its comparison value -- which host, which path,
+        which sha is the entire reason a gate log prints it.
+        """
+        redacted = redact_url_credentials('{"url": "https://oauth2:ghp_X@github.com/o/r.git"}')
+        assert 'github.com/o/r.git' in redacted
+        assert redacted.startswith('{"url": "https://')
+
+    def test_a_url_with_NO_credential_is_untouched(self):
+        plain = '{"url":"file:///C:/Users/linxu/Documents/PEMC/.pinned/agent-swarm-67c7aea","dir_info":{}}'
+        assert redact_url_credentials(plain) == plain
+
+    def test_it_stays_valid_JSON_so_a_reader_can_still_parse_it(self):
+        text = redact_url_credentials('{"url": "https://u:p@h/x.git", "dir_info": {}}')
+        assert json.loads(text)['url'] == 'https://<redacted>@h/x.git'
+
+    def test_there_is_NO_raw_accessor_beside_the_redacted_one(self):
+        """A `raw_direct_url_text` would be the one someone reached for. The unredacted file is on
+        disk for anyone who genuinely needs it; nothing in this package hands it to a printer.
+        """
+        assert not hasattr(Provenance, 'raw_direct_url_text')
+        # CODE, not prose. The docstring MENTIONS that accessor in order to explain why it does not
+        # exist, and a substring check read that explanation as the offence -- which is exactly the
+        # mistake the AST checks elsewhere in this suite were written to avoid, made by me, in the
+        # file about not making it.
+        source = (Path(__file__).resolve().parents[1] / 'src' / 'agent_swarm' / 'provenance.py').read_text(
+            encoding='utf-8'
+        )
+        defined = {node.name for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef)} | {
+            node.target.id
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        }
+        assert not any('raw' in name for name in defined), f'a raw accessor exists: {sorted(defined)}'

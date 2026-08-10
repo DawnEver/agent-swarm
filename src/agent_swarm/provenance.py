@@ -26,18 +26,41 @@ timing, and only an install-time interlock or a provenance line in the gate log 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+#: `//user:secret@host` in any URL. pip records the URL it installed from VERBATIM, so
+#: `pip install https://oauth2:<token>@github.com/...` writes that token into `direct_url.json` --
+#: and this module prints that text on every timing the rehearsal emits.
+_URL_CREDENTIAL = re.compile(r'(//)[^/@\s"]*:[^/@\s"]*@')
+
+
+def redact_url_credentials(text: str) -> str:
+    """Remove `user:secret@` from any URL in `text`. THE SAFE FORM IS THE ONLY FORM ON OFFER.
+
+    A `raw_direct_url_text` accessor beside this would be the one someone reached for, so there
+    isn't one: the unredacted file is on disk for anyone who genuinely needs it, and nothing in this
+    package hands it to a printer. Everything else about the URL survives, so the line keeps the
+    comparison value it exists for -- which host, which path, which sha.
+    """
+    return _URL_CREDENTIAL.sub(r'\g<1><redacted>@', text)
 
 
 @dataclass(frozen=True, slots=True)
 class Provenance:
     """What an installed distribution says about its own origin.
 
-    `direct_url` is kept as RAW TEXT as well as parsed, because a gate log should print what pip
-    wrote rather than this module's interpretation of it -- a summary is a place for a bug to hide,
-    and the verbatim line is the thing another engineer can compare against their own box.
+    `direct_url_text` is what pip wrote, MINUS any embedded credential, because a gate log should
+    print pip's own record rather than this module's interpretation -- a summary is a place for a
+    bug to hide, and the near-verbatim line is what another engineer can compare against their own
+    box.
+
+    THE ONE EDIT IS THE REDACTION, and it is not optional. `pip install https://<token>@host/...`
+    records that token in `direct_url.json`, so "print it verbatim" and "never log a credential"
+    are in direct conflict; the credential is also the one part of the URL that carries no
+    comparison value at all. Removing exactly that keeps both.
     """
 
     dist_info: Path
@@ -69,7 +92,7 @@ def read_provenance(site_packages: Path, distribution: str = 'agent_swarm') -> P
     if not direct_url.is_file():
         return Provenance(dist_info=dist_info, direct_url_text=None, editable=False, url=None)
 
-    text = direct_url.read_text(encoding='utf-8')
+    text = redact_url_credentials(direct_url.read_text(encoding='utf-8'))
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
