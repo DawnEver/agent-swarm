@@ -149,14 +149,12 @@ class TestTheTransportIsOPTIONAL:
             def verify(self, job):  # pragma: no cover -- must never be reached
                 raise AssertionError('the gate was asked about work that never ran')
 
-        class _Workspace:
-            def fingerprint(self) -> str:
-                return 'unchanged'
-
+        # workspace=None because this transport runs remotely -- the executor refuses the other
+        # combination at construction, and that refusal is tested in test_agent_executor.py.
         executor = AgentTaskExecutor(
             session=FabricSessionRunner(plugin_dir=tmp_path),
             verifier=_Verifier(),
-            workspace=_Workspace(),
+            workspace=None,
             brief=StaticBrief(),
         )
         verdict, detail = executor.execute(TASK)
@@ -249,19 +247,15 @@ class TestTheRealFleet:
             def verify(self, job):  # pragma: no cover -- reaching this IS the bug
                 raise AssertionError('the gate was asked about a tree nothing touched')
 
-        class _Workspace:
-            def fingerprint(self) -> str:
-                return 'unchanged'
-
         executor = AgentTaskExecutor(
             session=FabricSessionRunner(provider='codex', model='definitely-not-a-model'),
             verifier=_Verifier(),
-            workspace=_Workspace(),
+            workspace=None,
             brief=StaticBrief(),
         )
         verdict, detail = executor.execute(TASK)
         assert verdict == 'INCONCLUSIVE'
-        assert 'changed nothing' in detail
+        assert 'absence of evidence' in detail
 
     def test_an_unknown_PROVIDER_is_a_transport_failure_not_a_bad_session(self):
         """It is a configuration error, and reporting it as a session that went badly would send the

@@ -60,6 +60,12 @@ class FakeSession:
         self.briefs: list[str] = []
         self.workspace: FakeWorkspace | None = None
 
+    def executes_remotely(self) -> bool:
+        """This fake runs the "session" in-process, so a local workspace IS looking at the right
+        filesystem. A fake that claimed to be local while the real transport is remote would be the
+        double-gentler-than-reality trap again -- here it is honest because it really is local."""
+        return False
+
     def run(self, brief: str, *, job: Job) -> SessionOutcome:
         self.briefs.append(brief)
         if self.raises:
@@ -292,3 +298,77 @@ class TestTheSeamDoesNotLeakL0Vocabulary:
         """
         assert not hasattr(agent_executor_module, 'subprocess')
         assert not hasattr(agent_executor_module, 'socket')
+
+
+class TestAGuardThatCannotSeeItsSubjectMustNotVOTE:
+    """The blocker the rehearsal found, closed at the only place it can be closed structurally.
+
+    A local `Workspace` beside a REMOTE session does not give a weak answer -- it gives a confident
+    wrong one, in the direction that looks safe ("nothing changed"). That is why it survived a whole
+    integrated run. Today it only means an agent task can never PASS. The day someone "fixes" the
+    PASS path without fixing the filesystem, it means every agent task passes on a tree nobody read.
+    """
+
+    class RemoteSession:
+        def executes_remotely(self) -> bool:
+            return True
+
+        def run(self, brief: str, *, job: Job) -> SessionOutcome:
+            return SessionOutcome(completed=True, self_report='done!')
+
+    def test_a_LOCAL_workspace_beside_a_REMOTE_session_is_refused_at_construction(self):
+        """Refused where it cannot be accidentally satisfied later."""
+        with pytest.raises(ValueError, match='another node'):
+            AgentTaskExecutor(
+                session=self.RemoteSession(),
+                verifier=FakeVerifier(),
+                workspace=FakeWorkspace(),
+                brief=StaticBrief(),
+            )
+
+    def test_the_refusal_names_the_REPLACEMENT_not_just_the_problem(self):
+        with pytest.raises(ValueError, match='SessionOutcome.changed'):
+            AgentTaskExecutor(
+                session=self.RemoteSession(),
+                verifier=FakeVerifier(),
+                workspace=FakeWorkspace(),
+                brief=StaticBrief(),
+            )
+
+    def test_NO_evidence_is_a_third_answer_and_is_not_scored_as_no(self):
+        """ "Nobody can say" and "nothing changed" must not collapse into one word. An absence of
+        evidence scored as evidence of absence is how a guard starts voting.
+        """
+        verifier = FakeVerifier()
+        executor = AgentTaskExecutor(
+            session=self.RemoteSession(), verifier=verifier, workspace=None, brief=StaticBrief()
+        )
+        verdict, detail = executor.execute(TASK)
+        assert verdict == 'INCONCLUSIVE'
+        assert 'absence of evidence' in detail
+        assert verifier.asked == [], 'the gate was consulted with no evidence either way'
+
+    def test_a_transport_that_DOES_report_a_change_is_believed(self):
+        """The direction this is going: the fingerprint pair is taken where the work happened and
+        comes back through the transport, because the transport is the only thing that knows which
+        node that was.
+        """
+
+        class ReportingSession(TestAGuardThatCannotSeeItsSubjectMustNotVOTE.RemoteSession):
+            def run(self, brief: str, *, job: Job) -> SessionOutcome:
+                return SessionOutcome(completed=True, changed=True, self_report='done!')
+
+        verifier = FakeVerifier(verdict='PASS')
+        executor = AgentTaskExecutor(session=ReportingSession(), verifier=verifier, workspace=None, brief=StaticBrief())
+        assert executor.execute(TASK)[0] == 'PASS'
+        assert verifier.asked == [TASK.claim_key()]
+
+    def test_a_transport_reporting_NO_change_still_refuses(self):
+        class InertSession(TestAGuardThatCannotSeeItsSubjectMustNotVOTE.RemoteSession):
+            def run(self, brief: str, *, job: Job) -> SessionOutcome:
+                return SessionOutcome(completed=True, changed=False, self_report='nothing to do')
+
+        verifier = FakeVerifier(verdict='PASS')
+        executor = AgentTaskExecutor(session=InertSession(), verifier=verifier, workspace=None, brief=StaticBrief())
+        assert executor.execute(TASK)[0] == 'INCONCLUSIVE'
+        assert verifier.asked == []

@@ -305,13 +305,13 @@ class TestTheAGENTKindEndToEnd:
         executor = AgentTaskExecutor(
             session=FabricSessionRunner(provider='codex', write=False),
             verifier=gate,
-            workspace=TempWorkspace(workspace),
+            workspace=None,
             brief=StaticBrief(template='Reply with the single word ACK. Task {key}.'),
         )
         verdict, detail = executor.execute(Job(id='probe-e2e-agent', kind=AGENT_TASK))
 
-        assert verdict == 'INCONCLUSIVE', f'expected the no-change refusal, got {verdict}: {detail[:300]}'
-        assert 'changed nothing' in detail
+        assert verdict == 'INCONCLUSIVE', f'expected the no-evidence refusal, got {verdict}: {detail[:300]}'
+        assert 'absence of evidence' in detail
         assert gate.asked == [], 'the gate was consulted about a tree the session never touched'
 
     def test_a_scratch_project_alias_does_not_EXIST_which_is_the_blocker(self, tmp_path):
@@ -322,3 +322,10 @@ class TestTheAGENTKindEndToEnd:
         runner = FabricSessionRunner(provider='codex', write=True, project=str(tmp_path))
         with pytest.raises(SessionTransportUnavailable, match='unknown project alias'):
             runner.run('touch a file', job=Job(id='probe-e2e-agent', kind=AGENT_TASK))
+
+    def test_a_write_without_a_project_is_REFUSED_before_anything_is_written(self):
+        """The guard that came out of this rehearsal. A write-enabled session with no alias wrote a
+        file to an undefined directory on an undefined node -- one stray file is a curiosity, and at
+        a hundred agents it is an unbounded set of writes nobody can enumerate or delete."""
+        with pytest.raises(ValueError, match='undefined directory'):
+            FabricSessionRunner(provider='codex', write=True)

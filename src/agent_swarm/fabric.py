@@ -153,6 +153,23 @@ class FabricSessionRunner:
         node_binary: str = 'node',
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        if write and not project:
+            # REFUSED AT CONSTRUCTION, and this is not housekeeping. Measured: a write-enabled
+            # session with no project alias ran, reported creating a file, and that file exists
+            # nowhere on this box -- it went to an undefined directory on whichever node fabric
+            # picked. One stray file is a curiosity; at dozens to hundreds of agents it is an
+            # unbounded number of writes that nobody can enumerate, attribute or delete, because
+            # nobody can name where they went.
+            #
+            # A WARNING WOULD NOT DO. The write has already happened by the time anyone reads a log,
+            # and the cost of this mistake is unbounded and irreversible, which is exactly the shape
+            # that must be refused rather than reported.
+            msg = (
+                'write=True needs an explicit project: a write-enabled session with no project '
+                'alias writes to an undefined directory on an undefined node, and nothing can find '
+                'it afterwards. Pass project=<a configured fabric alias>, or leave write=False.'
+            )
+            raise ValueError(msg)
         self.provider = provider
         self.model = model
         self.write = write
@@ -161,6 +178,17 @@ class FabricSessionRunner:
         self.plugin_dir = plugin_dir
         self.node_binary = node_binary
         self.timeout_seconds = timeout_seconds
+
+    def executes_remotely(self) -> bool:
+        """Always True, and that is the honest answer even when the chosen node IS this box.
+
+        fabric picks the node; this class does not know which one until after the spawn, and a
+        transport that answered "local, probably" would hand the executor a workspace reading whose
+        correctness depended on a scheduling decision nobody recorded. `SessionOutcome.changed`
+        stays `None` until the driver can report a fingerprint taken ON the node -- see the module
+        docstring for why that is a bridge rather than the destination.
+        """
+        return True
 
     def run(self, brief: str, *, job: Job) -> SessionOutcome:
         """Spawn a session, send `brief` as one turn, close, and report what happened.

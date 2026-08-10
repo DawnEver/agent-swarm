@@ -241,3 +241,33 @@ class TestARunnerMayNotCREATE:
         assert isinstance(store.work_item_number(JOB), NotVisible)
         with pytest.raises(PermissionError):
             store.record_verdict(JOB, verdict='PASS', detail='')
+
+
+class TestTheIndexIsActuallyPOPULATED:
+    """An index nothing writes to is a cache that can only ever miss.
+
+    FOUND BY MEASURING, NOT BY READING. `register` recorded the number in its in-process dict and
+    not in the index -- and the submitter is the ONLY creator, so the index could only be warmed by
+    a lookup that had already paid for the list read it exists to avoid. Every test passed, because
+    every test either used one store object (in-process cache) or asserted correctness rather than
+    cost. Measured against the real forge: a "warm" index cost 5060 ms versus 4627 ms with no index
+    at all. After the fix: 235 ms versus 5347 ms.
+    """
+
+    def test_REGISTER_writes_the_number_to_the_index(self, tmp_path):
+        forge = RecordingForge()
+        index = ItemIndex(tmp_path / 'i.json')
+        number = ForgeStore('ns', forge, role=Role.SUBMITTER, index=index).register(JOB)
+        assert index.get(JOB.claim_key()).number == number
+
+    def test_a_FRESH_process_finds_it_without_touching_the_list(self, tmp_path):
+        """The property that makes the index worth having, asserted as a COST rather than a
+        behaviour: a new store must resolve the item without a single list call.
+        """
+        forge = StaleListForge(RecordingForge(), staleness=0.0)
+        ForgeStore('ns', forge, role=Role.SUBMITTER, index=ItemIndex(tmp_path / 'i.json')).register(JOB)
+
+        fresh = ForgeStore('ns', forge, role=Role.RUNNER, index=ItemIndex(tmp_path / 'i.json'))
+        before = forge.list_calls
+        assert fresh.work_item_number(JOB) is not None
+        assert forge.list_calls == before, 'the index was consulted and the list was read anyway'

@@ -33,6 +33,21 @@ one. The executor's own contribution is two refusals that a deterministic runner
    dangerous green there is. INCONCLUSIVE is also the word that means "re-runnable", which is what a
    killed session actually needs; `admission.should_retry` already prices how often.
 
+WHERE THE CHANGE EVIDENCE IS GOING, so the current shape is read as a bridge and not an answer
+====================================================================================================
+
+`SessionOutcome.changed` is `None` today for every remote transport, and the next step is for the
+transport to take the fingerprint pair ON THE NODE and return it -- the transport being the only
+component that knows which node ran the work. That is a bridge.
+
+**A FILESYSTEM FINGERPRINT IS NODE-BOUND BY CONSTRUCTION.** We are chasing the node because we chose
+a node-bound notion of "did work happen", and every fix in that family inherits the same problem: it
+is evidence that lives on one machine, cannot be read from another, and disappears when the box
+does. The durable, node-independent evidence that an agent task produced something is **a commit on
+a ref in the forge** -- which is the transport everything else in this system is already migrating
+onto. When that exists, `changed` stops being a fingerprint comparison and becomes "is there a
+commit", answerable from anywhere, by anyone, later.
+
 WHAT THIS STILL CANNOT CATCH, named because it is the failure a deterministic runner does not have:
 a session that satisfies the verifier by attacking the verifier -- deleting the failing test,
 loosening the tolerance, marking an xfail. The gate goes green and it is EARNED by the letter of the
@@ -78,11 +93,16 @@ class SessionOutcome:
     Attributes:
         completed: did the session finish on its own terms (not killed, not timed out)? A crashed
             session's tree state cannot be attributed to a finished attempt.
+        changed: did the working tree change? ``None`` means THE TRANSPORT CANNOT SAY -- which is
+            not the same as "no", and the difference is the whole point. A transport that ran the
+            session somewhere it cannot observe must return ``None`` here rather than guessing, and
+            the executor then refuses to judge instead of voting on evidence it does not have.
         transcript: the full session log, kept for the human who will review the diff.
         self_report: the model's closing claim. Recorded, never believed.
     """
 
     completed: bool
+    changed: bool | None = None
     transcript: str = ''
     self_report: str = ''
 
@@ -94,6 +114,15 @@ class SessionRunner(Protocol):
     def run(self, brief: str, *, job: Job) -> SessionOutcome:
         """Drive a session for `job` against `brief`. Raising is a legitimate outcome (a timeout,
         a dead provider); the executor turns it into INCONCLUSIVE rather than letting it escape."""
+        ...
+
+    def executes_remotely(self) -> bool:
+        """Does the work happen somewhere this process cannot look at?
+
+        THE TRANSPORT IS THE ONLY COMPONENT THAT KNOWS. It picked the node; nothing above it can
+        find out after the fact, and nothing below it cares. A `Workspace` handed to an executor
+        whose session runs elsewhere is not a weak signal, it is a reading of a different computer.
+        """
         ...
 
 
@@ -130,7 +159,9 @@ class AgentTaskExecutor:
     Args:
         session: the L0 transport. Not implemented in this package; see `FabricSessionRunner`.
         verifier: the definition of done. Its verdict IS the verdict.
-        workspace: used only to answer "did this session change anything at all".
+        workspace: used only to answer "did this session change anything at all", and ONLY legal
+            for a session that runs on this box. `None` when the transport reports `changed` itself,
+            which is where this is going -- see the module docstring.
         brief: turns a job into the instruction the session is given.
     """
 
@@ -139,17 +170,48 @@ class AgentTaskExecutor:
         *,
         session: SessionRunner,
         verifier: Verifier,
-        workspace: Workspace,
+        workspace: Workspace | None,
         brief: Brief,
     ) -> None:
+        if workspace is not None and session.executes_remotely():
+            # REFUSED AT CONSTRUCTION, where it cannot be accidentally satisfied later. A local
+            # `Workspace` beside a remote session does not give a weak answer, it gives a CONFIDENT
+            # WRONG one -- and it is wrong in the direction that looks safe, "nothing changed",
+            # which is why it survived a whole integrated rehearsal unnoticed.
+            #
+            # Today the consequence is only that an agent task can never PASS: annoying, honest.
+            # The danger is the day someone "fixes" the PASS path without fixing the filesystem, at
+            # which point EVERY agent task passes on a tree nobody read. A guard that cannot see its
+            # subject must say so; it must not vote.
+            msg = (
+                'this session executes on another node, so a local Workspace cannot be evidence '
+                'about it -- it would answer "changed nothing" about a tree the session never '
+                'touched. The change evidence must come back through the transport as '
+                'SessionOutcome.changed; pass workspace=None until it does.'
+            )
+            raise ValueError(msg)
         self.session = session
         self.verifier = verifier
         self.workspace = workspace
         self.brief = brief
 
+    def _did_anything_change(self, before: str | None, outcome: SessionOutcome) -> bool | None:
+        """Did the tree move? ``None`` means NOBODY CAN SAY, which is a third answer and not a no.
+
+        THE TRANSPORT'S REPORT WINS when it has one, because it was taken where the work happened
+        and a fingerprint is node-bound by construction. The local workspace is only consulted for a
+        session that ran on this box, and `__init__` already refuses the other combination -- so by
+        the time this runs, a workspace being present means it is looking at the right filesystem.
+        """
+        if outcome.changed is not None:
+            return outcome.changed
+        if self.workspace is None or before is None:
+            return None
+        return self.workspace.fingerprint() != before
+
     def execute(self, job: Job) -> tuple[str, str]:
         """Run the session, then earn a verdict. Never returns the session's own opinion."""
-        before = self.workspace.fingerprint()
+        before = None if self.workspace is None else self.workspace.fingerprint()
 
         try:
             outcome = self.session.run(self.brief.for_job(job), job=job)
@@ -161,7 +223,19 @@ class AgentTaskExecutor:
             # the most dangerous PASS available, and asking the gate first would produce exactly it.
             return INCONCLUSIVE, _context('the session did not complete', outcome)
 
-        if self.workspace.fingerprint() == before:
+        changed = self._did_anything_change(before, outcome)
+        if changed is None:
+            # A THIRD ANSWER, and it must not collapse into "no". The session ran somewhere this
+            # process cannot observe and the transport reported nothing, so this is an absence of
+            # evidence rather than evidence of absence -- and scoring it either way is a guard
+            # voting on a subject it cannot see.
+            return INCONCLUSIVE, _context(
+                'nobody can say whether this session changed anything: it ran somewhere this '
+                'process cannot observe and the transport did not report a change. That is an '
+                'absence of evidence, NOT evidence of absence',
+                outcome,
+            )
+        if not changed:
             return INCONCLUSIVE, _context(
                 'the session changed nothing; a tree it did not touch being green is not evidence about this task',
                 outcome,

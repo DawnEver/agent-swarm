@@ -441,6 +441,13 @@ class ForgeStore:
         title = self._item_title(job)
         number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
         self._item_numbers[title] = number
+        # THE INDEX IS WRITTEN HERE OR IT IS NEVER WRITTEN USEFULLY. The submitter is the only
+        # creator, so this is the one moment the number is known for free -- and it was missing:
+        # the index could previously only be warmed by a lookup that had ALREADY paid for the list
+        # read, so it never saved the read it exists to save. Measured before the fix, a "warm"
+        # index cost 5060 ms against 4627 ms with no index at all, because every lookup still fell
+        # through to the list. That is the assumption-not-measurement trap in one number.
+        self._remember(job, number)
         return number
 
     def _item_number(self, job: Job, *, create: bool = False) -> int | NotVisible:
