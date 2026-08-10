@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +40,39 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 _HTTP_TIMEOUT = 60.0
+
+#: How many times an API call is attempted in total. USER DIRECTIVE 2026-08-10:
+#: 「所有 gitea 操作都要重试 3 次」.
+#:
+#: WHAT IS **NOT** RETRIED, because that is where the decisions are:
+#:
+#: * **A 4xx.** A 401 retried three times is still a 401. Retrying costs three backoffs and makes a
+#:   PERMANENT condition look transient, which is the reading that sends someone hunting for a flake
+#:   instead of reissuing a token. Measured 2026-08-10: the stored Gitea credential stopped being
+#:   accepted mid-session and every call returned 401 -- exactly the shape a blanket retry hides.
+#:
+#: WHAT IS RETRIED AND WHAT IT COSTS: 5xx and connection failures, including POST. A create whose
+#: response was lost is indistinguishable from one that never arrived, so retrying it is the whole
+#: point -- and the price is that a create which SUCCEEDED can be issued twice. That duplicate is
+#: ACCEPTED, not prevented: work items resolve by lowest number, claims by lowest comment id, and
+#: `ForgeStore.reconcile_duplicates` retires the losers off the hot path. A retry that refused POST
+#: would be useless for exactly the calls that matter; a retry that claimed it could not duplicate
+#: would be a declaration that lies.
+API_ATTEMPTS = 3
+
+#: Seconds of backoff, multiplied by the attempt number. Immediate retries against a struggling
+#: server are three requests, not one retry.
+_BACKOFF_S = 1.0
+
+#: Indirected so a test can assert the BOUND without paying it. Patched by name, never passed in:
+#: a sleep argument would let a caller set it to zero in production.
+_sleep = time.sleep
+
+
+def _is_retryable_status(code: int) -> bool:
+    """5xx yes, 4xx no. Stated as a function so the rule has one definition and a test can call it."""
+    return code >= 500
+
 
 #: This project's forge. It lives in the VENDOR module, not in the store: a default is a choice of
 #: vendor, and a store holding one would name a vendor in the one file that must not.
@@ -329,19 +363,39 @@ class GiteaForge:
         return found
 
     def _api(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(f'{self.base_url}/api/v1{path}', data=data, method=method)
-        request.add_header('Authorization', f'token {self._credential()}')
-        request.add_header('Content-Type', 'application/json')
-        try:
-            with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            # The RESPONSE body is echoed because a refusal explains itself there. The REQUEST is
-            # never echoed: it carries the credential header.
-            msg = f'{method} {path} -> {exc.code}: {exc.read().decode(errors="replace")[:400]}'
-            raise ForgeError(msg) from None
-        return json.loads(raw) if raw else None
+        """One API call, retried per `API_ATTEMPTS`. See that constant for what is NOT retried.
+
+        A NEW REQUEST OBJECT PER ATTEMPT, deliberately: a `Request` carries its body as a consumed
+        stream and its headers include the credential, so reusing one across attempts is both
+        fragile and a second lifetime for the token.
+        """
+        last: ForgeError | None = None
+        for attempt in range(1, API_ATTEMPTS + 1):
+            data = json.dumps(body).encode() if body is not None else None
+            request = urllib.request.Request(f'{self.base_url}/api/v1{path}', data=data, method=method)
+            request.add_header('Authorization', f'token {self._credential()}')
+            request.add_header('Content-Type', 'application/json')
+            try:
+                with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:
+                    raw = response.read()
+            except urllib.error.HTTPError as exc:
+                # The RESPONSE body is echoed because a refusal explains itself there. The REQUEST
+                # is never echoed: it carries the credential header.
+                detail = exc.read().decode(errors='replace')[:400]
+                msg = f'{method} {path} -> {exc.code}: {detail}'
+                if not _is_retryable_status(exc.code):
+                    raise ForgeError(msg) from None
+                last = ForgeError(msg)
+            except urllib.error.URLError as exc:
+                # No response at all. Indistinguishable, from here, from a request that ARRIVED and
+                # whose response was lost -- which is why a retried create can duplicate.
+                last = ForgeError(f'{method} {path} -> unreachable: {exc.reason}')
+            else:
+                return json.loads(raw) if raw else None
+            if attempt < API_ATTEMPTS:
+                _sleep(_BACKOFF_S * attempt)
+        msg = f'{last} (gave up after {API_ATTEMPTS} attempts)'
+        raise ForgeError(msg)
 
     def _credential(self) -> str:
         """The API token, from `git credential fill`, held in memory only.
