@@ -355,7 +355,9 @@ class ForgeStore:
             and `purge_namespace` cannot reach outside it.
         forge: the storage/UI backend. REQUIRED, and deliberately not defaulted -- a default is a
             choice of vendor, and this module is the one that must not make one. Callers take
-            `forge.default_forge()`.
+            `forge.default_forge(role)`, and THE ROLE IS NOT OPTIONAL THERE EITHER: four
+            credentials share one host, and which one a process holds is the only thing separating
+            the roles, since Gitea has no scope for commit status.
         lease_seconds: how long a claim survives without a release. MUST BE POSITIVE: a zero lease
             expires the claim being made, so every runner would refuse and the job would never run.
 
