@@ -631,12 +631,13 @@ class ForgeStore:
             msg = f'a {Role.RUNNER.value} store may not register work items; submitting is not its job'
             raise PermissionError(msg)
         title = self._item_title(job)
-        number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
-        # HANDED OVER AT BIRTH: the swarm creating work for itself needs no human in the
-        # loop. A create that succeeds and a label that fails leaves an item nobody picks up
-        # -- visible and inert, which is the safe direction; the opposite order would leave
-        # a label on nothing.
-        self.forge.add_label(number, READY_LABEL)
+        # HANDED OVER AT BIRTH, IN ONE CALL. A separate `add_label` cost a second round trip per
+        # registered job -- measured at 2.0 calls per job against a create-only 1.0, i.e. half the
+        # registration throughput spent on a label -- and it left a window in which the item existed
+        # WITHOUT the label that makes it claimable.
+        number = self.forge.create_work_item(
+            title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL]
+        )
         self._item_numbers[title] = number
         for requested in sorted(set(requests)):
             if not requested:
@@ -723,8 +724,9 @@ class ForgeStore:
             # NO RE-READ. The creation response is authoritative and fresh on every forge, and
             # asking the list to confirm what we just made is the `created-blind` failure: measured
             # on GitHub, the re-read did not return the reader's OWN issue 24 of 24 times.
-            mine = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`')
-            self.forge.add_label(mine, READY_LABEL)  # see `register`: handed over at birth
+            mine = self.forge.create_work_item(
+                title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL]
+            )
             self._item_numbers[title] = mine
             self._remember(job, mine)
             return mine

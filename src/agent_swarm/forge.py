@@ -29,6 +29,8 @@ prove this by measurement before it is written.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import json
 import os
 import subprocess
@@ -170,7 +172,21 @@ class Forge(Protocol):
         """
         ...
 
-    def create_work_item(self, *, title: str, body: str) -> int: ...
+    def create_work_item(self, *, title: str, body: str, labels: Sequence[str] = ()) -> int:
+        """Create an item, with its labels applied IN THE SAME CALL.
+
+        `labels` is not a convenience. Applying them afterwards costs a second round trip per item,
+        and item creation is the write path the whole fleet shares -- MEASURED at 2.0 calls per
+        registered job before this parameter existed, against a create-only cost of 1.0. At the
+        aggregate write rate this deployment sustains, that is half the registration throughput
+        spent on a label.
+
+        It also removes a window: between a create and a separate label call the item exists WITHOUT
+        the label that makes it claimable, so a sweep landing in between sees work nobody handed
+        over. Harmless today because the sweep simply skips it, but only by luck of which direction
+        the missing label points.
+        """
+        ...
 
     def add_comment(self, number: int, body: str) -> int:
         """Post a comment, returning the SERVER-ASSIGNED id.
@@ -317,8 +333,14 @@ class GiteaForge:
             raise
         return WorkItem(number=raw['number'], title=raw['title'], state=raw['state'])
 
-    def create_work_item(self, *, title: str, body: str) -> int:
-        return self._api('POST', f'/repos/{self.repo}/issues', {'title': title, 'body': body})['number']
+    def create_work_item(self, *, title: str, body: str, labels: Sequence[str] = ()) -> int:
+        """One POST. Label IDS are a Gitea concept that stops at this boundary, so names are
+        resolved here -- and `_label_id` caches, so the resolution is paid once per process rather
+        than once per item."""
+        payload: dict[str, Any] = {'title': title, 'body': body}
+        if labels:
+            payload['labels'] = [self._label_id(name) for name in labels]
+        return self._api('POST', f'/repos/{self.repo}/issues', payload)['number']
 
     def add_comment(self, number: int, body: str) -> int:
         return self._api('POST', f'/repos/{self.repo}/issues/{number}/comments', {'body': body})['id']
@@ -609,8 +631,8 @@ class GitHubForge:
     def work_item(self, number: int) -> WorkItem | None:
         raise self._unmeasured('work_item')
 
-    def create_work_item(self, *, title: str, body: str) -> int:
-        raise self._unmeasured('create_work_item')
+    def create_work_item(self, *, title: str, body: str, labels: Sequence[str] = ()) -> int:
+        raise self._unmeasured(f'create_work_item(labels={list(labels)})')
 
     def add_comment(self, number: int, body: str) -> int:
         raise self._unmeasured('add_comment')

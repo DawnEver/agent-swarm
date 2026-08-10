@@ -27,6 +27,8 @@ VERSIONED, and the version is not decoration -- see :data:`DOUBLE_MODEL_VERSION`
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import threading
 
 from agent_swarm.forge import STATUS_STATES, Comment, CommentGone, ForgeError, WorkItem
@@ -124,13 +126,20 @@ class RecordingForge:
         with self._lock:
             return self.items.get(number)
 
-    def create_work_item(self, *, title: str, body: str) -> int:
+    def create_work_item(self, *, title: str, body: str, labels: Sequence[str] = ()) -> int:
+        # Ids resolved BEFORE the lock: `label_id` takes it too, and the real client also resolves
+        # them before its single POST.
+        resolved = [(self.label_id(name), name) for name in labels]
         with self._lock:
             number = len(self.items) + 1
             self.items[number] = WorkItem(number=number, title=title, state='open')
             self.bodies[number] = body
             self._comments[number] = []
-            self.item_labels[number] = []
+            # SET DIRECTLY, not via `add_label`: that would re-enter `self._lock`, and it would
+            # also model two operations where the real client now performs one -- a double that
+            # needs two calls to do what the client does in one would hide exactly the write
+            # amplification this parameter was added to remove.
+            self.item_labels[number] = resolved
             return number
 
     def add_comment(self, number: int, body: str) -> int:

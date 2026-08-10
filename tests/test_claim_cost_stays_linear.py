@@ -113,3 +113,36 @@ def test_the_counter_actually_counts():
     methods, every assertion above would pass by counting zero."""
     calls, _ = _contend(8)
     assert calls > 0
+
+
+# ---------------------------------------------------------------------------
+# WRITE AMPLIFICATION. The other measurable-without-a-network axis, and the one
+# I regressed myself.
+
+
+def _register_cost(n: int) -> float:
+    forge = _Counting()
+    store = ForgeStore('bench', forge, role=Role.SUBMITTER)
+    forge.calls = 0
+    for i in range(n):
+        store.register(Job(id=f'g/j{i}', kind=TEST_RUN))
+    return forge.calls / n
+
+
+@pytest.mark.parametrize('n', [1, 10, 50])
+def test_registering_a_job_costs_ONE_round_trip(n: int):
+    """MEASURED AND REGRESSED BY ME. Adding the handover label as a separate `add_label` took
+    registration from 1.0 calls per job to 2.0 -- at the aggregate write rate this deployment
+    sustains, half the registration throughput spent on a label, on the write path the whole fleet
+    shares. Folding it into the create payload put it back to 1.0.
+
+    The bar is exactly 1.0, not "small": any second call here is a doubling, and a bound of 2 would
+    accept the regression this test exists to have caught.
+    """
+    assert _register_cost(n) == 1.0, 'registration costs more than one round trip per job'
+
+
+def test_the_write_cost_does_not_grow_with_the_number_registered():
+    """A per-job constant, not an amortised average: a cache that helps only after the first item
+    would still make the hundredth agent's registration cheap and the first fleet's expensive."""
+    assert _register_cost(1) == _register_cost(50)

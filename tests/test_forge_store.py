@@ -582,8 +582,11 @@ class StaleListForge:
             if now - self.created_at.get(item.number, 0.0) >= self.staleness
         ]
 
-    def create_work_item(self, *, title: str, body: str) -> int:
-        number = self.inner.create_work_item(title=title, body=body)
+    def create_work_item(self, *, title: str, body: str, **kwargs) -> int:
+        # FORWARDED, not dropped. A wrapper that quietly discards `labels` is a double better
+        # behaved than reality in the direction that hides a bug: the item would come back
+        # unlabelled and every handover assertion would be testing the wrapper.
+        number = self.inner.create_work_item(title=title, body=body, **kwargs)
         self.created_at[number] = time.monotonic()
         return number
 
