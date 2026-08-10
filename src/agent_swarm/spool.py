@@ -340,6 +340,47 @@ class Spool:
         return [entry for entry in self.pending() if entry.age(now=moment) > self.stale_after_seconds]
 
 
+class SpooledStore:
+    """A `Store` whose VERDICTS land on disk first. THE ADAPTER THAT MADE THE SPOOL REACHABLE.
+
+    The spool was built so that a 25-minute gate cannot produce nothing when a POST fails -- and
+    nothing connected it to the code that actually records verdicts. `loop.run_one` writes straight
+    to whatever `Store` it is handed, so the durability work was real, tested, and on no path any
+    runner took. This closes that, and the gap is worth naming because it is the shape a
+    fully-tested system fails in: every part correct, one wire absent.
+
+    CLAIMS PASS STRAIGHT THROUGH, deliberately. A claim is a mutual-exclusion lease that must be
+    visible to the whole FLEET, so buffering it locally would be actively wrong -- a second runner
+    would read the job as unclaimed and take it. Only the verdict is buffered, because a verdict is
+    an answer this box already knows and the forge does not yet.
+
+    `verdict` READS THROUGH TO THE FORGE, never from the spool. A pending entry means "not published
+    yet", and answering from it would report a job as answered to a fleet that cannot see it -- the
+    board would show green for something no other box could confirm. The spool is a write buffer,
+    not a cache, and that asymmetry is the whole reason the failure direction stays safe.
+    """
+
+    def __init__(self, inner: ForgeStore, spool: Spool) -> None:
+        self.inner = inner
+        self.spool = spool
+
+    def try_claim(self, job: Job, *, owner: str) -> bool:
+        return self.inner.try_claim(job, owner=owner)
+
+    def claim_owner(self, job: Job) -> str | None:
+        return self.inner.claim_owner(job)
+
+    def release(self, job: Job, *, owner: str) -> None:
+        self.inner.release(job, owner=owner)
+
+    def record_verdict(self, job: Job, *, verdict: str, detail: str) -> None:
+        """Durable before this returns. Publication is `Spool.drain`'s job, and a later one."""
+        self.spool.record(job, verdict=verdict, detail=detail)
+
+    def verdict(self, job: Job) -> str | None:
+        return self.inner.verdict(job)
+
+
 class ForgePublisher:
     """Publishes spooled verdicts through a `ForgeStore`, idempotently.
 
