@@ -36,7 +36,7 @@ from pathlib import Path
 import pytest
 
 from agent_swarm import forge_store as forge_store_module
-from agent_swarm.forge import Comment, CommentGone, Forge, ForgeError, GiteaForge, WorkItem, default_forge
+from agent_swarm.forge import CommentGone, Forge, ForgeError, GiteaForge, WorkItem, default_forge
 from agent_swarm.forge_store import (
     NOT_VISIBLE,
     VERDICT_LABELS,
@@ -49,6 +49,7 @@ from agent_swarm.forge_store import (
 )
 from agent_swarm.job import TEST_RUN, Job, JobKind
 from agent_swarm.store import VERDICTS, Store
+from agent_swarm.testing import DOUBLE_MODEL_VERSION, RecordingForge
 
 # Imported under private names ON PURPOSE: a name starting with `Test` is COLLECTED wherever it is
 # bound, so importing them plainly would re-run the in-memory suite here -- against a `store`
@@ -95,205 +96,11 @@ def _race_one_round(namespace: str, job: Job, *, racers: int) -> list[str]:
     return winners
 
 
-class RecordingForge:
-    """An in-memory `Forge` that MODELS THE PRECONDITION, and says so.
-
-    It assigns comment ids from a single counter under a lock -- server-assigned, monotonic, unique
-    -- and every read sees every completed write. Those are precisely the two properties the claim
-    protocol requires of a deployment, and they are here by CONSTRUCTION.
-
-    So: a green run against this forge is evidence that `ForgeStore`'s arbitration is correct. It is
-    NOT evidence that any real forge has these properties, and no amount of it ever will be. That is
-    what the `live_forge` tests are for, and why they were measured before this was written.
-
-    It is not a mock of the code under test -- the store's logic runs unmodified against it -- and
-    it is a second genuine backend, which is what makes the vendor-neutrality claim checkable.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._next_id = 1
-        self.items: dict[int, WorkItem] = {}
-        self.bodies: dict[int, str] = {}
-        self._comments: dict[int, list[Comment]] = {}
-        # LABELS ARE (id, name) PAIRS, and the id is what a real removal targets.
-        #
-        # This double used to key labels by NAME, which made it gentler than reality on exactly the
-        # axis reality has already been MEASURED to differ: `POST /labels` accepted twelve identical
-        # names from twelve concurrent racers on this Gitea, so a name maps to a LIST of ids. A
-        # name-keyed double cannot express a duplicate at all, so every test written through it
-        # agreed that removal by name removes everything -- which is what `remove_label` does here
-        # and is NOT what the vendor does.
-        self.item_labels: dict[int, list[tuple[int, str]]] = {}
-        #: Repo-level label definitions: name -> the ids sharing it. Non-unique BY MEASUREMENT.
-        self.repo_labels: dict[str, list[int]] = {}
-        self._next_label_id = 1000
-        self.retired: list[int] = []
-
-    def list_work_items(self) -> list[WorkItem]:
-        """DETERMINISTICALLY SCRAMBLED. Neither first nor last correlates with the number.
-
-        A real forge promises no ordering on a list endpoint -- Gitea and GitHub both default to
-        recently-updated first, and either may change -- so a double that returns a MEANINGFUL order
-        is better behaved than reality, and every ordering rule tested through it is really testing
-        the double.
-
-        This has now cost two holes, and the second is the more instructive:
-
-        * **Insertion order** made "first match" and "LOWEST-numbered match" the same function, so
-          `_lowest_numbered`'s tie-break was untestable.
-        * Fixing that by REVERSING made "first match" and "HIGHEST-numbered match" the same
-          function, so `newest_open`'s rule was untestable. **The fix relocated the hole rather than
-          closing it**, which is this suite's own law about elimination fixes, firing on the repair
-          for the previous instance of that law.
-
-        The order here is a ROTATION by half the list, which for three or more items puts neither
-        the lowest nor the highest number first -- so it is adverse to both `min` and `max` at once,
-        by construction rather than by luck. A digest-based scramble was tried first and is worse:
-        deterministic, but whether it happens to lead with the maximum is a property of the
-        particular numbers, so it discriminated `min` and not `max`. **Fewer than three items cannot
-        discriminate either way** -- with two, "first" IS one of min and max -- which is why the
-        crashed-supersede case is also tested at six.
-
-        Not `random.shuffle` and not `hash()`: an intermittent double fails intermittently, which
-        reads as flakiness and gets retried away, and `hash()` is salted per process.
-        """
-        with self._lock:
-            items = list(self.items.values())
-        half = len(items) // 2
-        return items[half:] + items[:half]
-
-    def work_item(self, number: int) -> WorkItem | None:
-        """BY NUMBER, and therefore fresh even in `StaleListForge` -- which is the measured shape."""
-        with self._lock:
-            return self.items.get(number)
-
-    def create_work_item(self, *, title: str, body: str) -> int:
-        with self._lock:
-            number = len(self.items) + 1
-            self.items[number] = WorkItem(number=number, title=title, state='open')
-            self.bodies[number] = body
-            self._comments[number] = []
-            self.item_labels[number] = []
-            return number
-
-    def add_comment(self, number: int, body: str) -> int:
-        with self._lock:
-            # THE COUNTER IS THE POINT. A per-issue index, or a timestamp, would not be a
-            # server-assigned monotonic key and the store's arbitration would be untested.
-            comment_id = self._next_id
-            self._next_id += 1
-            self._comments[number].append(Comment(id=comment_id, body=body))
-            return comment_id
-
-    def comments(self, number: int) -> list[Comment]:
-        with self._lock:
-            return list(self._comments[number])
-
-    def update_comment(self, number: int, comment_id: int, body: str) -> None:
-        with self._lock:
-            existing = self._comments[number]
-            if not any(c.id == comment_id for c in existing):
-                # THE DOUBLE MUST BE AS UNFORGIVING AS THE FORGE HERE. Gitea answers 404 for an edit
-                # of a pruned comment, and a fake that silently no-op'd would let a runner believe
-                # it had beaten -- the exact failure the distinction exists to prevent.
-                msg = f'comment {comment_id} on item {number} no longer exists; re-create it'
-                raise CommentGone(msg)
-            self._comments[number] = [Comment(id=c.id, body=body) if c.id == comment_id else c for c in existing]
-
-    def delete_comment(self, number: int, comment_id: int) -> None:
-        with self._lock:
-            self._comments[number] = [c for c in self._comments[number] if c.id != comment_id]
-
-    def labels(self, number: int) -> list[str]:
-        """NAMES, because that is what the `Forge` protocol promises. Ids stop at this boundary --
-        and the fact that a name can appear TWICE in this list is the whole point of the change."""
-        with self._lock:
-            return [name for _id, name in self.item_labels[number]]
-
-    def label_id(self, name: str) -> int:
-        """The LOWEST id for `name`, created if absent -- `GiteaForge._label_id`'s rule.
-
-        Mirrored deliberately rather than simplified: it is the rule that makes every runner
-        converge on one id without coordinating, and a double that picked differently would make
-        the store's convergence untestable.
-        """
-        with self._lock:
-            ids = self.repo_labels.get(name)
-            if not ids:
-                self._next_label_id += 1
-                self.repo_labels[name] = [self._next_label_id]
-                return self._next_label_id
-            return min(ids)
-
-    def define_duplicate_label(self, name: str) -> int:
-        """Create a SECOND repo label with an existing name and a higher id, and return it.
-
-        NOT PART OF THE `Forge` PROTOCOL. It reproduces a state the vendor reaches and our code
-        cannot: a losing racer's label, a human adding one in the web UI, an older client. Twelve
-        of these were created on the real server in the CAS measurement, so this is reproduction,
-        not invention.
-        """
-        with self._lock:
-            self._next_label_id += 1
-            self.repo_labels.setdefault(name, []).append(self._next_label_id)
-            return self._next_label_id
-
-    def attach_label_id(self, number: int, label_id: int, name: str) -> None:
-        """Attach a SPECIFIC label id. The escape hatch for planting the duplicate above."""
-        with self._lock:
-            self.item_labels[number].append((label_id, name))
-
-    def add_label(self, number: int, name: str) -> None:
-        label_id = self.label_id(name)
-        with self._lock:
-            self.item_labels[number].append((label_id, name))
-
-    def remove_label(self, number: int, name: str) -> None:
-        """Detaches EVERY id sharing this name -- mirroring `GiteaForge.remove_label`.
-
-        Until 2026-08-10 both this and the vendor wrapper removed only the ONE id `_label_id`
-        converges on, so a same-named label attached under a higher id survived and left an item
-        carrying two verdicts at once. The double could not express that at all while it keyed
-        labels by name, which is why the bug lived behind a green suite.
-        """
-        with self._lock:
-            ids = set(self.repo_labels.get(name, []))
-            self.item_labels[number] = [(i, n) for i, n in self.item_labels[number] if i not in ids]
-
-    def close_work_item(self, number: int) -> None:
-        with self._lock:
-            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='closed')
-
-    def reopen_work_item(self, number: int) -> None:
-        """NOT part of the `Forge` protocol -- deliberately.
-
-        Reopening is something a HUMAN does in the web UI, or a retry policy that lives above this
-        layer; no code here needs to do it, and adding it to the protocol would oblige every
-        backend to implement an operation nobody calls. This double grows it because a double's job
-        is to reproduce states the real world can reach, not only the ones our code writes.
-        """
-        with self._lock:
-            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='open')
-
-    def state(self, number: int) -> str:
-        with self._lock:
-            return self.items[number].state
-
-    def retire_work_item(self, number: int) -> None:
-        """Closes AND retitles, because a retired item must stop matching its title.
-
-        The fake used only to close, which made it gentler than every real forge: retired items went
-        on answering title lookups, so `reconcile_duplicates` would have retired the same ones
-        forever and the test that counts survivors could never pass. Exactly the audit question from
-        the double note -- is this double better-behaved than reality, and does the difference hide
-        a failure class -- caught here by the sweep rather than in production.
-        """
-        self.retired.append(number)
-        with self._lock:
-            current = self.items[number]
-            suffix = '' if current.title.endswith(' (retired)') else ' (retired)'
-            self.items[number] = WorkItem(number=number, title=f'{current.title}{suffix}', state='closed')
+# `RecordingForge` MOVED INTO THE PACKAGE (`agent_swarm.testing`) rather than being copied there.
+# A consumer that wrote its own would be a second implementation of one contract, starting with
+# none of the three hardenings this one was corrected into having. Imported above; the tests that
+# PIN its model live below, and they stay here because they are about this double, not about a
+# consumer of it.
 
 
 @pytest.fixture
@@ -1540,3 +1347,52 @@ class TestADuplicateLabelCannotProduceTwoVerdictsAtOnce:
         memory_store.record_verdict(job, verdict='PASS', detail='green on the retry')
 
         assert memory_store.verdict(job) == 'PASS'
+
+
+class TestTheSHIPPEDDoubleDeclaresItsModel:
+    """`DOUBLE_MODEL_VERSION` exists so a STALE PIN reds instead of quietly agreeing.
+
+    THE TRAP IT CLOSES, and it is the wrong-tree family in its hardest-to-see form. A downstream
+    repo imports this double from a PINNED `agent_swarm`, not from this working tree. So a hardening
+    added here does not reach that repo's tests until the pin moves -- and the failure is silent and
+    in the bad direction: **the consumer's suite passes against an older, gentler double while this
+    repo's suite passes against the newer one.** Two repos, one contract, two versions of the
+    instrument, both green.
+
+    The first two forms of this family were about SOURCE -- a suite green about the wrong tree, a
+    mutation sweep red about the wrong tree. This one is about a DEPENDENCY, which is harder to see
+    because nothing in either repo looks wrong.
+
+    A consumer asserts this constant against the minimum it needs. That is the whole mechanism:
+    cheap, and it fails loudly at the version rather than subtly at a behaviour.
+    """
+
+    def test_the_version_is_declared(self):
+        assert isinstance(DOUBLE_MODEL_VERSION, int)
+        assert DOUBLE_MODEL_VERSION >= 3, 'three hardenings are paid for; the version cannot go below them'
+
+    def test_the_version_covers_the_THREE_hardenings(self, recording_forge):
+        """Named individually, so bumping the number without adding a property is visible.
+
+        Each of these was an assertion of impossibility that measurement refuted, and each is the
+        reason a consumer must not write its own double instead of importing this one.
+        """
+        # 1. label identity is (id, name), and a name maps to several ids
+        number = recording_forge.create_work_item(title='t', body='b')
+        recording_forge.add_label(number, 'verdict:pass')
+        stray = recording_forge.define_duplicate_label('verdict:pass')
+        recording_forge.attach_label_id(number, stray, 'verdict:pass')
+        assert recording_forge.labels(number) == ['verdict:pass', 'verdict:pass']
+
+        # 2. removal detaches EVERY id sharing the name
+        recording_forge.remove_label(number, 'verdict:pass')
+        assert recording_forge.labels(number) == []
+
+        # 3. list order leads with neither the lowest nor the highest number
+        for _ in range(5):
+            recording_forge.create_work_item(title='x', body='b')
+        numbers = [i.number for i in recording_forge.list_work_items()]
+        assert numbers[0] not in (min(numbers), max(numbers)), (
+            'the double leads with an extreme, so "first match" and one of min/max are the same '
+            'function again -- the defect this ordering exists to make impossible'
+        )

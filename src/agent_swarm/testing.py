@@ -1,0 +1,244 @@
+"""Test doubles that are SHIPPED, because they carry measured properties worth reusing.
+
+WHY THIS IS IN THE PACKAGE AND NOT IN `tests/`. A consumer needing an in-memory forge would
+otherwise write a second one -- a second implementation of one contract, by someone with failing
+tests and every incentive to make them pass. That is the "two implementations, only one covered"
+defect this package found in `remove_label` on 2026-08-10, recreated deliberately.
+
+AND THE NEW ONE WOULD START WITH NONE OF THE HARDENINGS BELOW, each of which was paid for by being
+wrong first:
+
+* **List order is adversarial by construction.** Insertion order made "first match" and
+  "lowest-numbered match" the same function, hiding a tie-break defect. Reversing it made "first"
+  and "highest" the same function, hiding the next one -- the fix relocated the hole. Rotate-by-half
+  leads with neither extreme for three or more items.
+* **A label is `(id, name)` and a name maps to SEVERAL ids.** `POST /labels` accepted twelve
+  identical names from twelve racers on the measured deployment, so a name-keyed double asserts an
+  impossibility. `remove_label` detaching one id left items carrying two verdicts at once.
+* **The model is PINNED by tests**, because collapsing `labels()` back to a set made every test pass
+  again with the modelled reality gone.
+
+A double that cannot represent a failure is not a neutral simplification; it is an assertion that
+the failure is impossible. These three were all such assertions, and all three were refuted by
+measurement against the real server.
+
+VERSIONED, and the version is not decoration -- see :data:`DOUBLE_MODEL_VERSION`.
+"""
+
+from __future__ import annotations
+
+import threading
+
+from agent_swarm.forge import Comment, CommentGone, WorkItem
+
+#: Bumped whenever this double's MODEL of the forge changes -- a new adverse property, a corrected
+#: identity, a refuted simplification.
+#:
+#: WHY A CONSUMER SHOULD ASSERT IT. A downstream repo imports this from a PINNED `agent_swarm`, not
+#: from this working tree, so a hardening added here does not reach that repo's tests until the pin
+#: moves. The failure is quiet and it is the bad direction: the consumer's suite passes against an
+#: older, gentler double while this repo's suite passes against the newer one -- two repos, one
+#: contract, two versions of the instrument. Asserting this constant makes a stale pin RED instead
+#: of quietly agreeable.
+DOUBLE_MODEL_VERSION = 3
+
+
+class RecordingForge:
+    """An in-memory `Forge` that MODELS THE PRECONDITION, and says so.
+
+    It assigns comment ids from a single counter under a lock -- server-assigned, monotonic, unique
+    -- and every read sees every completed write. Those are precisely the two properties the claim
+    protocol requires of a deployment, and they are here by CONSTRUCTION.
+
+    So: a green run against this forge is evidence that `ForgeStore`'s arbitration is correct. It is
+    NOT evidence that any real forge has these properties, and no amount of it ever will be. That is
+    what the `live_forge` tests are for, and why they were measured before this was written.
+
+    It is not a mock of the code under test -- the store's logic runs unmodified against it -- and
+    it is a second genuine backend, which is what makes the vendor-neutrality claim checkable.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_id = 1
+        self.items: dict[int, WorkItem] = {}
+        self.bodies: dict[int, str] = {}
+        self._comments: dict[int, list[Comment]] = {}
+        # LABELS ARE (id, name) PAIRS, and the id is what a real removal targets.
+        #
+        # This double used to key labels by NAME, which made it gentler than reality on exactly the
+        # axis reality has already been MEASURED to differ: `POST /labels` accepted twelve identical
+        # names from twelve concurrent racers on this Gitea, so a name maps to a LIST of ids. A
+        # name-keyed double cannot express a duplicate at all, so every test written through it
+        # agreed that removal by name removes everything -- which is what `remove_label` does here
+        # and is NOT what the vendor does.
+        self.item_labels: dict[int, list[tuple[int, str]]] = {}
+        #: Repo-level label definitions: name -> the ids sharing it. Non-unique BY MEASUREMENT.
+        self.repo_labels: dict[str, list[int]] = {}
+        self._next_label_id = 1000
+        self.retired: list[int] = []
+
+    def list_work_items(self) -> list[WorkItem]:
+        """DETERMINISTICALLY SCRAMBLED. Neither first nor last correlates with the number.
+
+        A real forge promises no ordering on a list endpoint -- Gitea and GitHub both default to
+        recently-updated first, and either may change -- so a double that returns a MEANINGFUL order
+        is better behaved than reality, and every ordering rule tested through it is really testing
+        the double.
+
+        This has now cost two holes, and the second is the more instructive:
+
+        * **Insertion order** made "first match" and "LOWEST-numbered match" the same function, so
+          `_lowest_numbered`'s tie-break was untestable.
+        * Fixing that by REVERSING made "first match" and "HIGHEST-numbered match" the same
+          function, so `newest_open`'s rule was untestable. **The fix relocated the hole rather than
+          closing it**, which is this suite's own law about elimination fixes, firing on the repair
+          for the previous instance of that law.
+
+        The order here is a ROTATION by half the list, which for three or more items puts neither
+        the lowest nor the highest number first -- so it is adverse to both `min` and `max` at once,
+        by construction rather than by luck. A digest-based scramble was tried first and is worse:
+        deterministic, but whether it happens to lead with the maximum is a property of the
+        particular numbers, so it discriminated `min` and not `max`. **Fewer than three items cannot
+        discriminate either way** -- with two, "first" IS one of min and max -- which is why the
+        crashed-supersede case is also tested at six.
+
+        Not `random.shuffle` and not `hash()`: an intermittent double fails intermittently, which
+        reads as flakiness and gets retried away, and `hash()` is salted per process.
+        """
+        with self._lock:
+            items = list(self.items.values())
+        half = len(items) // 2
+        return items[half:] + items[:half]
+
+    def work_item(self, number: int) -> WorkItem | None:
+        """BY NUMBER, and therefore fresh even in `StaleListForge` -- which is the measured shape."""
+        with self._lock:
+            return self.items.get(number)
+
+    def create_work_item(self, *, title: str, body: str) -> int:
+        with self._lock:
+            number = len(self.items) + 1
+            self.items[number] = WorkItem(number=number, title=title, state='open')
+            self.bodies[number] = body
+            self._comments[number] = []
+            self.item_labels[number] = []
+            return number
+
+    def add_comment(self, number: int, body: str) -> int:
+        with self._lock:
+            # THE COUNTER IS THE POINT. A per-issue index, or a timestamp, would not be a
+            # server-assigned monotonic key and the store's arbitration would be untested.
+            comment_id = self._next_id
+            self._next_id += 1
+            self._comments[number].append(Comment(id=comment_id, body=body))
+            return comment_id
+
+    def comments(self, number: int) -> list[Comment]:
+        with self._lock:
+            return list(self._comments[number])
+
+    def update_comment(self, number: int, comment_id: int, body: str) -> None:
+        with self._lock:
+            existing = self._comments[number]
+            if not any(c.id == comment_id for c in existing):
+                # THE DOUBLE MUST BE AS UNFORGIVING AS THE FORGE HERE. Gitea answers 404 for an edit
+                # of a pruned comment, and a fake that silently no-op'd would let a runner believe
+                # it had beaten -- the exact failure the distinction exists to prevent.
+                msg = f'comment {comment_id} on item {number} no longer exists; re-create it'
+                raise CommentGone(msg)
+            self._comments[number] = [Comment(id=c.id, body=body) if c.id == comment_id else c for c in existing]
+
+    def delete_comment(self, number: int, comment_id: int) -> None:
+        with self._lock:
+            self._comments[number] = [c for c in self._comments[number] if c.id != comment_id]
+
+    def labels(self, number: int) -> list[str]:
+        """NAMES, because that is what the `Forge` protocol promises. Ids stop at this boundary --
+        and the fact that a name can appear TWICE in this list is the whole point of the change."""
+        with self._lock:
+            return [name for _id, name in self.item_labels[number]]
+
+    def label_id(self, name: str) -> int:
+        """The LOWEST id for `name`, created if absent -- `GiteaForge._label_id`'s rule.
+
+        Mirrored deliberately rather than simplified: it is the rule that makes every runner
+        converge on one id without coordinating, and a double that picked differently would make
+        the store's convergence untestable.
+        """
+        with self._lock:
+            ids = self.repo_labels.get(name)
+            if not ids:
+                self._next_label_id += 1
+                self.repo_labels[name] = [self._next_label_id]
+                return self._next_label_id
+            return min(ids)
+
+    def define_duplicate_label(self, name: str) -> int:
+        """Create a SECOND repo label with an existing name and a higher id, and return it.
+
+        NOT PART OF THE `Forge` PROTOCOL. It reproduces a state the vendor reaches and our code
+        cannot: a losing racer's label, a human adding one in the web UI, an older client. Twelve
+        of these were created on the real server in the CAS measurement, so this is reproduction,
+        not invention.
+        """
+        with self._lock:
+            self._next_label_id += 1
+            self.repo_labels.setdefault(name, []).append(self._next_label_id)
+            return self._next_label_id
+
+    def attach_label_id(self, number: int, label_id: int, name: str) -> None:
+        """Attach a SPECIFIC label id. The escape hatch for planting the duplicate above."""
+        with self._lock:
+            self.item_labels[number].append((label_id, name))
+
+    def add_label(self, number: int, name: str) -> None:
+        label_id = self.label_id(name)
+        with self._lock:
+            self.item_labels[number].append((label_id, name))
+
+    def remove_label(self, number: int, name: str) -> None:
+        """Detaches EVERY id sharing this name -- mirroring `GiteaForge.remove_label`.
+
+        Until 2026-08-10 both this and the vendor wrapper removed only the ONE id `_label_id`
+        converges on, so a same-named label attached under a higher id survived and left an item
+        carrying two verdicts at once. The double could not express that at all while it keyed
+        labels by name, which is why the bug lived behind a green suite.
+        """
+        with self._lock:
+            ids = set(self.repo_labels.get(name, []))
+            self.item_labels[number] = [(i, n) for i, n in self.item_labels[number] if i not in ids]
+
+    def close_work_item(self, number: int) -> None:
+        with self._lock:
+            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='closed')
+
+    def reopen_work_item(self, number: int) -> None:
+        """NOT part of the `Forge` protocol -- deliberately.
+
+        Reopening is something a HUMAN does in the web UI, or a retry policy that lives above this
+        layer; no code here needs to do it, and adding it to the protocol would oblige every
+        backend to implement an operation nobody calls. This double grows it because a double's job
+        is to reproduce states the real world can reach, not only the ones our code writes.
+        """
+        with self._lock:
+            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='open')
+
+    def state(self, number: int) -> str:
+        with self._lock:
+            return self.items[number].state
+
+    def retire_work_item(self, number: int) -> None:
+        """Closes AND retitles, because a retired item must stop matching its title.
+
+        The fake used only to close, which made it gentler than every real forge: retired items went
+        on answering title lookups, so `reconcile_duplicates` would have retired the same ones
+        forever and the test that counts survivors could never pass. Exactly the audit question from
+        the double note -- is this double better-behaved than reality, and does the difference hide
+        a failure class -- caught here by the sweep rather than in production.
+        """
+        self.retired.append(number)
+        with self._lock:
+            current = self.items[number]
+            suffix = '' if current.title.endswith(' (retired)') else ' (retired)'
+            self.items[number] = WorkItem(number=number, title=f'{current.title}{suffix}', state='closed')
