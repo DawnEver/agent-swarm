@@ -124,6 +124,24 @@ def rehearsal(tmp_path):
         fleet.submitter.purge_namespace()
 
 
+def _fleet_on(namespace: str, tmp_path, *, index_name: str) -> Fleet:
+    """A second fleet on an EXISTING namespace, with a cold in-process cache and a warm index.
+
+    The distinction this exists to preserve: an in-process dict and an on-disk index are two caches
+    in front of one another, and timing the outer one tells you nothing about the inner one.
+    """
+    index = ItemIndex(tmp_path / index_name)
+    return Fleet(
+        roadmap=loads(ROADMAP),
+        submitter=ForgeStore(namespace, default_forge(), role=Role.SUBMITTER, index=index),
+        runner=ForgeStore(namespace, default_forge(), role=Role.RUNNER, index=index),
+        spool=Spool(tmp_path / 'spool2'),
+        publisher=ForgePublisher(ForgeStore(namespace, default_forge(), role=Role.SUBMITTER, index=index)),
+        executors={AGENT_TASK: StubGate(), TEST_RUN: StubGate()},
+        owner='box-rehearsal',
+    )
+
+
 BOX = Box(available_gib=64.0)
 
 
@@ -246,7 +264,7 @@ class TestTheLoopCloses:
 
 @pytest.mark.live_forge
 class TestTheCostOfOneCycle:
-    def test_one_cycle_is_timed_and_reported(self, rehearsal, capsys):
+    def test_one_cycle_is_timed_and_reported(self, rehearsal, tmp_path, capsys):
         """A WALL-CLOCK NUMBER, because at 7x24 the per-job overhead decides how many jobs a box can
         turn -- and nothing else in this suite measures the LOOP rather than a call.
         """
@@ -258,8 +276,15 @@ class TestTheCostOfOneCycle:
         tick(rehearsal, BOX)
         tick_ms = (time.perf_counter() - tick_start) * 1000
 
+        # A FRESH FLEET, because the label has to be true. Calling `submit` again on the SAME
+        # fleet measures the in-process dict, not the index -- it reported 0 ms and I nearly quoted
+        # it as the index figure. That is the same defect as an untested cache wearing a different
+        # hat: a NAME asserting a property the measurement does not have, and the working cache
+        # alibiing the one under test. Exactly the mechanism that hid the index bug, in the file
+        # that reports the index's cost.
+        cold_fleet = _fleet_on(rehearsal.runner.namespace, tmp_path, index_name='index.json')
         warm_start = time.perf_counter()
-        submit(rehearsal)  # everything already exists: the INDEX-WARM existence check
+        submit(cold_fleet)
         warm_ms = (time.perf_counter() - warm_start) * 1000
 
         with capsys.disabled():
@@ -267,11 +292,11 @@ class TestTheCostOfOneCycle:
             # working tree, quoted beside an interpreter pinned commits behind it, LOOKS reproducible
             # and is not -- the same defect as an install landing mid-gate, aimed at a number rather
             # than a verdict. The rule that follows is "always quote the two together", and a rule
-            # someone has to remember is one they will eventually not. So the qualification travels
-            # with the figure instead of with whoever measured it.
-            print(f'\n  {running_provenance()}')
-            print(f'  submit, cold index (2 items): {submit_ms:.0f} ms')
-            print(f'  submit, warm index (2 items): {warm_ms:.0f} ms')
+            # someone has to remember is one they will eventually not.
+            print()
+            print(f'  {running_provenance()}')
+            print(f'  submit, cold (creates, 2 items):   {submit_ms:.0f} ms')
+            print(f'  submit, warm INDEX (fresh store):  {warm_ms:.0f} ms')
             print(f'  one full tick:                {tick_ms:.0f} ms')
         assert tick_ms > 0
 
