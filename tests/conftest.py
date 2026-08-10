@@ -50,6 +50,21 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
         terminalreporter.write_sep('-', f'{LIVE_MARKER}: {selected_live} ran off this box', green=True)
 
 
+def live_tier_selected_by_accident(markexpr: str) -> bool:
+    """Did a command-line `-m` widen this run into the live tier without meaning to?
+
+    A FUNCTION, so the predicate can be tested without spawning pytest inside pytest. Its first
+    version lived inline and fired on every default run, because the hook that holds it runs BEFORE
+    pytest's own mark deselection -- a warning that cries wolf on every offline run is one that gets
+    deleted, so the predicate is the part that has to be right.
+
+    The accident's signature is an expression that never NAMES a live marker: `-m "not live"` reads
+    as a guard and matches neither `live_forge` nor `live_fabric`, so it excludes nothing while
+    replacing the default that did.
+    """
+    return bool(markexpr) and not any(marker in markexpr for marker in LIVE_MARKERS)
+
+
 def _is_whole_suite(config) -> bool:
     """Is this a full run, as opposed to someone iterating on one file?
 
@@ -71,6 +86,33 @@ def pytest_collection_modifyitems(config, items) -> None:
     """
     live = [item for item in items if any(item.get_closest_marker(m) for m in LIVE_MARKERS)]
     config._live_collected = live
+
+    # SAY IT BEFORE THE FIRST NETWORK CALL, not in the summary.
+    #
+    # A command-line `-m` REPLACES the `addopts` expression rather than intersecting with it, so
+    # `pytest -m "not live"` -- reaching for `-m` to narrow a run -- silently WIDENS it into the live
+    # tier: real forge writes, real LLM sessions. `live` matches neither marker name, so the guard
+    # reads as satisfied while doing nothing. That is not hypothetical; it happened, and the run was
+    # killed at 3.5 minutes having already created work items on the real forge.
+    #
+    # The end-of-run summary could not have helped: it prints after the writes. A banner at
+    # collection is the only version that arrives while the run can still be stopped, and it names
+    # the flag because "you are about to hit the network" is useless without "here is what did it".
+    # The signature is the EXPRESSION, not the selection. This hook runs before pytest's own mark
+    # deselection, so `items` still holds the live tests on an ordinary default run -- the first
+    # version of this banner fired on every offline run, which is how a warning becomes wallpaper.
+    # What distinguishes the accident is that `-m` was overridden by an expression that never
+    # NAMES a live marker: the author was thinking about the live tier and failed to exclude it.
+    markexpr = config.option.markexpr
+    if live and live_tier_selected_by_accident(markexpr):
+        writer = config.get_terminal_writer()
+        writer.line('')
+        writer.line(f'LIVE TIER SELECTED: {len(live)} tests will contact a REAL forge / spawn REAL sessions.', red=True)
+        writer.line(f'  -m was given as {markexpr!r}, which names neither {" nor ".join(LIVE_MARKERS)}.', red=True)
+        writer.line('  a command-line -m REPLACES the default deselection; it does not add to it.', red=True)
+        writer.line('  to NARROW a default run use -k or a path. Ctrl-C now if this is not what you meant.', red=True)
+        writer.line('')
+
     if _is_whole_suite(config) and len(live) < MINIMUM_LIVE_TESTS:
         raise pytest.UsageError(
             f'only {len(live)} tests carry @pytest.mark.{LIVE_MARKER}, expected at least '

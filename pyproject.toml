@@ -52,4 +52,16 @@ markers = [
 # because by then you asked for the forge. And `tests/conftest.py` prints how many were skipped, so
 # that "all green" and "no forge was ever contacted" cannot be confused -- deselection without that
 # line would trade a wall of red for a silence, which is the worse of the two.
+#
+# THE SHARP EDGE OF THAT CHOICE, and it has already cost a real accidental live run:
+# **a command-line `-m` REPLACES this expression, it does not intersect with it.** So
+# `pytest -m "not live"` -- reaching for `-m` to NARROW a run -- silently WIDENS it into the live
+# tier: real forge writes and real LLM sessions, from a flag whose author meant to exclude them.
+# The marker names are `live_forge` and `live_fabric`; `live` matches neither, so the guard reads as
+# satisfied while doing nothing.
+#
+# To narrow a default run, use `-k` or a path, never `-m`. To add a constraint on top of this one,
+# spell the whole expression:  -m "not live_forge and not live_fabric and <yours>".
+# `tests/conftest.py` prints how many live tests were deselected, which is the line that says
+# immediately which of the two happened -- it is only silent when the answer is "none, they ran".
 addopts = ["-m", "not live_forge and not live_fabric"]

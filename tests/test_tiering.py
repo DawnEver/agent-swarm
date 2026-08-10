@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import conftest
 from conftest import LIVE_MARKER, LIVE_MARKERS, MINIMUM_LIVE_TESTS
 
 REPO = Path(__file__).resolve().parent.parent
@@ -97,3 +98,36 @@ class TestTheLiveTierStillExists:
         it asserts nothing. A floor only ever moves when the tier genuinely shrinks.
         """
         assert MINIMUM_LIVE_TESTS < 27
+
+
+class TestAnOverriddenMarkExpressionCannotSilentlySelectLive:
+    """The accident: `-m` REPLACES `addopts`' deselection rather than intersecting with it.
+
+    `pytest -m "not live"` reads as a guard, names neither marker, and therefore excludes nothing --
+    it widens an offline run into real forge writes and real LLM sessions. It happened, and the run
+    was killed at 3.5 minutes having already created work items on the real forge.
+
+    The end-of-run summary cannot help, because it prints after the writes. The banner fires at
+    COLLECTION, while the run can still be stopped.
+    """
+
+    @pytest.mark.parametrize('markexpr', ['not live', 'not slow', 'unit', 'not network'])
+    def test_an_expression_that_never_NAMES_a_live_marker_is_the_accident(self, markexpr):
+        assert conftest.live_tier_selected_by_accident(markexpr)
+
+    @pytest.mark.parametrize(
+        'markexpr', ['live_forge or live_fabric', 'live_forge', 'not live_forge and not live_fabric']
+    )
+    def test_asking_for_the_live_tier_BY_NAME_is_not_an_accident(self, markexpr):
+        """The discriminating direction. A banner on a deliberate live run is noise, and noise is
+        how a warning stops being read.
+        """
+        assert not conftest.live_tier_selected_by_accident(markexpr)
+
+    def test_the_DEFAULT_run_is_silent(self):
+        """No `-m` on the command line means `addopts` is in force and nothing was overridden.
+
+        This is the case the first version got wrong: the hook runs before pytest's own mark
+        deselection, so the live items are still in `items` on an ordinary offline run.
+        """
+        assert not conftest.live_tier_selected_by_accident('')

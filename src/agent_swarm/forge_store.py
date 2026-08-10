@@ -86,6 +86,7 @@ verdict label may be attached -- is decided here, once, for every vendor.
 from __future__ import annotations
 
 import enum
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -93,7 +94,7 @@ from typing import ClassVar, Self
 
 from agent_swarm.forge import Forge
 from agent_swarm.item_index import IndexCorruptError, ItemIndex, NotIndexed
-from agent_swarm.job import Job
+from agent_swarm.job import Job, JobKind
 from agent_swarm.store import VERDICTS
 
 #: How long a claim stays valid without being released. Long enough for the longest blocking gate
@@ -117,6 +118,67 @@ VERDICT_LABELS = {
 _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 
 _ITEM_TITLE_ROOT = '[swarm]'
+
+
+@dataclass(frozen=True, slots=True)
+class Claimable:
+    """Work a runner could take. **Its truthiness is deliberately undefined.**
+
+    WHY A WRAPPER RATHER THAN A LIST. The one thing a caller must never conclude from this is
+    ABSENCE. Every list read on a forge can be stale -- measured on GitHub, `?labels=` lagged 4-6.6 s
+    and 20/20 reads missed a just-created item -- so a short result means "none VISIBLE", never
+    "none EXIST". Seeing less than exists costs a runner one idle tick and nothing else; concluding
+    that nothing exists is what re-runs a 25-minute job or creates a duplicate work item.
+
+    A docstring saying so would not have been enough, and this project has the receipts: the
+    `tmp_path` scope trap was described in a comment in the very file where two people then fell
+    into it. So the rule is STRUCTURAL. `if not claimable:` raises; the caller writes `.jobs` and
+    thereby says which question it is asking.
+
+    Iterating, indexing and `len()` all work -- the ban is only on the one expression whose two
+    readings ("no work visible" and "no work exists") are indistinguishable at the call site.
+    """
+
+    jobs: tuple[Job, ...]
+
+    def __bool__(self) -> bool:
+        msg = (
+            'Claimable has no truth value: an empty result means NO WORK VISIBLE, never no work '
+            'exists, because a forge list read can be stale. Write `.jobs` and say which you mean '
+            '-- `if not c.jobs:` to idle this tick is fine; concluding a job is absent is not.'
+        )
+        raise TypeError(msg)
+
+    def __iter__(self):
+        return iter(self.jobs)
+
+    def __len__(self) -> int:
+        return len(self.jobs)
+
+
+def decode_claim_key(key: str, *, kind: JobKind) -> Job | None:
+    """`test-run/abc/s2of4` -> the Job that produced it, or None if it is not this kind's.
+
+    THE INVERSE OF `Job.claim_key`, and it lives here for the reason the title scheme does: one
+    spelling. A consumer decoding item titles itself would be a second definition of the identity
+    grammar, free to drift from the one that writes it.
+
+    IDENTITY ONLY. A claim key carries kind, id and the shard/width -- it does not carry `ram_gib`,
+    `exclusivity`, `solo_seconds` or `ceiling_seconds`, so those come back as Job defaults and the
+    CALLER must supply them from its own policy. Said plainly because `exclusivity` defaults to the
+    whole box: a caller that scheduled straight off this Job would be correct but maximally
+    conservative, and one that read the default as a measurement would be wrong.
+    """
+    prefix = f'{kind.value}/'
+    if not key.startswith(prefix):
+        return None
+    rest = key[len(prefix) :]
+    shard = n_shards = None
+    if (m := re.fullmatch(r'(?P<id>.+)/s(?P<i>\d+)of(?P<n>\d+)', rest)) is not None:
+        rest, shard, n_shards = m.group('id'), int(m.group('i')), int(m.group('n'))
+    if not rest:
+        return None
+    return Job(id=rest, kind=kind, shard=shard, n_shards=n_shards)
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,6 +479,57 @@ class ForgeStore:
         """The ONE spelling of a work item's identity. Everything that needs to find a job's item
         goes through here, so there is one scheme rather than two copies drifting apart."""
         return f'{_ITEM_TITLE_ROOT} {self.namespace}/{job.claim_key()}'
+
+    def claimable(self, kind: JobKind) -> Claimable:
+        """Work of `kind` a runner could take: OPEN, in this namespace, and not yet answered.
+
+        THE QUESTION A RUNNER HAS AND NOBODY ELSE COULD ANSWER. Every other method here takes a Job
+        the caller already holds; a runner's whole problem is that it has none yet. Before this, the
+        only way to ask was `Forge.list_work_items()` from the consumer -- which would put the
+        identity grammar and the answered-ness rule in a second place, free to drift from the ones
+        that write them. "The open, unclaimed work in this namespace" says nothing about any
+        particular consumer, so it is store vocabulary.
+
+        **ORDERING IS THE CALLER'S.** Returned in the forge's own order and nothing more: a
+        scheduler sorts by its own policy (integration branch first, retry budgets, capability
+        gates) and the store cannot see any of it. Sorting here would be a policy the caller cannot
+        override and cannot inspect.
+
+        **AN EMPTY RESULT MEANS NO WORK VISIBLE, NEVER NO WORK EXISTS** -- which is why this returns
+        :class:`Claimable` rather than a list. See its docstring; the ban on truthiness is the whole
+        point of the wrapper.
+
+        **AN UNREACHABLE STORE RAISES**, matching `live_runners` in the CI scheduler rather than the
+        `fleet_capabilities` asymmetry. Returning an empty result on a network failure would make an
+        offline runner report "no work" forever -- indistinguishable from a genuinely idle queue,
+        and a regression that layer has already been through once. `ForgeError` propagates.
+
+        ANSWERED-NESS IS READ FROM LABELS, *AND* OPENNESS FROM STATE -- both, because neither alone
+        is the question. **A claim this docstring first made and which is FALSE:** that
+        `verdict:inconclusive` leaves an item open, so the label check was what carried the
+        three-valued distinction. It does not -- `record_verdict` closes on every verdict word
+        including INCONCLUSIVE. Deleting the label check left the whole suite green, which is how
+        the claim was caught.
+
+        What the label check ACTUALLY buys is the REOPENED item: a human or a retry policy reopens
+        an answered issue without clearing its verdict label. State says claimable, the label says
+        answered, and the safe reading is answered -- handing that to a runner re-runs a job whose
+        conclusion is already published. `test_a_REOPENED_item_carrying_a_verdict_label_is_not_work`
+        is the only test that discriminates it.
+        """
+        prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        jobs: list[Job] = []
+        for item in self.forge.list_work_items():
+            if item.state != 'open' or not item.title.startswith(prefix):
+                continue
+            job = decode_claim_key(item.title[len(prefix) :], kind=kind)
+            if job is None:
+                continue
+            self._item_numbers[item.title] = item.number
+            if any(label in _LABEL_TO_VERDICT for label in self.forge.labels(item.number)):
+                continue
+            jobs.append(job)
+        return Claimable(jobs=tuple(jobs))
 
     def register(self, job: Job) -> int:
         """Create this job's work item ONCE, from the single writer that owns submitting it.

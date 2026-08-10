@@ -47,7 +47,7 @@ from agent_swarm.forge_store import (
     decode_claim,
     encode_claim,
 )
-from agent_swarm.job import TEST_RUN, Job
+from agent_swarm.job import TEST_RUN, Job, JobKind
 from agent_swarm.store import VERDICTS, Store
 
 # Imported under private names ON PURPOSE: a name starting with `Test` is COLLECTED wherever it is
@@ -180,6 +180,17 @@ class RecordingForge:
     def close_work_item(self, number: int) -> None:
         with self._lock:
             self.items[number] = WorkItem(number=number, title=self.items[number].title, state='closed')
+
+    def reopen_work_item(self, number: int) -> None:
+        """NOT part of the `Forge` protocol -- deliberately.
+
+        Reopening is something a HUMAN does in the web UI, or a retry policy that lives above this
+        layer; no code here needs to do it, and adding it to the protocol would oblige every
+        backend to implement an operation nobody calls. This double grows it because a double's job
+        is to reproduce states the real world can reach, not only the ones our code writes.
+        """
+        with self._lock:
+            self.items[number] = WorkItem(number=number, title=self.items[number].title, state='open')
 
     def state(self, number: int) -> str:
         with self._lock:
@@ -968,3 +979,174 @@ class TestTheDuplicateSubmitterReconciler:
         with pytest.raises(DuplicateWorkItems):
             loser_store.reconcile_duplicates()
         assert loser_store.work_item_number(job) == 1
+
+
+# --------------------------------------------------------------------------------------------
+# Discovery: the question a runner has and nobody else could answer.
+# --------------------------------------------------------------------------------------------
+
+
+class TestClaimableFindsWorkARunnerCouldTake:
+    """`claimable` is the only method here that does not take a Job the caller already holds.
+
+    A runner's whole problem is that it has none yet. Before this, the only way to ask was
+    `Forge.list_work_items()` from the consumer -- which would put the identity grammar and the
+    answered-ness rule in a second place, free to drift from the ones that write them.
+    """
+
+    def _register(self, store, *ids, kind=JobKind.TEST_RUN):
+        return [store.register(Job(id=i, kind=kind)) for i in ids]
+
+    def test_it_returns_registered_open_work(self, memory_store):
+        self._register(memory_store, 'a', 'b')
+
+        jobs = memory_store.claimable(JobKind.TEST_RUN).jobs
+
+        assert sorted(j.id for j in jobs) == ['a', 'b']
+        assert all(j.kind is JobKind.TEST_RUN for j in jobs)
+
+    def test_an_ANSWERED_item_is_not_work(self, memory_store):
+        """The control. Without it, `claimable` could return everything and still look right."""
+        self._register(memory_store, 'a', 'b')
+        memory_store.record_verdict(Job(id='a', kind=JobKind.TEST_RUN), verdict='PASS', detail='done')
+
+        assert [j.id for j in memory_store.claimable(JobKind.TEST_RUN).jobs] == ['b']
+
+    def test_INCONCLUSIVE_is_ANSWERED_too(self, memory_store):
+        """ "I cannot tell" is a conclusion about this attempt, so the item is not still waiting.
+
+        Re-offering it here would make an unreachable box spin on the same job forever. Retrying an
+        inconclusive run is a POLICY -- it belongs to whoever owns the retry budget, and it acts by
+        clearing the label, not by the store quietly forgetting the label exists.
+        """
+        (number,) = self._register(memory_store, 'a')
+        memory_store.record_verdict(Job(id='a', kind=JobKind.TEST_RUN), verdict='INCONCLUSIVE', detail='node down')
+
+        assert memory_store.claimable(JobKind.TEST_RUN).jobs == ()
+        assert 'verdict:inconclusive' in memory_store.forge.labels(number)
+
+    def test_a_REOPENED_item_carrying_a_verdict_label_is_not_work(self, memory_store, recording_forge):
+        """THE ONLY TEST THAT DISCRIMINATES THE LABEL CHECK. Verified by deleting the check.
+
+        Every other test here passes with `claimable`'s label filter removed, because
+        `record_verdict` CLOSES the item on every verdict word -- so the state check alone was
+        answering them. I had written the opposite in the docstring (that INCONCLUSIVE stays open
+        and the label check carried it); deleting the check and watching nothing redden is what
+        corrected it.
+
+        The case where state and label disagree is a REOPEN -- a human reopening an answered issue,
+        a retry policy reopening before it clears the label. State says claimable, label says
+        answered. Answered wins: the cheap outcome is one job nobody picks up, the expensive one is
+        re-running a job whose conclusion is already published and racing its author.
+        """
+        (number,) = self._register(memory_store, 'a')
+        memory_store.record_verdict(Job(id='a', kind=JobKind.TEST_RUN), verdict='PASS', detail='green')
+        recording_forge.reopen_work_item(number)
+
+        assert memory_store.item_state(Job(id='a', kind=JobKind.TEST_RUN)) == 'open'
+        assert memory_store.claimable(JobKind.TEST_RUN).jobs == (), (
+            'a reopened item still carrying verdict:pass was offered as work'
+        )
+
+    def test_a_CANCELLED_item_closed_without_a_verdict_is_not_work(self, memory_store, recording_forge):
+        """THE ONLY TEST THAT DISCRIMINATES THE STATE CHECK, and the exact mirror of the one above.
+
+        The two filters cover for each other on everything our own code writes: `record_verdict`
+        always labels AND closes, so each mutant survived the other's tests. Only where they
+        DISAGREE does either earn its place, and both disagreements are things a human does --
+        reopen an answered item (label without open), close an unwanted one (closed without label).
+
+        Cancelled is the cheaper-looking direction and is not free: withdrawn work handed to a
+        runner burns a whole gate and publishes a verdict on a question nobody is asking any more.
+        """
+        (number,) = self._register(memory_store, 'a')
+        recording_forge.close_work_item(number)
+
+        assert memory_store.verdict(Job(id='a', kind=JobKind.TEST_RUN)) is None, 'not a verdict -- a withdrawal'
+        assert memory_store.claimable(JobKind.TEST_RUN).jobs == ()
+
+    def test_another_KIND_is_not_returned(self, memory_store):
+        self._register(memory_store, 'a')
+        self._register(memory_store, 'z', kind=JobKind.AGENT_TASK)
+
+        assert [j.id for j in memory_store.claimable(JobKind.TEST_RUN).jobs] == ['a']
+        assert [j.id for j in memory_store.claimable(JobKind.AGENT_TASK).jobs] == ['z']
+
+    def test_another_NAMESPACE_is_not_returned(self, recording_forge):
+        """Namespaces are what keep two fleets off each other's work."""
+        mine = ForgeStore('mine', recording_forge, role=Role.SUBMITTER)
+        theirs = ForgeStore('theirs', recording_forge, role=Role.SUBMITTER)
+        mine.register(Job(id='a', kind=JobKind.TEST_RUN))
+        theirs.register(Job(id='b', kind=JobKind.TEST_RUN))
+
+        assert [j.id for j in mine.claimable(JobKind.TEST_RUN).jobs] == ['a']
+
+    def test_a_SHARDED_job_round_trips_its_width(self, memory_store):
+        """The width is part of the identity: a 2-way shard 1 and a 4-way shard 1 cover different
+        tests, so losing it would hand a runner a slice of the wrong partition."""
+        memory_store.register(Job(id='k', kind=JobKind.TEST_RUN, shard=2, n_shards=4))
+
+        (job,) = memory_store.claimable(JobKind.TEST_RUN).jobs
+
+        assert (job.id, job.shard, job.n_shards) == ('k', 2, 4)
+
+    def test_an_UNREACHABLE_store_RAISES(self, memory_store, monkeypatch):
+        """Matching `live_runners`, not the `fleet_capabilities` asymmetry.
+
+        Returning an empty result on a network failure would make an offline runner report "no
+        work" forever -- indistinguishable from a genuinely idle queue, and a regression the CI
+        scheduler has already been through once.
+        """
+
+        def _boom():
+            raise ForgeError('the control plane is unreachable')
+
+        monkeypatch.setattr(memory_store.forge, 'list_work_items', _boom)
+
+        with pytest.raises(ForgeError):
+            memory_store.claimable(JobKind.TEST_RUN)
+
+
+class TestAbsenceIsUNWRITABLE:
+    """The structural half, and the reason this returns a wrapper rather than a list.
+
+    An empty result means NO WORK VISIBLE, never no work exists -- every forge list read can be
+    stale. Seeing less than exists costs one idle tick; concluding nothing exists re-runs a
+    25-minute job or creates a duplicate item.
+
+    A docstring saying so would not be enough, and this project has the receipts: the `tmp_path`
+    scope trap was described in a comment in the very file where two people then fell into it. So
+    the ban is enforced rather than documented.
+    """
+
+    def test_truthiness_RAISES(self, memory_store):
+        claimable = memory_store.claimable(JobKind.TEST_RUN)
+
+        with pytest.raises(TypeError, match='no truth value'):
+            bool(claimable)
+
+    def test_the_tempting_expression_raises(self, memory_store):
+        """`if not claimable:` is the exact line this exists to make impossible."""
+        claimable = memory_store.claimable(JobKind.TEST_RUN)
+
+        with pytest.raises(TypeError):
+            if not claimable:
+                pass
+
+    def test_the_error_says_what_to_write_instead(self, memory_store):
+        """A refusal that does not name the alternative gets worked around, not obeyed."""
+        try:
+            bool(memory_store.claimable(JobKind.TEST_RUN))
+        except TypeError as exc:
+            assert '.jobs' in str(exc)
+        else:
+            pytest.fail('truthiness did not raise')
+
+    def test_iteration_and_len_still_WORK(self, memory_store):
+        """The ban is narrow on purpose. Only the ambiguous expression is refused; a caller that
+        wants to count or loop is asking an unambiguous question."""
+        memory_store.register(Job(id='a', kind=JobKind.TEST_RUN))
+        claimable = memory_store.claimable(JobKind.TEST_RUN)
+
+        assert len(claimable) == 1
+        assert [j.id for j in claimable] == ['a']
