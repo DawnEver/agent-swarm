@@ -346,7 +346,7 @@ class TestTheVerdictVocabularyIsClosedBEFOREAnyIO:
         that validated after the comment was posted would leave one behind for a verdict it then
         rejected.
         """
-        store = ForgeStore('probe-never-contacted', GiteaForge('http://127.0.0.1:1', 'o/r'), role=Role.SUBMITTER)
+        store = ForgeStore('probe-never-contacted', GiteaForge('http://127.0.0.1:1', 'o/r', username='swarm-agent'), role=Role.SUBMITTER)
         with pytest.raises(ValueError, match='verdict'):
             store.record_verdict(JOB, verdict='ERROR', detail='')
 

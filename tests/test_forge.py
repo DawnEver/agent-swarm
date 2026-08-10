@@ -77,7 +77,7 @@ class TestTheSeamCoversWhatTheStoreNeeds:
         assert sorted(ARITY) == FORGE_METHODS
 
     def test_gitea_satisfies_it(self):
-        assert isinstance(GiteaForge('http://127.0.0.1:1', 'o/r'), Forge)
+        assert isinstance(GiteaForge('http://127.0.0.1:1', 'o/r', username='swarm-agent'), Forge)
 
     def test_github_satisfies_it_STRUCTURALLY(self):
         """It must be substitutable at the type level even though every call refuses. A backend
@@ -133,12 +133,12 @@ class TestConstructionTouchesNothing:
         refusal has to be about the WORD. A constructor that connected, or read a credential, would
         make the failure about the network instead -- and on a good day would hide the bug entirely.
         """
-        forge = GiteaForge('http://127.0.0.1:1', 'o/r')
+        forge = GiteaForge('http://127.0.0.1:1', 'o/r', username='swarm-agent')
         assert forge.repo == 'o/r'
         assert forge.base_url == 'http://127.0.0.1:1'
 
     def test_a_trailing_slash_does_not_produce_a_double_slash_url(self):
-        assert GiteaForge('http://host:9000/', 'o/r').base_url == 'http://host:9000'
+        assert GiteaForge('http://host:9000/', 'o/r', username='swarm-agent').base_url == 'http://host:9000'
 
 
 class TestGitHubRefusesInsteadOfGuessing:
@@ -245,7 +245,7 @@ class TestRemovingALabelDetachesEveryIdSharingItsName:
     """
 
     def _forge_with_labels(self, monkeypatch, defined: list[dict]):
-        forge = GiteaForge('http://127.0.0.1:1', 'o/r')
+        forge = GiteaForge('http://127.0.0.1:1', 'o/r', username='swarm-agent')
         calls: list[tuple[str, str]] = []
 
         def fake_api(method: str, path: str, body: dict | None = None):
@@ -311,16 +311,16 @@ def test_a_non_http_base_url_is_refused_where_it_enters(bad: str) -> None:
     happened to be under the cursor -- a duplicated scheme, not one drifted copy.
     """
     with pytest.raises(ForgeError, match='http'):
-        GiteaForge(bad, 'owner/repo')
+        GiteaForge(bad, 'owner/repo', username='swarm-agent')
 
 
 @pytest.mark.parametrize('good', ['http://host:9000', 'https://forge.example.com', 'https://h/gitea'])
 def test_http_and_https_are_accepted(good: str) -> None:
     """The discriminating half: a guard that refused everything would also pass the test above."""
-    assert GiteaForge(good, 'owner/repo').base_url.startswith(('http://', 'https://'))
+    assert GiteaForge(good, 'owner/repo', username='swarm-agent').base_url.startswith(('http://', 'https://'))
 
 
 def test_the_default_forge_url_satisfies_its_own_guard() -> None:
     """The shipped default must not be refused by the check added for operator input -- otherwise
     the guard is discovered by the first person to run the thing, not by this suite."""
-    assert GiteaForge(DEFAULT_GITEA_BASE_URL, 'owner/repo').base_url
+    assert GiteaForge(DEFAULT_GITEA_BASE_URL, 'owner/repo', username='swarm-agent').base_url

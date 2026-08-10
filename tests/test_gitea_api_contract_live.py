@@ -35,7 +35,7 @@ from agent_swarm.job import TEST_RUN, Job
 def live():
     """A real client against a throwaway namespace, cleaned up afterwards."""
     repo = os.environ.get('SWARM_REPO') or 'Tianjie-Zou-Team/motronics-studio'
-    forge = GiteaForge(os.environ.get('SWARM_BASE_URL') or DEFAULT_GITEA_BASE_URL, repo)
+    forge = GiteaForge(os.environ.get('SWARM_BASE_URL') or DEFAULT_GITEA_BASE_URL, repo, username='swarm-agent')
     namespace = f'contract-{secrets.token_hex(3)}'
     store = ForgeStore(namespace, forge, role=Role.SUBMITTER)
     yield forge, store, namespace

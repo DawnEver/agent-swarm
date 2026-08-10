@@ -47,7 +47,7 @@ class CountingGitea(GiteaForge):
     """
 
     def __init__(self) -> None:
-        super().__init__('http://127.0.0.1:1', 'o/r')
+        super().__init__('http://127.0.0.1:1', 'o/r', username='swarm-agent')
         self.api_calls: list[str] = []
         self.credential_calls = 0
 
@@ -59,7 +59,7 @@ class CountingGitea(GiteaForge):
             return {'id': 7}
         return {}
 
-    def _run_credential_helper(self, scheme: str, netloc: str) -> subprocess.CompletedProcess[str]:
+    def _run_credential_helper(self, scheme: str, netloc: str, username: str) -> subprocess.CompletedProcess[str]:
         self.credential_calls += 1
         return subprocess.CompletedProcess(args=[], returncode=0, stdout='password=not-a-real-token\n', stderr='')
 
@@ -140,6 +140,6 @@ def test_the_named_cost_attributes_still_exist(name):
     """
     holders = [
         vars(ForgeStore('ns', RecordingForge(), role=Role.SUBMITTER)),
-        vars(GiteaForge('http://127.0.0.1:1', 'o/r')),
+        vars(GiteaForge('http://127.0.0.1:1', 'o/r', username='swarm-agent')),
     ]
     assert any(name in holder for holder in holders), f'{name} is gone; its cost test now measures nothing'

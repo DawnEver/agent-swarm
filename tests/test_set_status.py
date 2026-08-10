@@ -26,7 +26,7 @@ from agent_swarm.testing import RecordingForge
 
 @pytest.fixture
 def gitea():
-    forge = GiteaForge('http://forge.test:9000', 'owner/repo')
+    forge = GiteaForge('http://forge.test:9000', 'owner/repo', username='swarm-agent')
     sent: list[tuple[str, str, dict | None]] = []
     forge._api = lambda method, path, body=None: sent.append((method, path, body))  # type: ignore[method-assign]
     forge.sent = sent  # type: ignore[attr-defined]

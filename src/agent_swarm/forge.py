@@ -279,7 +279,6 @@ class Forge(Protocol):
         """
         ...
 
-
     def retire_work_item(self, number: int) -> None:
         """Make the item stop counting, by whatever means the vendor allows.
 
@@ -303,6 +302,8 @@ class GiteaForge:
     Args:
         base_url: the Gitea root, no trailing slash.
         repo: ``owner/name``.
+        username: WHICH ROLE this forge acts as. Required, and it is not decoration -- see
+            `_credential`.
 
     MEASURED, not assumed: `POST .../comments` returns a server-assigned id; three successive posts
     came back 595, 596, 597 -- monotonic and unique -- and `DELETE .../issues/comments/{id}` removed
@@ -314,7 +315,7 @@ class GiteaForge:
     word rather than about the network.
     """
 
-    def __init__(self, base_url: str, repo: str) -> None:
+    def __init__(self, base_url: str, repo: str, *, username: str) -> None:
         # THE SCHEME IS ALLOWLISTED, and the reason is not tidiness. `urllib.request` dispatches on
         # the URL's scheme and honours `file:`, so a base URL of `file:///etc` would turn every API
         # call into a LOCAL READ that still looks like a forge answering -- claims, verdicts and
@@ -325,8 +326,12 @@ class GiteaForge:
         if split.scheme not in {'http', 'https'} or not split.netloc:
             msg = f'base_url must be http:// or https:// with a host, got {base_url!r}'
             raise ForgeError(msg)
+        if not username:
+            msg = 'username is required: four role credentials share one host and git tells them apart by it'
+            raise ForgeError(msg)
         self.base_url = base_url.rstrip('/')
         self.repo = repo
+        self.username = username
         self._token: str | None = None
         self._label_ids: dict[str, int] = {}
 
@@ -341,12 +346,16 @@ class GiteaForge:
         out: list[WorkItem] = []
         page, limit = 1, 50
         while True:
-            batch = self._api('GET', f'/repos/{self.repo}/issues?state={state}&type=issues&limit={limit}&page={page}') or []
+            batch = (
+                self._api('GET', f'/repos/{self.repo}/issues?state={state}&type=issues&limit={limit}&page={page}') or []
+            )
             # LABELS COME FREE HERE. Gitea's issue objects carry them inline, so taking them
             # costs nothing and removes the per-item fetch the store used to do.
             out.extend(
                 WorkItem(
-                    number=x['number'], title=x['title'], state=x['state'],
+                    number=x['number'],
+                    title=x['title'],
+                    state=x['state'],
                     labels=tuple(lb['name'] for lb in x.get('labels') or ()),
                 )
                 for x in batch
@@ -455,11 +464,15 @@ class GiteaForge:
         if state not in STATUS_STATES:
             msg = f'state must be one of {sorted(STATUS_STATES)}, got {state!r}'
             raise ForgeError(msg)
-        self._api('POST', f'/repos/{self.repo}/statuses/{sha}', {
-            'state': state,
-            'context': context,
-            'description': description[:_STATUS_DESCRIPTION_LIMIT],
-        })
+        self._api(
+            'POST',
+            f'/repos/{self.repo}/statuses/{sha}',
+            {
+                'state': state,
+                'context': context,
+                'description': description[:_STATUS_DESCRIPTION_LIMIT],
+            },
+        )
 
     def retire_work_item(self, number: int) -> None:
         """Close and retitle. This deployment is not configured to let the API delete an issue, and
@@ -524,24 +537,36 @@ class GiteaForge:
         raise ForgeError(msg)
 
     def _credential(self) -> str:
-        """The API token, from `git credential fill`, held in memory only.
+        """The API token for THIS ROLE, from `git credential fill`, held in memory only.
 
         NEVER LOGGED, PRINTED OR PERSISTED -- a hard project invariant. Note what this does NOT do:
         it takes no token argument (which would invite a caller to hard-code one) and it reads no
         environment variable at import time.
+
+        THE USERNAME IS LOAD-BEARING, and omitting it was a defect rather than a simplification.
+        `git credential fill` keys on (protocol, host, USERNAME). Four role credentials share one
+        host, so a query with no username returns whichever the helper happens to hold -- measured
+        on the live host 2026-08-10, where the bare-host key belonged to `OAUTH_USER`, an entry
+        nothing in this system issued.
+
+        WHAT THAT SILENTLY DEFEATED. Gitea has no scope for commit status, so "only the verifier
+        marks a commit green" is carried by WHICH PROCESS HOLDS WHICH CREDENTIAL -- that is stated
+        in `swarmctl`'s role table and it is the only thing separating the roles at all. A client
+        that cannot select its role does not weaken that boundary; it removes it, while every call
+        still succeeds and every test still passes.
         """
         if self._token is not None:
             return self._token
         host = urllib.parse.urlsplit(self.base_url)
-        filled = self._run_credential_helper(host.scheme, host.netloc)
+        filled = self._run_credential_helper(host.scheme, host.netloc, self.username)
         for line in filled.stdout.splitlines():
             if line.startswith('password='):
                 self._token = line[len('password=') :]
                 return self._token
-        msg = f'no stored credential for {host.netloc}'
+        msg = f'no stored credential for {self.username}@{host.netloc} -- run `swarmctl enroll` on this machine'
         raise ForgeError(msg)
 
-    def _run_credential_helper(self, scheme: str, netloc: str) -> subprocess.CompletedProcess[str]:
+    def _run_credential_helper(self, scheme: str, netloc: str, username: str) -> subprocess.CompletedProcess[str]:
         """Shell out to `git credential fill`. A SEAM, extracted so the cache above it is testable.
 
         The caching in `_credential` exists ONLY to avoid this subprocess -- it is a pure cost
@@ -705,6 +730,27 @@ class GitHubForge:
         raise self._unmeasured('retire_work_item')
 
 
-def default_forge() -> Forge:
-    """The forge this project actually uses. One place to change when a second one is measured."""
-    return GiteaForge(DEFAULT_GITEA_BASE_URL, DEFAULT_REPO)
+#: role -> the forge account it authenticates as. The four share one host, and `git credential fill`
+#: keys on (protocol, host, USERNAME) -- so this mapping is the ONLY thing that makes a process act
+#: as one role rather than another. Gitea has no scope for commit status, so the whole
+#: "only the verifier marks a commit green" boundary rests here and nowhere else.
+ROLE_ACCOUNTS = {
+    'observer': 'swarm-observer',
+    'agent': 'swarm-agent',
+    'verifier': 'swarm-verifier',
+    'integrator': 'swarm-integrator',
+}
+
+
+def default_forge(role: str = 'agent') -> Forge:
+    """The forge this project actually uses, acting as `role`. One place to change per forge.
+
+    THE ROLE IS A PARAMETER WITH A DEFAULT, not a constant, and the default is the least privileged
+    one that can do the common thing. A no-argument version returned a client whose identity was
+    whatever the credential helper happened to hold for the host -- on the measured machine, an
+    `OAUTH_USER` entry nothing in this system issued.
+    """
+    if role not in ROLE_ACCOUNTS:
+        msg = f'role must be one of {sorted(ROLE_ACCOUNTS)}, got {role!r}'
+        raise ForgeError(msg)
+    return GiteaForge(DEFAULT_GITEA_BASE_URL, DEFAULT_REPO, username=ROLE_ACCOUNTS[role])

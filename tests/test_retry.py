@@ -44,7 +44,7 @@ _TOKEN = 'tok-' + 'x' * 80
 
 
 def _forge(monkeypatch) -> GiteaForge:
-    forge = GiteaForge(base_url='http://forge.invalid', repo='o/r')
+    forge = GiteaForge(base_url='http://forge.invalid', repo='o/r', username='swarm-agent')
     monkeypatch.setattr(forge, '_credential', lambda: _TOKEN)
     return forge
 

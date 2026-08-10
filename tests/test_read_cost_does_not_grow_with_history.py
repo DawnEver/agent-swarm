@@ -149,7 +149,7 @@ def _gitea_queries(state: str | None = None) -> list[str]:
     """Every API path a real `GiteaForge` would request, with `_api` stubbed at the boundary."""
     from agent_swarm.forge import GiteaForge
 
-    forge = GiteaForge('http://forge.test:9000', 'owner/repo')
+    forge = GiteaForge('http://forge.test:9000', 'owner/repo', username='swarm-agent')
     seen: list[str] = []
 
     def fake_api(method: str, path: str, body=None):
