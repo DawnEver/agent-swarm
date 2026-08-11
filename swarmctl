@@ -1,0 +1,49 @@
+#!/bin/sh
+# swarmctl -- macOS/Linux launcher. It finds a Python, puts this checkout's
+# `src` on PYTHONPATH and forwards to `-m agent_swarm.swarmctl`; every verb,
+# flag and default lives in that module, which runs identically on Windows via
+# the sibling swarmctl.cmd.
+#
+# PYTHONPATH RATHER THAN AN INSTALL: the Gitea host has no venv and nothing
+# installed, and the package is stdlib-only by construction, so a checkout plus
+# any Python 3 is the whole requirement. It also means the code that runs is
+# THIS tree rather than a pinned copy in site-packages.
+#
+# NOTHING IS CONFIGURED HERE. Run `swarmctl config <admin-user>` once per
+# machine; `swarmctl config` prints where that is stored.
+set -eu
+
+# `readlink -f` is GNU-only and macOS ships BSD readlink, so the script's own
+# directory is derived with dirname, which is POSIX everywhere.
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# PROBED BY RUNNING IT, not by `command -v`. A name that resolves is not an interpreter that
+# works: the Windows sibling of this script hit a Microsoft Store alias that `where` finds and that
+# exits non-zero when run, and the POSIX equivalents are a dangling symlink or a python3 whose
+# shared library is missing. Existence and usability are different questions; only the second one
+# decides whether swarmctl can run.
+py=
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" --version >/dev/null 2>&1; then
+        py=$candidate
+        break
+    fi
+done
+if [ -z "$py" ]; then
+    echo "  No usable Python 3 on PATH. swarmctl is stdlib-only; any Python 3.9+ will do." >&2
+    echo "  (A name that resolves is not enough -- each candidate is run with --version.)" >&2
+    exit 2
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+    echo "  No git on PATH. Required: credentials are stored by piping them into" >&2
+    echo "  \`git credential approve\`, which is what keeps them off the screen." >&2
+    exit 2
+fi
+
+# PREPENDED, never assigned over: a caller may already be pointing PYTHONPATH somewhere, and losing
+# that silently is how a launcher starts deciding things it was written not to decide.
+PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+
+exec "$py" -m agent_swarm.swarmctl "$@"

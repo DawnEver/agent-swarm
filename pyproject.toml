@@ -11,10 +11,25 @@ requires-python = ">=3.11"
 # decides; it does not reach. Facts arrive as arguments (fabric supplies them), stores arrive
 # through adapters. The day something here needs a third-party package, check first whether the
 # decision has quietly grown an I/O half that belongs in an adapter.
+#
+# THE CHECK WAS RUN, ONCE, AND THE ANSWER WAS "NO" -- see the `procs` extra below. `procs` is not a
+# decision that grew an I/O half; it is the MEASUREMENT half itself, and it is what supplies the
+# facts the decision half consumes ("is anyone in that worktree", "how much RAM is free"). The rule
+# above still holds where it was aimed: nothing under `dependencies` reaches, and every module that
+# does is behind an extra. Installing plain `agent-swarm` still installs nothing.
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+# THE ONLY REACHING MODULE, and it is opt-in so the decision core keeps its no-dependency property.
+# `agent_swarm.procs` walks the process table; there is no way to do that from arguments, because
+# the thing being measured is the machine. Absent psutil the module still IMPORTS (so
+# `import agent_swarm` never depends on this being installed): its census functions answer `None` --
+# "I could not look" -- and its enumerating and terminating functions raise a `RuntimeError` naming
+# this extra. Neither invents a number, because every caller's failure direction here is destructive.
+procs = ["psutil>=5.9"]
+# psutil is in `dev` too: the procs suite spawns real processes and would otherwise be silently
+# unrunnable, which for a module about "is it actually dead" is the worst possible thing to skip.
+dev = ["pytest>=8", "ruff>=0.6", "psutil>=5.9"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_swarm"]

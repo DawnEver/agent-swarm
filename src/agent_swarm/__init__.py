@@ -34,6 +34,14 @@ from agent_swarm.admission import (
     staleness_blocker,
     time_blocker,
 )
+from agent_swarm.exclusive import (
+    LockBusy,
+    LockOwner,
+    exclusive_lock,
+    lock_dir,
+    lock_path_for_class,
+    read_owner,
+)
 from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
 from agent_swarm.loop import Box, Executor, Outcome, run_one
 from agent_swarm.store import VERDICTS, InMemoryStore, Store
@@ -51,14 +59,20 @@ __all__ = [
     'InMemoryStore',
     'Job',
     'JobKind',
+    'LockBusy',
+    'LockOwner',
     'Outcome',
     'Store',
     'admission_blockers',
     'capacity_blocker',
     'claim_key',
     'classes_conflict',
+    'exclusive_lock',
     'is_known_class',
+    'lock_dir',
+    'lock_path_for_class',
     'own_claim_is_abandoned',
+    'read_owner',
     'run_one',
     'should_retry',
     'staleness_blocker',
