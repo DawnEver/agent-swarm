@@ -12,13 +12,40 @@ one scheduler, not two.
 Dependency arrow strictly L2 -> L1 -> L0. The vocabulary test decides the layer: a sentence needing
 "issue/branch/gate" is swarm or project; one needing only "session/turn/node/pid" is fabric.
 
-WHAT IS HERE TODAY: `admission` (the decision layer), `job` (one model, two kinds) and `store`
-(the claim/verdict contract, with a reference in-memory implementation). `admission` -- extracted from motronics' `ci_tick.py`, where it had been
-running and measured for months, rather than written fresh. That is deliberate: M1's first block is
-the extraction, not a new scheduler. Everything in it is stdlib-only by construction so the move
-was a file move.
+THE MODULE CENSUS IS IN `layers.py`, NOT IN THIS PARAGRAPH -- and that is the point. What stood here
+was a hand-maintained inventory of three modules, written when there were three and still saying
+"what is here today" at thirty-three. A longer list would have drifted identically. `layers.py`
+places EVERY module in HOST / DRIVER / JOB / ENTRY, and `test_the_dependency_arrow_is_enforced.py`
+reads it, walks every import with `ast`, and reds on an upward edge, a cycle, an unplaced module or
+a placement whose module is gone. The arrow above stops being a sentence and becomes a check.
+
+`admission` was EXTRACTED from motronics' `ci_tick.py`, where it had been running and measured for
+months, rather than written fresh. That is deliberate: M1's first block is the extraction, not a new
+scheduler. It is stdlib-only by construction, so the move was a file move.
 """
 
+# THE JOB LAYER'S MODULES, re-exported by name. Not decoration: `__all__` used to carry symbols
+# from five modules, so `claim` -- the arbitration everything else is built on -- was invisible from
+# the front door. `test_the_dependency_arrow_is_enforced.py` asserts this list stays complete.
+from agent_swarm import (
+    admission,
+    agent_executor,
+    allocator,
+    claim,
+    exclusive,
+    fabric,
+    forge_store,
+    item_index,
+    job,
+    layers,
+    loop,
+    pull,
+    roadmap,
+    seats,
+    spool,
+    status,
+    store,
+)
 from agent_swarm.admission import (
     CHEAP,
     SHARED_SLOWDOWN,
@@ -63,18 +90,35 @@ __all__ = [
     'LockOwner',
     'Outcome',
     'Store',
+    'admission',
     'admission_blockers',
+    'agent_executor',
+    'allocator',
+    'claim',
     'capacity_blocker',
     'claim_key',
     'classes_conflict',
+    'exclusive',
     'exclusive_lock',
+    'fabric',
+    'forge_store',
     'is_known_class',
+    'item_index',
+    'job',
+    'layers',
     'lock_dir',
     'lock_path_for_class',
+    'loop',
     'own_claim_is_abandoned',
+    'pull',
     'read_owner',
+    'roadmap',
     'run_one',
+    'seats',
     'should_retry',
+    'spool',
     'staleness_blocker',
+    'status',
+    'store',
     'time_blocker',
 ]

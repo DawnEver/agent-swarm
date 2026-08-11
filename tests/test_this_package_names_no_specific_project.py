@@ -28,7 +28,8 @@ the sole definition rather than the surviving duplicate.
 
 WHAT THIS FILE SCANS, STATED SO THE READER DOES NOT SUPPLY "EVERYTHING". It reads every module under
 `src/agent_swarm` and rejects a forbidden token appearing in a NAME or in a string the code can USE
-AS A VALUE. It deliberately does NOT reject the token in docstrings or comments: several modules
+AS A VALUE. It deliberately does NOT reject the token in any DISCARDED string statement -- module, class and
+function docstrings, and ATTRIBUTE docstrings, which it used to miss -- nor in comments: several modules
 record, correctly, that they were extracted from motronics' `ci_tick.py`, and that is provenance
 about where the code came from rather than a dependency on where it runs. Deleting true history to
 satisfy a grep would be the reverse of this project's rule about declarations. The distinction is
@@ -72,14 +73,18 @@ def _offending(source: str, *, where: str) -> list[str]:
     the same green-because-the-instrument-is-broken shape the double-model version exists for.
     """
     tree = ast.parse(source)
+    # A DISCARDED STRING STATEMENT IS THE DEFINITION, not "the first statement of a module/def".
+    # MEASURED 2026-08-11: `layers.py` recorded its provenance in an ATTRIBUTE docstring -- the
+    # string written under `DEV_TOOL = ...`, which `help()` renders and every reader calls a
+    # docstring -- and this scanner rejected it, because the old set only ever collected `body[0]`.
+    # That is a scope narrower than the name, the variant this repo calls worse than a behaviour
+    # bug: it does not make you distrust the check, it makes you reword TRUE provenance to appease
+    # it. The replacement rule is both exact and simpler -- a bare string expression statement is
+    # evaluated and thrown away, so it can never be a value the code uses.
     docstrings = {
-        node.body[0].value
+        node.value
         for node in ast.walk(tree)
-        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
-        and node.body
-        and isinstance(node.body[0], ast.Expr)
-        and isinstance(node.body[0].value, ast.Constant)
-        and isinstance(node.body[0].value.value, str)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
     }
     hits: list[str] = []
     for node in ast.walk(tree):
@@ -118,6 +123,19 @@ def test_the_scanner_catches_it_in_an_fstring():
     looked at top-level assignments would miss `f'motronics/{name}'` entirely.
     """
     assert _offending("x = f'motronics/{name}'\n", where='x')
+
+
+def test_the_scanner_exempts_an_ATTRIBUTE_docstring():
+    """The 2026-08-11 miss. `help()` renders this string, PEP 258 names it, every reader calls it a
+    docstring -- and the scanner did not, because it is not `body[0]` of anything."""
+    assert not _offending("DEV_TOOL = frozenset()\n'''extracted from motronics.'''\n", where='x')
+
+
+def test_the_exemption_does_NOT_cover_a_string_the_code_can_reach():
+    """The control, and the one that matters: the exemption is for a DISCARDED statement, so a
+    string one line away that is actually bound must still trip. Without this, widening the
+    exemption could have quietly turned the whole scanner off."""
+    assert _offending("DEV_TOOL = 'motronics'\n'''prose.'''\n", where='x')
 
 
 def test_the_scanner_catches_it_as_an_identifier():

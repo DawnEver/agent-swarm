@@ -800,13 +800,13 @@ def cmd_list(provider: GiteaProvider, args: argparse.Namespace) -> int:
         team_name = TEAMS[role]
         team = by_name.get(team_name)
         if not team:
-            say(f'  {team_name:<14} MISSING')
+            say(f'  {team_name:<18} MISSING')
             continue
         members = provider.team_members(team['id'])
         repos = provider.team_repos(team['id'])
         drift = {k: v for k, v in units.items() if (team.get('units_map') or {}).get(k) != v}
         say(
-            f'  {team_name:<14} id={team["id"]:<4} members={members or "-"}  repos={repos or "-"}'
+            f'  {team_name:<18} id={team["id"]:<4} members={members or "-"}  repos={repos or "-"}'
             f'{"  UNIT DRIFT: " + json.dumps(drift) if drift else ""}'
         )
 
@@ -836,14 +836,15 @@ def cmd_provision(provider: GiteaProvider, _args: argparse.Namespace) -> int:
             provider.create_user(username)
             say(f'  {username:<18} created')
 
-    say('\nteams (units updated in place, so a ROLES change reaches existing installs)')
+    say('\nteams (units updated in place, so a ROLES change reaches existing installs; a team still')
+    say('carrying its pre-`Swarm-` name is RENAMED, keeping its id, its members and its repos)')
     for role, (units, _scopes) in ROLES.items():
         team_name = TEAMS[role]
         team_id, what = provider.ensure_team(team_name, units, was_called=_old_name_of(role))
         if USERS[role] not in provider.team_members(team_id):
             provider.add_member(team_id, USERS[role])
             what += ', member added'
-        say(f'  {team_name:<14} id={team_id:<4} {what}')
+        say(f'  {team_name:<18} id={team_id:<4} {what}')
     say('\nNo repository is attached yet -- run `onboard --repo OWNER/NAME`.')
     return 0
 
@@ -870,10 +871,10 @@ def cmd_onboard(provider: GiteaProvider, args: argparse.Namespace) -> int:
             msg = f'team {team_name} does not exist -- run `provision` first'
             raise Fail(msg)
         if f'{owner}/{repo}' in provider.team_repos(team['id']):
-            say(f'  {team_name:<14} already attached')
+            say(f'  {team_name:<18} already attached')
         else:
             provider.attach_repo(team['id'], owner, repo)
-            say(f'  {team_name:<14} attached')
+            say(f'  {team_name:<18} attached')
 
     say('\nremote URLs -- THE USERNAME IS REQUIRED, not decoration:')
     for role in ('agent', 'verifier', 'integrator'):
