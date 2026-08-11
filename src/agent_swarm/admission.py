@@ -246,6 +246,35 @@ def should_retry(results: list[str], max_retries: int) -> bool:
     return wasted < max(1, max_retries)
 
 
+#: The shard half of a claim key: `s<index>of<width>`. **THE ONE SPELLING.**
+#:
+#: It had THREE. `admission.claim_key` built it, `Job.claim_key` built it again, and
+#: `forge_store.decode_claim_key` parsed it with a regex written from scratch -- one grammar, three
+#: independent definitions, and the two writers were byte-identical by luck rather than by
+#: construction. Changing any one of them silently strands every live claim: the shard suffix stops
+#: matching, shard 1 is refused while shard 0 is held, and the mechanism degrades to serial WITHOUT
+#: ERRORING. Both `claim_key` docstrings warn about exactly that failure while being two of the
+#: three copies that could cause it.
+#:
+#: HERE rather than in `job`, because `job` imports this module and the arrow must not reverse.
+SHARD_SUFFIX = 's{shard}of{n_shards}'
+
+#: The inverse, for the same reason. A parser written separately from the writer is the drift.
+SHARD_SUFFIX_PATTERN = r's(?P<shard>\d+)of(?P<n_shards>\d+)'
+
+
+def shard_suffix(*, shard: int | None, n_shards: int | None) -> str:
+    """The `/s<i>of<n>` tail of a claim key, or `''` for work that is not sharded.
+
+    ``n_shards <= 1`` IS THE UNSHARDED IDENTITY, byte-for-byte: live claims and their leases already
+    exist under the bare spelling, and a key that changed shape would strand every in-flight claim
+    -- and let a second runner take work that really is running.
+    """
+    if not n_shards or n_shards <= 1:
+        return ''
+    return '/' + SHARD_SUFFIX.format(shard=shard, n_shards=n_shards)
+
+
 def claim_key(job: dict) -> str:
     """The claim namespace for ``job``. A GROUP HAS NO TESTKEY, and `None` is not a key.
 
@@ -267,9 +296,9 @@ def claim_key(job: dict) -> str:
     """
     base = job['testkey'] if job.get('testkey') else f'group-{job["group"]}'
     n_shards = int(job.get('n_shards') or 1)
-    if n_shards <= 1:
-        return base
-    return f'{base}/s{int(job["shard"])}of{n_shards}'
+    # THE SUFFIX IS NOT SPELLED HERE. See `shard_suffix`: this was one of three copies of one
+    # grammar, and the two that wrote it agreed by luck.
+    return base + shard_suffix(shard=int(job['shard']) if n_shards > 1 else None, n_shards=n_shards)
 
 
 #: A claim of this runner's own must be at least this old before the free lock is read as proof the

@@ -382,3 +382,46 @@ class TestReportIsTheSameVerdictNamespace:
         bench = _bench(forge, owner='human')
         with pytest.raises(LeaseLost):
             Ticket(workbench=bench, job=JOB, owner='human').report(verdict='PASS', detail='')
+
+
+class TestDifferentOwnersLookAtDifferentWork:
+    """THE DEFECT THE BOUND INTRODUCED, and the mechanism that was sitting unused beside it.
+
+    `Claimable.preferred` was measured live on 2026-08-10: rotating each owner's start position by a
+    hash of its name took completed jobs per round from 1 to 7 at sixteen runners. **Nothing in this
+    package called it.** Unbounded that was waste; once `available` grew a `limit` it became
+    starvation -- every owner examining the same first K, racing the same head, K-1 of them doing
+    nothing while work sat visible past the edge of the screen.
+    """
+
+    def test_two_owners_with_a_BOUND_do_not_examine_the_same_head(self, forge, submitter):
+        """THE DISCRIMINATING ASSERTION. Without the rotation both owners see job 0 and nothing else;
+        the sets are then identical and this fails.
+        """
+        for i in range(12):
+            submitter.register(Job(id=f'g/j{i}', kind=TEST_RUN))
+        first = _bench(forge, owner='alice').available(TEST_RUN, limit=2).offered.jobs
+        second = _bench(forge, owner='bob-the-second').available(TEST_RUN, limit=2).offered.jobs
+        assert {j.id for j in first} != {j.id for j in second}, (
+            'both owners examined the same head; the bound is starvation without the rotation'
+        )
+
+    def test_the_rotation_is_a_PERMUTATION_and_never_hides_work(self, forge, submitter):
+        """A partition starves: with three items and ten runners, seven get an empty shard. Every
+        job must still be reachable by every owner, just later.
+        """
+        for i in range(6):
+            submitter.register(Job(id=f'g/j{i}', kind=TEST_RUN))
+        for owner in ('alice', 'bob', 'carol', 'dave'):
+            seen = _bench(forge, owner=owner).available(TEST_RUN).offered.jobs
+            assert {j.id for j in seen} == {f'g/j{i}' for i in range(6)}
+
+    def test_it_is_DETERMINISTIC_so_a_retry_races_the_item_it_just_lost(self, forge, submitter):
+        """By sha256 rather than `hash()`, which is salted per process: two runs of one owner would
+        otherwise prefer different items and a retry would race a fresh item instead of its own.
+        """
+        for i in range(8):
+            submitter.register(Job(id=f'g/j{i}', kind=TEST_RUN))
+        once = _bench(forge, owner='alice').available(TEST_RUN, limit=3).offered.jobs
+        twice = _bench(forge, owner='alice').available(TEST_RUN, limit=3).offered.jobs
+        assert [j.id for j in once] == [j.id for j in twice]

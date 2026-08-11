@@ -224,8 +224,14 @@ class Workbench:
         **WHAT `limit` DOES NOT DO, said because the obvious reading is wrong:** it does not hide
         work. Jobs past the bound are simply not claim-checked, so they may still be taken by key --
         and `Survey.bound_bit` says the look stopped early, so a caller can never render "no work
-        available" when the truthful sentence is "none in the first K". Pairing it with
-        `Claimable.preferred` is what stops every owner examining the SAME first K.
+        available" when the truthful sentence is "none in the first K".
+
+        **THE ORDER IS ROTATED BY OWNER FIRST (`Claimable.preferred`), AND THAT IS PART OF THE
+        BOUND, NOT A GARNISH.** Without it every owner examines the same first K, races the same
+        head, and K-1 of them do nothing while work sits visible past the edge of the screen -- the
+        bound converting waste into starvation. This docstring used to NAME `preferred` as the
+        pairing that prevents it while nothing in the package called it, which is the same defect as
+        the heartbeat that named a cadence it recomputed. The code now does what the sentence says.
 
         **RETURNS A `Survey`.** Not a bare list, and not a bare `Claimable` either: four different
         situations produce zero offers and a human needs different words for each. See `Survey`.
@@ -237,7 +243,17 @@ class Workbench:
             msg = f'limit must be positive or None, got {limit!r}; a zero bound offers nothing and says nothing'
             raise ValueError(msg)
         listed = self.store.claimable(kind)
-        capable = [job for job in listed.jobs if listed.requirements_for(job) <= self.capabilities]
+        # ROTATED BY OWNER BEFORE ANYTHING IS BOUNDED, and this line is the repair for a defect the
+        # bound INTRODUCED. `preferred` was measured live on 2026-08-10 to take completed jobs per
+        # round from 1 to 7 at sixteen runners, purely by making different owners lead with
+        # different items -- and NOTHING in this package called it. Unbounded, that was waste;
+        # bounded, it is starvation: every owner would examine the same first K, race the same head,
+        # and K-1 of them would do nothing while work sat visible past the edge of the screen.
+        #
+        # It is applied HERE rather than left to the caller because the caller cannot: the bound is
+        # applied below, so by the time a caller sees the result the tail it would have rotated into
+        # view is already gone.
+        capable = [job for job in listed.preferred(self.owner) if listed.requirements_for(job) <= self.capabilities]
         considered = capable if limit is None else capable[:limit]
 
         jobs: list[Job] = []

@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import socketserver
 import subprocess
@@ -111,14 +112,38 @@ def poll_interval(policy_path: Path, *, default: float = DEFAULT_POLL_INTERVAL_S
     belonging to whichever checkout it happened to start in.
 
     AN UNREADABLE OR MALFORMED POLICY FALLS BACK RATHER THAN RAISING, and that direction is chosen:
-    the cost of a wrong cadence is polling at 45 s instead of 30, while the cost of raising is a
+    the cost of an UNKNOWN cadence is polling at 45 s instead of 30, while the cost of raising is a
     fleet that will not start because somebody left a trailing bracket in a config file.
+
+    **A DECLARED NON-POSITIVE CADENCE IS A DIFFERENT CASE AND IT RAISES.** The sentence above used
+    to cover it and was false: `poll_seconds = 0` does not cost "45 s instead of 30", it makes
+    `wait_for_work` return instantly forever, so the clock spawns a fresh tick process as fast as
+    the machine allows. That is a fork bomb wearing a config key. The distinction is KNOWN-BAD
+    versus UNKNOWN: a malformed file leaves the value unknown, and falling back is the humane
+    answer; a file that says zero has stated something that cannot be a cadence, and papering over
+    it would substitute a number the operator did not choose while their fleet melted.
+
+    Raises:
+        ValueError: the policy declares a cadence that is not a positive, finite number of seconds.
     """
     try:
         policy = tomllib.loads(Path(policy_path).read_text(encoding='utf-8'))
     except (OSError, tomllib.TOMLDecodeError):
         return default
-    return float(policy.get('schedule', {}).get('poll_seconds', default))
+    declared = policy.get('schedule', {}).get('poll_seconds', default)
+    try:
+        seconds = float(declared)
+    except (TypeError, ValueError) as exc:
+        msg = f'{policy_path} declares poll_seconds = {declared!r}, which is not a number of seconds'
+        raise ValueError(msg) from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        msg = (
+            f'{policy_path} declares poll_seconds = {declared!r}. A non-positive or infinite cadence '
+            f'is not a slow clock -- it is a clock that spawns a tick as fast as the machine allows, '
+            f'or one that never ticks again. State a positive number of seconds.'
+        )
+        raise ValueError(msg)
+    return seconds
 
 
 def maintenance_policy(policy_path: Path) -> dict | None:
@@ -398,6 +423,18 @@ class Clock:
         """
         if not list(self.tick_command):
             msg = 'Clock needs a tick command to spawn; there is no default one-shot to fall back on'
+            raise ValueError(msg)
+        if not math.isfinite(self.heartbeat_every_s) or self.heartbeat_every_s <= 0:
+            # REFUSED HERE, BESIDE THE OTHER CONSTRUCTION CHECK, because the failure it prevents is
+            # not a slow heartbeat. `run_once_through` waits `min(interval, heartbeat_every_s)`, so
+            # a zero cadence turns that poll into a busy spin that stamps the heartbeat file and
+            # SPAWNS `beat_command` as fast as the machine allows -- a subprocess per iteration, for
+            # the whole length of a tick. It reads as a liveness signal working extremely well.
+            msg = (
+                f'Clock needs a positive heartbeat cadence, got {self.heartbeat_every_s!r}. A '
+                f'non-positive one does not beat slowly; it spins, spawning the beat command as '
+                f'fast as the machine allows.'
+            )
             raise ValueError(msg)
 
     def beat(self) -> None:

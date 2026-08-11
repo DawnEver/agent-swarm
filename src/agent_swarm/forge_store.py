@@ -59,6 +59,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import ClassVar, Self
 
+from agent_swarm.admission import SHARD_SUFFIX_PATTERN
 from agent_swarm.claim import Arbiter, Held, LeaseLost, beat_interval, decode_claim
 from agent_swarm.forge import Forge
 from agent_swarm.item_index import IndexCorruptError, ItemIndex, NotIndexed
@@ -81,7 +82,13 @@ VERDICT_LABELS = {
 }
 _LABEL_TO_VERDICT = {label: word for word, label in VERDICT_LABELS.items()}
 
-_ITEM_TITLE_ROOT = '[swarm]'
+#: The first token of EVERY work-item title this package creates, seats included.
+#:
+#: PUBLIC because `seats` needs it and had its own copy. Two constants holding '[swarm]' agree until
+#: one is edited: `purge_namespace` matches on THIS prefix, so a seat pool spelling its own would
+#: quietly stop being purged -- the cleanup would report success having matched nothing, and the
+#: leak would only ever be visible on a real server.
+ITEM_TITLE_ROOT = '[swarm]'
 
 #: THE HANDOVER LABEL. An item without it is NOT work, whoever created it and whatever its title.
 #:
@@ -243,8 +250,10 @@ def decode_claim_key(key: str, *, kind: JobKind) -> Job | None:
         return None
     rest = key[len(prefix) :]
     shard = n_shards = None
-    if (m := re.fullmatch(r'(?P<id>.+)/s(?P<i>\d+)of(?P<n>\d+)', rest)) is not None:
-        rest, shard, n_shards = m.group('id'), int(m.group('i')), int(m.group('n'))
+    # THE PATTERN IS THE WRITER'S, not a second one written from the same description. A parser
+    # authored separately from its writer is the drift, and this file was the third copy.
+    if (m := re.fullmatch(rf'(?P<id>.+)/{SHARD_SUFFIX_PATTERN}', rest)) is not None:
+        rest, shard, n_shards = m.group('id'), int(m.group('shard')), int(m.group('n_shards'))
     if not rest:
         return None
     return Job(id=rest, kind=kind, shard=shard, n_shards=n_shards)
@@ -563,7 +572,7 @@ class ForgeStore:
     def _item_title(self, job: Job) -> str:
         """The ONE spelling of a work item's identity. Everything that needs to find a job's item
         goes through here, so there is one scheme rather than two copies drifting apart."""
-        return f'{_ITEM_TITLE_ROOT} {self.namespace}/{job.claim_key()}'
+        return f'{ITEM_TITLE_ROOT} {self.namespace}/{job.claim_key()}'
 
     def claimable(self, kind: JobKind) -> Claimable:
         """Work of `kind` a runner could take: OPEN, in this namespace, and not yet answered.
@@ -602,7 +611,7 @@ class ForgeStore:
         conclusion is already published. `test_a_REOPENED_item_carrying_a_verdict_label_is_not_work`
         is the only test that discriminates it.
         """
-        prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        prefix = f'{ITEM_TITLE_ROOT} {self.namespace}/'
         jobs: list[Job] = []
         requires: dict[str, frozenset[str]] = {}
         for item in self.forge.list_work_items(state='open'):
@@ -665,7 +674,7 @@ class ForgeStore:
             group: the id prefix that identifies the series -- a branch name, for candidates. The
                 store does not know what a branch is; it knows that ids are `group/rest`.
         """
-        prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        prefix = f'{ITEM_TITLE_ROOT} {self.namespace}/'
         best: tuple[int, Job] | None = None
         for item in self.forge.list_work_items(state='open'):
             if item.state != 'open' or not item.title.startswith(prefix):
@@ -944,7 +953,7 @@ class ForgeStore:
             msg = f'a {Role.RUNNER.value} store may not reconcile work items; that is the submitter lifecycle'
             raise PermissionError(msg)
 
-        prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        prefix = f'{ITEM_TITLE_ROOT} {self.namespace}/'
         by_title: dict[str, list[int]] = {}
         for item in self.forge.list_work_items(state='open'):
             # OPEN ITEMS ONLY, and that is what makes this sweep IDEMPOTENT rather than an alarm
@@ -986,7 +995,7 @@ class ForgeStore:
         swarm's items are not reachable from here. HOW an item is retired is the forge's business --
         this deployment closes and retitles, another may delete.
         """
-        title_prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
+        title_prefix = f'{ITEM_TITLE_ROOT} {self.namespace}/'
         for item in self.forge.list_work_items():
             if item.title.startswith(title_prefix):
                 self.forge.retire_work_item(item.number)

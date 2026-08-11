@@ -25,6 +25,7 @@ import pytest
 
 from agent_swarm import clock
 from agent_swarm.clock import (
+    DEFAULT_POLL_INTERVAL_S,
     Clock,
     maintenance_due,
     maintenance_policy,
@@ -424,3 +425,55 @@ class _Sink:
 
     def flush(self) -> None:
         pass
+
+
+class TestACadenceThatCannotBeACadence:
+    """CLASS A: a computed bound that is inert -- or worse -- at some legal configuration.
+
+    Both defects below are invisible at the production values (45 s poll, 30 s beat) and neither was
+    reachable by review, because the code reads as arithmetic that obviously works. They are the
+    same shape as the heartbeat interval that could not fire inside the lease it protected.
+    """
+
+    def test_a_DECLARED_zero_poll_cadence_is_refused_rather_than_spinning(self, tmp_path):
+        """`poll_seconds = 0` does not poll slowly. `wait_for_work` returns instantly forever, so
+        the clock spawns a fresh tick process as fast as the machine allows -- a fork bomb wearing a
+        config key. The docstring used to claim the cost of a wrong cadence was "45 s instead of 30".
+        """
+        policy = tmp_path / 'policy.toml'
+        for bad in ('0', '-5', 'inf'):
+            policy.write_text(f'[schedule]\npoll_seconds = {bad}\n', encoding='utf-8')
+            with pytest.raises(ValueError, match='poll_seconds'):
+                poll_interval(policy)
+
+    def test_a_MALFORMED_policy_still_falls_back_because_unknown_is_not_known_bad(self, tmp_path):
+        """The distinction the fix rests on. A trailing bracket leaves the cadence UNKNOWN and the
+        fleet should still start; a file that says zero has stated something that cannot be a
+        cadence. Collapsing the two would either melt a fleet or refuse to start over a typo.
+        """
+        policy = tmp_path / 'policy.toml'
+        policy.write_text('[schedule\npoll_seconds = 30\n', encoding='utf-8')
+        assert poll_interval(policy) == DEFAULT_POLL_INTERVAL_S
+        assert poll_interval(tmp_path / 'absent.toml') == DEFAULT_POLL_INTERVAL_S
+
+    def test_a_NON_NUMERIC_declared_cadence_names_itself(self, tmp_path):
+        policy = tmp_path / 'policy.toml'
+        policy.write_text('[schedule]\npoll_seconds = "soon"\n', encoding='utf-8')
+        with pytest.raises(ValueError, match='not a number of seconds'):
+            poll_interval(policy)
+
+    @pytest.mark.parametrize('bad', [0.0, -1.0, float('inf')])
+    def test_a_NON_POSITIVE_beat_cadence_is_refused_at_CONSTRUCTION(self, tmp_path, bad):
+        """`run_once_through` waits `min(interval, heartbeat_every_s)`, so a zero cadence turns that
+        poll into a busy spin that stamps the heartbeat AND spawns `beat_command` as fast as the
+        machine allows -- for the whole length of a tick. It reads as a liveness signal working
+        extremely well.
+        """
+        with pytest.raises(ValueError, match='heartbeat cadence'):
+            Clock(
+                tick_command=[sys.executable, '-c', 'pass'],
+                policy_path=tmp_path / 'p.toml',
+                heartbeat_path=tmp_path / 'h.json',
+                maintenance_stamp=tmp_path / 'm.json',
+                heartbeat_every_s=bad,
+            )

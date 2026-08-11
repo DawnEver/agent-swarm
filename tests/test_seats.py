@@ -23,7 +23,7 @@ import pytest
 
 from agent_swarm import seats as seats_module
 from agent_swarm.claim import LeaseLost
-from agent_swarm.forge_store import Role
+from agent_swarm.forge_store import ITEM_TITLE_ROOT, ForgeStore, Role
 from agent_swarm.seats import (
     DeclaredSeats,
     SeatPool,
@@ -186,3 +186,28 @@ class TestProvisioningIsTheSubmittersAlone:
         number = provision_seat_item(forge, namespace=NAMESPACE, tool=TOOL, role=Role.SUBMITTER)
         assert find_seat_item(forge, namespace=NAMESPACE, tool=TOOL) == number
         assert forge.work_item(number).title == seat_item_title(NAMESPACE, TOOL)
+
+
+class TestTheTitleRootIsNotASecondCopy:
+    """CLASS C, and this one was mine. `forge_store` and `seats` each held `'[swarm]'`.
+
+    Two constants with the same value agree until one is edited. `ForgeStore.purge_namespace`
+    matches on the STORE's prefix, so a seat pool spelling its own would quietly stop being purged:
+    the cleanup would report success having matched nothing, and the leak is only ever visible on a
+    real server -- which is exactly where the live seat tests create items.
+    """
+
+    def test_a_seat_item_is_REACHED_by_the_stores_own_prefix(self, forge, catalog):
+        """The behavioural assertion, not a constant comparison: two identical constants pass an
+        equality check and still drift apart the next time one is edited. This plants a seat item
+        and makes the STORE clean it up.
+        """
+        pool = _pool(forge, catalog)
+        pool.acquire(owner='holder')
+        ForgeStore(NAMESPACE, forge, role=Role.SUBMITTER).purge_namespace()
+        assert pool.item_number in forge.retired, (
+            'purge_namespace did not reach the seat item; the two title roots have drifted'
+        )
+
+    def test_the_seat_title_is_built_from_the_STORES_root(self):
+        assert seat_item_title(NAMESPACE, TOOL).startswith(f'{ITEM_TITLE_ROOT} {NAMESPACE}/')

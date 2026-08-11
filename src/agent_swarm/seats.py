@@ -40,7 +40,7 @@ from typing import Protocol, runtime_checkable
 
 from agent_swarm.claim import Arbiter, Held, Holders
 from agent_swarm.forge import Forge
-from agent_swarm.forge_store import NOT_VISIBLE, NotVisible, Role
+from agent_swarm.forge_store import ITEM_TITLE_ROOT, NOT_VISIBLE, NotVisible, Role
 
 #: How long a seat survives without a beat. MUCH SHORTER than a job claim's three hours, and that
 #: difference is the heartbeat's whole return: a seat is beaten while it is held, so the lease only
@@ -49,7 +49,6 @@ from agent_swarm.forge_store import NOT_VISIBLE, NotVisible, Role
 #: costing the fleet five minutes and costing it an afternoon.
 DEFAULT_SEAT_LEASE_SECONDS = 300.0
 
-_SEAT_ITEM_ROOT = '[swarm]'
 _SEAT_SEGMENT = 'seat'
 
 
@@ -117,7 +116,7 @@ def seat_item_title(namespace: str, tool: str) -> str:
     the symptom of drift is a pool that provisions one item and arbitrates on another, i.e. every
     seat granted twice.
     """
-    return f'{_SEAT_ITEM_ROOT} {namespace}/{_SEAT_SEGMENT}/{tool}'
+    return f'{ITEM_TITLE_ROOT} {namespace}/{_SEAT_SEGMENT}/{tool}'
 
 
 def provision_seat_item(forge: Forge, *, namespace: str, tool: str, role: Role) -> int:

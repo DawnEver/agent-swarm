@@ -34,6 +34,8 @@ from dataclasses import fields
 import pytest
 
 from agent_swarm import WHOLE_BOX, is_known_class
+from agent_swarm.admission import claim_key, shard_suffix
+from agent_swarm.forge_store import decode_claim_key
 from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
 
 
@@ -138,3 +140,62 @@ class TestItIsHashableAndComparable:
         job = Job(id='a', kind=TEST_RUN, ram_gib=1.0)
         with pytest.raises(Exception):  # noqa: B017 -- dataclass raises FrozenInstanceError
             job.ram_gib = 99.0  # type: ignore[misc]
+
+
+class TestTheShardGrammarHasEXACTLYOneSpelling:
+    """CLASS C: one grammar, three independent definitions, two of them agreeing by luck.
+
+    `admission.claim_key` built the `s<i>of<n>` suffix, `Job.claim_key` built it again, and
+    `forge_store.decode_claim_key` parsed it with a regex written from the same description. Editing
+    any one of them strands every live claim SILENTLY: the suffix stops matching, shard 1 is refused
+    while shard 0 is held, and sharding degrades to serial without erroring. Both `claim_key`
+    docstrings warn about that exact failure while being two of the three copies that cause it.
+    """
+
+    def test_the_WRITER_and_the_READER_are_the_same_grammar(self):
+        """A round trip, which is the only assertion that fails when the two drift apart."""
+        for shard, width in ((0, 2), (1, 2), (2, 4), (7, 8)):
+            job = Job(id='abc', kind=TEST_RUN, shard=shard, n_shards=width)
+            back = decode_claim_key(job.claim_key(), kind=TEST_RUN)
+            assert back is not None
+            assert (back.shard, back.n_shards) == (shard, width)
+
+    def test_the_TWO_writers_agree_by_construction_and_not_by_luck(self):
+        """`admission.claim_key` takes the dict shape and `Job.claim_key` the dataclass; they must
+        produce the same suffix for the same shard, because both feed one claim namespace.
+        """
+        for shard, width in ((1, 2), (3, 4)):
+            from_job = Job(id='abc', kind=TEST_RUN, shard=shard, n_shards=width).claim_key()
+            from_dict = claim_key({'testkey': 'abc', 'shard': shard, 'n_shards': width})
+            assert from_job.endswith(from_dict.removeprefix('abc')), (from_job, from_dict)
+            assert from_dict == 'abc' + shard_suffix(shard=shard, n_shards=width)
+
+    def test_the_UNSHARDED_key_is_byte_for_byte_the_pre_sharding_form(self):
+        """Live claims and their leases exist under the bare spelling. A key that changed shape
+        would strand every in-flight claim AND let a second runner take work that is running.
+        """
+        assert shard_suffix(shard=None, n_shards=None) == ''
+        assert shard_suffix(shard=0, n_shards=1) == ''
+        assert Job(id='abc', kind=TEST_RUN).claim_key() == 'test-run/abc'
+        assert claim_key({'testkey': 'abc'}) == 'abc'
+
+    def test_NOBODY_ELSE_spells_the_suffix(self):
+        """The structural half. SEARCH SCOPE: the code tokens plus string literals of every module
+        under src/agent_swarm/ except `admission` itself, scanned for the literal `of` join that the
+        three copies all contained.
+        """
+        import re as _re
+        from pathlib import Path as _Path
+
+        import agent_swarm as _pkg
+
+        root = _Path(_pkg.__file__).parent
+        offenders = []
+        for module in sorted(root.glob('*.py')):
+            if module.name == 'admission.py':
+                continue
+            text = module.read_text(encoding='utf-8')
+            for line in text.splitlines():
+                if _re.search(r"""s\{[a-z_]*shard[a-z_]*\}of\{|of\(\?P<n|s\(\?P<i""", line):
+                    offenders.append(f'{module.name}: {line.strip()[:70]}')
+        assert not offenders, f'the shard grammar is spelled outside admission: {offenders}'

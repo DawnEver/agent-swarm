@@ -27,7 +27,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 
-from agent_swarm.admission import WHOLE_BOX
+from agent_swarm.admission import WHOLE_BOX, shard_suffix
 
 
 class JobKind(enum.Enum):
@@ -98,7 +98,6 @@ class Job:
         An unsharded job keys byte-identically to the pre-sharding form, so introducing shards did
         not orphan every claim already in the store.
         """
-        base = f'{self.kind.value}/{self.id}'
-        if self.n_shards and self.n_shards > 1:
-            return f'{base}/s{self.shard}of{self.n_shards}'
-        return base
+        # THE SUFFIX GRAMMAR IS `admission.shard_suffix`'s, not this method's -- see it for the
+        # three-copy defect this replaces.
+        return f'{self.kind.value}/{self.id}' + shard_suffix(shard=self.shard, n_shards=self.n_shards)
