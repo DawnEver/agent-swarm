@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import pytest
 
+from agent_swarm import admission
+
 from agent_swarm import (
     CHEAP,
-    KNOWN_CLASSES,
     SHARED_SLOWDOWN,
+    VENDOR_PREFIX,
     WHOLE_BOX,
     admission_blockers,
     capacity_blocker,
     claim_key,
     classes_conflict,
+    is_known_class,
     should_retry,
     staleness_blocker,
     time_blocker,
@@ -50,7 +53,16 @@ class TestTheClassRelation:
     def test_two_cheap_jobs_never_conflict(self):
         assert not classes_conflict(CHEAP, CHEAP)
 
-    @pytest.mark.parametrize('unknown', [None, '', 'typo', 'vendor', 'EXPENSIVE'])
+    def test_cheap_conflicts_with_the_whole_box_AND_NOTHING_ELSE(self):
+        """The half the other three leave open. `cheap` is bounded by CAPACITY, not by exclusion, so
+        it must run beside a vendor job -- otherwise a parse tier waits on a licence server it never
+        touches, and the loss is invisible: nothing errors, the box merely stops overlapping.
+        """
+        assert classes_conflict(CHEAP, WHOLE_BOX)
+        assert not classes_conflict(CHEAP, 'vendor:femm')
+        assert not classes_conflict(CHEAP, CHEAP)
+
+    @pytest.mark.parametrize('unknown', [None, '', 'typo', 'vendor', 'EXPENSIVE', 'vendor:', 'VENDOR:femm'])
     def test_anything_unrecognised_is_the_whole_box(self, unknown):
         """DEFAULT-DENY. The alternative is that a typo in policy silently grants a job the right to
         run beside everything, surfacing as two heavy runs starving each other rather than as a
@@ -68,8 +80,54 @@ class TestTheClassRelation:
         """
         assert classes_conflict(a, b) == classes_conflict(b, a)
 
-    def test_the_vocabulary_is_closed_and_named(self):
-        assert {WHOLE_BOX, CHEAP} <= KNOWN_CLASSES
+
+class TestTheClassVocabularyIsAShapeNotAList:
+    """WHICH vendors exist is the CONSUMER's fact. This layer knows only the FORM.
+
+    The set this replaced named `vendor:femm` and `vendor:jmag` -- one project's two FEA tools,
+    frozen into vendor-neutral infrastructure, invisible because it worked for that project. Same
+    defect as `DEFAULT_REPO`, same fix: delete the enumeration, keep the mechanism.
+    """
+
+    def test_the_two_built_in_classes_are_known(self):
+        assert is_known_class(WHOLE_BOX)
+        assert is_known_class(CHEAP)
+
+    @pytest.mark.parametrize('name', ['femm', 'jmag', 'matlab', 'a-tool-this-package-never-heard-of'])
+    def test_any_named_vendor_is_known(self, name):
+        """The discriminating half. A predicate that accepted only what it had been told about would
+        pass every test above and still be the coupling.
+        """
+        assert is_known_class(f'{VENDOR_PREFIX}{name}')
+
+    def test_an_EMPTY_vendor_name_is_REFUSED(self):
+        """`vendor:` accepted would collapse every typo'd class into ONE exclusivity slot: unrelated
+        jobs serialising on a shared lock they have no reason to share. That failure is a HANG, not
+        an error -- the fleet just gets slower, and no log says why.
+        """
+        assert not is_known_class('vendor:')
+
+    def test_a_refused_class_falls_to_the_whole_box(self):
+        """The refusal must reach the RELATION, not merely the predicate: default-deny is what makes
+        an unrecognised class conservative instead of permissive.
+        """
+        assert classes_conflict('vendor:', CHEAP)
+        assert classes_conflict('nonsense', CHEAP)
+
+    @pytest.mark.parametrize('gone', ['KNOWN_CLASSES', '_VENDOR_PREFIX'])
+    def test_the_enumerated_vocabulary_is_GONE_not_aliased(self, gone):
+        """No compat alias. A surviving name is the value the next caller reaches for -- the exact
+        reason `DEFAULT_REPO`'s removal had to take its default with it.
+        """
+        assert not hasattr(admission, gone)
+
+    def test_the_interface_the_consumer_already_uses_still_works(self):
+        """Consumers pass these strings TODAY against an installed copy of this package. The
+        vocabulary changed shape; the wire format did not, and may not.
+        """
+        assert is_known_class('vendor:femm')
+        assert is_known_class('vendor:jmag')
+        assert not classes_conflict('vendor:femm', 'vendor:jmag')
 
 
 class TestAdmissionBlockers:

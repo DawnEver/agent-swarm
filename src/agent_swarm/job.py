@@ -58,8 +58,10 @@ class Job:
         id: identity within its kind -- an issue number, a testkey, a group name.
         kind: which instance of the loop this belongs to.
         ram_gib: measured peak RSS, or ``None`` when nobody has measured it yet.
-        exclusivity: the class from `admission.KNOWN_CLASSES`. Defaults to the WHOLE BOX, so a job
-            that forgot to declare one cannot be granted the right to run beside everything.
+        exclusivity: a class `admission.is_known_class` accepts -- `WHOLE_BOX`, `CHEAP`, or the
+            vendor form `vendor:<name>`, whose names are the CONSUMER's to declare, not this
+            package's to enumerate. Defaults to the WHOLE BOX, so a job that forgot to declare one
+            cannot be granted the right to run beside everything.
         solo_seconds: measured duration running alone, or ``None``.
         ceiling_seconds: the budget beyond which this job's own timeouts fire, or ``None``.
         shard / n_shards: which slice of a split job, and how wide the split is. Both are part of

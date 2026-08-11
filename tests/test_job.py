@@ -33,7 +33,7 @@ from dataclasses import fields
 
 import pytest
 
-from agent_swarm import KNOWN_CLASSES, WHOLE_BOX
+from agent_swarm import WHOLE_BOX, is_known_class
 from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
 
 
@@ -89,8 +89,12 @@ class TestItStatesItsOwnCost:
         assert Job(id='x', kind=TEST_RUN).exclusivity == WHOLE_BOX
 
     def test_a_declared_exclusivity_must_be_a_KNOWN_class(self):
+        """A vendor name the LIBRARY has never heard of is still a valid class: the shape is the
+        contract, and which vendors exist belongs to whatever declares the job.
+        """
         job = Job(id='x', kind=TEST_RUN, exclusivity='vendor:femm')
-        assert job.exclusivity in KNOWN_CLASSES
+        assert is_known_class(job.exclusivity)
+        assert is_known_class(Job(id='x', kind=TEST_RUN, exclusivity='vendor:nobody-shipped-this').exclusivity)
 
 
 class TestTheClaimIdentity:

@@ -52,7 +52,15 @@ PACKAGE = Path(forge.__file__).parent
 
 #: Lower-cased substrings that name ONE project rather than a capability. The owner is included
 #: because a repo path is two halves and only one of them is the project's name.
-FORBIDDEN = ('motronics', 'tianjie-zou')
+#:
+#: THE VENDOR TOOLS ARE HERE FOR THE SAME REASON THE REPO IS. `admission.KNOWN_CLASSES` enumerated
+#: `vendor:femm` and `vendor:jmag` -- two FEA tools belonging to the consumer, not to the fleet --
+#: and the shape rule that replaced them accepts those strings anyway, so NO BEHAVIOURAL test can
+#: tell a re-enumeration from the mechanism. Only a source assertion can, which is what this is.
+#: The docstring exemption below is what keeps the MEASUREMENTS ("jmag takes 356 s solo") legal:
+#: those record where a number came from, and this file's whole point is that provenance is not
+#: coupling.
+FORBIDDEN = ('motronics', 'tianjie-zou', 'femm', 'jmag')
 
 
 def _offending(source: str, *, where: str) -> list[str]:
@@ -117,6 +125,15 @@ def test_the_scanner_catches_it_as_an_identifier():
     in the one place a reader looks for what a module knows about the world.
     """
     assert _offending('MOTRONICS_GATE = 1\n', where='x')
+
+
+def test_the_scanner_catches_an_enumerated_vendor_class():
+    """The exact line that was in `admission.py`. A vendor class is a KIND -- "monopolises one
+    licensed tool" -- and WHICH tools exist is the consumer's data; a built-in list makes adding one
+    a release of this package. It is undetectable behaviourally, because the shape rule accepts
+    those two strings too, so it is pinned at the source.
+    """
+    assert _offending("KNOWN_CLASSES = frozenset({'expensive', 'cheap', 'vendor:femm', 'vendor:jmag'})\n", where='x')
 
 
 def test_the_scanner_ignores_a_docstring():

@@ -116,7 +116,9 @@ class TestIdStability:
         # would abandon the verdict history of work that did not change.
         assert load(_item(**hint)).items[0].job.id == load(_item()).items[0].job.id
 
-    @pytest.mark.parametrize('material', [{'title': 'a different job'}, {'acceptance': 'pytest -q -k other', 'rem': 'human'}])
+    @pytest.mark.parametrize(
+        'material', [{'title': 'a different job'}, {'acceptance': 'pytest -q -k other', 'rem': 'human'}]
+    )
     def test_a_material_change_moves_the_id(self, material) -> None:
         # A verdict is a statement about a specific brief judged by a specific criterion. Keeping
         # the id would let an old PASS answer the new item -- the unearned green, by re-editing.

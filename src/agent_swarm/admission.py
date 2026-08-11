@@ -40,12 +40,42 @@ WHOLE_BOX = 'expensive'
 #: Parse/scan tiers. Bounded by capacity (M3), not by exclusion.
 CHEAP = 'cheap'
 
-#: Classes that share a bounded external resource: one FEMM 4.2 install, one JMAG COM server. Two
-#: jobs of the SAME vendor collide over it; two of DIFFERENT vendors do not, which `fanout.md`
-#: records as a user directive ("FEMM and JMAG DO run concurrently") that nothing enforced.
-_VENDOR_PREFIX = 'vendor:'
+#: The VENDOR FORM: `vendor:<name>`, a class whose jobs share one bounded external resource -- one
+#: installation, one licence server, one COM object. Two jobs of the SAME vendor collide over it;
+#: two of DIFFERENT vendors do not, which `fanout.md` records as a user directive ("FEMM and JMAG DO
+#: run concurrently") that nothing enforced.
+VENDOR_PREFIX = 'vendor:'
 
-KNOWN_CLASSES = frozenset({WHOLE_BOX, CHEAP, 'vendor:femm', 'vendor:jmag'})
+
+def is_known_class(cls: str | None) -> bool:
+    """Is ``cls`` a class this layer can reason about? THE ONE PREDICATE; there is no class LIST.
+
+    A SHAPE RULE, NOT AN ENUMERATION, and that is the whole point. This vocabulary was a frozenset
+    naming `vendor:femm` and `vendor:jmag` -- two tools belonging to ONE consumer, hard-coded into
+    vendor-neutral fleet infrastructure. It is the same coupling `default_forge`'s `DEFAULT_REPO`
+    had, and it was invisible for the same reason: it WORKED, for that one project. Infrastructure
+    supplies the MECHANISM -- "a vendor class monopolises something and is exclusive with itself" --
+    and takes WHICH vendors exist as DATA from the caller, which is where it already lived
+    (a consumer's own `policy.toml` says `class = "vendor:femm"`).
+
+    So there is no `KNOWN_CLASSES` to import and nothing to keep in step: a caller that wants to
+    enumerate enumerates what IT declared. Adding a vendor is a line of the consumer's config, never
+    a release of this package.
+
+    AN EMPTY NAME IS REFUSED, and this is a correctness rule rather than tidiness. `'vendor:'`
+    accepted would make every typo'd class the SAME class, so unrelated jobs would serialise on one
+    exclusivity slot -- a HANG, which is the failure mode you cannot read off a log. Refused, it
+    falls to default-deny like any other nonsense: conservative, and visible as a class nobody
+    recognises rather than as a fleet that got slower.
+
+    THE `femm`/`jmag` MENTIONS ELSEWHERE IN THIS MODULE ARE MEASUREMENTS -- "jmag takes 356 s solo",
+    "667 s shared" -- and they STAY. They record where a number came from, and a number whose
+    provenance is deleted is a number nobody can re-take. Only the EXECUTABLE vocabulary must stop
+    naming a consumer's tools; do not "finish the job" by scrubbing the prose.
+    """
+    if cls in (WHOLE_BOX, CHEAP):
+        return True
+    return bool(cls) and cls.startswith(VENDOR_PREFIX) and len(cls) > len(VENDOR_PREFIX)
 
 
 def classes_conflict(a: str | None, b: str | None) -> bool:
@@ -64,11 +94,11 @@ def classes_conflict(a: str | None, b: str | None) -> bool:
     The relation is SYMMETRIC by construction and pinned as such -- an order-dependent answer would
     mean overlap depends on which job arrived first, a race visible only under load.
     """
-    ca = a if a in KNOWN_CLASSES else WHOLE_BOX
-    cb = b if b in KNOWN_CLASSES else WHOLE_BOX
+    ca = a if is_known_class(a) else WHOLE_BOX
+    cb = b if is_known_class(b) else WHOLE_BOX
     if WHOLE_BOX in (ca, cb):
         return True
-    if ca.startswith(_VENDOR_PREFIX) or cb.startswith(_VENDOR_PREFIX):
+    if ca.startswith(VENDOR_PREFIX) or cb.startswith(VENDOR_PREFIX):
         return ca == cb  # same vendor collides over its one install; different vendors do not
     return False  # cheap vs cheap
 
