@@ -5,6 +5,9 @@ here"; `store.try_claim` answers "who gets it"; nothing answered "which one". A 
 either idles or takes whatever is first in a list -- and a list order nobody designed is a scheduling
 policy nobody wrote down.
 
+SECOND LINK OF THE SCHEDULING CHAIN: `admission` -> **allocator** -> `loop` -> `tick` -> `clock`.
+Ranking is the whole of this file's job; `loop` is what then runs whatever came out on top, once.
+
 IT RANKS; IT DOES NOT REFUSE. Every capacity, class and retry question is delegated -- `Box.blockers`
 for the first two, `admission.should_retry` for the third. Re-deriving any of them here would be the
 duplicated-scheme defect this package was extracted to end: two modules deciding one thing are two

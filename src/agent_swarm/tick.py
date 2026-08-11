@@ -1,5 +1,10 @@
 """The driver: one pass of the whole loop, for both kinds of job.
 
+FOURTH LINK OF THE SCHEDULING CHAIN: `admission` -> `allocator` -> `loop` -> **tick** -> `clock`.
+`loop.run_one` runs one JOB; a tick is one PASS, doing at most one thing before exiting. It is not
+what repeats -- `clock` is, from outside, spawning a fresh process each time so a tick that dies
+takes nothing with it.
+
 WHY THIS FILE EXISTS AT ALL -- IT IS THE COMPONENT NOBODY SPECIFIED
 ==================================================================
 

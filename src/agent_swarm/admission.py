@@ -1,5 +1,11 @@
 """ADMISSION: who may run what, right now. The decision half of the swarm job layer.
 
+FIRST LINK OF THE SCHEDULING CHAIN, which reads: `admission` (may I?) -> `allocator` (which of the
+permitted first?) -> `loop` (run exactly one) -> `tick` (one pass of the whole thing) -> `clock`
+(pull the next tick). This module only REFUSES; choosing among what it permits is `allocator`'s, and
+that split is deliberate. Each link names its neighbours and a test keeps it that way -- every one
+of these files is locally clear, and the set was not.
+
 WHAT THIS IS. `.claude/memory/2026/08/09/design-final-architecture-collaboration-and-test-system-unified.md`
 places admission in L1 (swarm), between fabric's capacity FACTS and the project's gate:
 

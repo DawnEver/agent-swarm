@@ -2,6 +2,12 @@
 
     work item -> admission -> atomic claim -> execute -> verdict -> record -> release
 
+MIDDLE LINK OF THE SCHEDULING CHAIN, and the file most people land in first, so it is stated here in
+full: `admission` (may I?) -> `allocator` (which first?) -> **loop** (run exactly ONE) -> `tick` (one
+pass of the whole thing) -> `clock` (pull the next tick). `run_one` is the boundary that makes the
+other four possible -- it does one job and returns, so a crash costs one job, and everything above it
+is free to be a plain function rather than a service.
+
 NOTHING HERE READS `job.kind`, and that is enforced by a test rather than asked for in prose. A
 branch on the kind is the second scheduler in its first commit: it starts as one `if`, accretes,
 and by the time collaboration and testing are two systems with two queues and two verdict
