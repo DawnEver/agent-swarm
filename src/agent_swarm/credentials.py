@@ -80,6 +80,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from agent_swarm import roles
+
 #: The environment variable a caller sets to supply one role's token explicitly. `swarm-agent` ->
 #: `SWARM_TOKEN_AGENT`; a non-role username is normalised the same way so the scheme has no hole.
 _ENV_PREFIX = 'SWARM_TOKEN_'
@@ -91,7 +93,7 @@ _DEFAULT_ENV = os.environ
 
 def env_var_for(username: str) -> str:
     """`swarm-agent` -> `SWARM_TOKEN_AGENT`. The one spelling, so nothing composes it by hand."""
-    bare = username[len('swarm-') :] if username.startswith('swarm-') else username
+    bare = roles.strip_prefix(username)  # the prefix was inlined here -- the third of four spellings
     return _ENV_PREFIX + ''.join(c if c.isalnum() else '_' for c in bare).upper()
 
 

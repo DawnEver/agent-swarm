@@ -45,6 +45,10 @@ LAYERS: dict[str, int] = {
     'lanes': HOST,
     'lifetime': HOST,
     'procs': HOST,
+    # HOST because `forge` (DRIVER) and `swarmctl` (ENTRY) both read it. That is not a preference:
+    # the account scheme had grown FOUR spellings precisely because the fact sat too high for the
+    # lowest consumer to reach, so `forge` grew its own literals instead.
+    'roles': HOST,
     'provenance': HOST,
     # DRIVER -- the outside world and its stand-ins.
     'credentials': DRIVER,

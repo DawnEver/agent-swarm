@@ -80,6 +80,7 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from agent_swarm import roles
 from agent_swarm.claim import LeaseLost
 from agent_swarm.forge import DEFAULT_GITEA_BASE_URL, ForgeError, GiteaForge
 from agent_swarm.forge_store import ForgeStore, Role, decode_claim_key
@@ -176,7 +177,9 @@ def default_owner() -> str:
 
 def build_workbench(settings: Settings) -> Workbench:
     """A RUNNER-role workbench. NO I/O -- construction never touches the network."""
-    forge = GiteaForge(settings.base_url, settings.repo, username='swarm-agent')
+    # NOT a literal: this was the fourth spelling of the account scheme, and the barest one. A change
+    # of prefix would have left this workbench authenticating as an account nobody issues.
+    forge = GiteaForge(settings.base_url, settings.repo, username=roles.account_for('agent'))
     store = ForgeStore(
         settings.namespace,
         forge,

@@ -89,7 +89,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from agent_swarm import credentials
+from agent_swarm import credentials, roles
 from agent_swarm.forge import _BACKOFF_S as BACKOFF_S
 from agent_swarm.forge import API_ATTEMPTS, _is_retryable_status
 
@@ -159,11 +159,16 @@ ROLES: dict[str, tuple[dict[str, str], list[str]]] = {
     ),
 }
 
-#: THE ONE HOME OF THE PREFIX. Both the account names and the team names are built from it, so a
-#: fifth role cannot arrive with an unprefixed team -- there is no literal for it to be spelled in.
-_PREFIX = 'swarm'
+#: THE PREFIX MOVED DOWN TO `roles`, because `forge` needs the same fact and is a layer BELOW this
+#: one -- it cannot import from here without pointing up the arrow, which is why four literals had
+#: grown there instead. Both the account names and the team names are still built from one string,
+#: so a fifth role cannot arrive with an unprefixed team; there is no literal to misspell.
+_PREFIX = roles.PREFIX
 
-USERS = {role: f'{_PREFIX}-{role}' for role in ROLES}
+#: RE-EXPORTED, NOT DEFINED. This was a derivation while `forge.ROLE_ACCOUNTS` was four literals of
+#: the same fact, and each of the two docstrings called ITSELF the only thing deciding which role a
+#: process acts as. Now one owner, two aliases, and no way to edit half the fleet's identity.
+USERS = roles.ACCOUNTS
 
 #: role -> team name. DERIVED, exactly like `USERS` and for the same reason.
 #:
@@ -1365,7 +1370,10 @@ def cmd_verify(provider: GiteaProvider, args: argparse.Namespace) -> int:
 
     say('\nNOT CHECKED FROM HERE, and each needs a real attempt rather than a config read:')
     say('  * does an ABSENT status actually block a merge (not merely a failing one)')
-    say('  * is swarm-agent actually refused a merge')
+    # DERIVED, not typed: operator output naming an account is a spelling like any other, and this
+    # one would have gone on naming `swarm-agent` after a prefix change -- telling the human to test
+    # an account that no longer exists. The literal scanner found this; I had counted four.
+    say(f'  * is {roles.ACCOUNTS["agent"]} actually refused a merge')
     say('  * do the issued token scopes match what was requested')
     say('  A config that LOOKS right is the state this whole design exists to distrust.')
     return 1 if problems else 0

@@ -41,6 +41,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from agent_swarm import roles
+
 _HTTP_TIMEOUT = 60.0
 
 #: How many times an API call is attempted in total. USER DIRECTIVE 2026-08-10:
@@ -735,16 +737,12 @@ class GitHubForge:
         raise self._unmeasured('retire_work_item')
 
 
-#: role -> the forge account it authenticates as. The four share one host, and `git credential fill`
-#: keys on (protocol, host, USERNAME) -- so this mapping is the ONLY thing that makes a process act
-#: as one role rather than another. Gitea has no scope for commit status, so the whole
-#: "only the verifier marks a commit green" boundary rests here and nowhere else.
-ROLE_ACCOUNTS = {
-    'observer': 'swarm-observer',
-    'agent': 'swarm-agent',
-    'verifier': 'swarm-verifier',
-    'integrator': 'swarm-integrator',
-}
+#: role -> the forge account it authenticates as. RE-EXPORTED FROM `roles`, NOT DEFINED HERE: this
+#: was four literals while `swarmctl.USERS` was a derivation of the same fact, and each of the two
+#: docstrings declared ITSELF the only thing deciding a process's identity. A reader believing
+#: either would edit one and ship a fleet whose halves disagree about who they are. The name stays
+#: because callers import it; it is now an alias rather than a second copy.
+ROLE_ACCOUNTS = roles.ACCOUNTS
 
 
 def default_forge(role: str = 'agent', *, repo: str, base_url: str = DEFAULT_GITEA_BASE_URL) -> Forge:
