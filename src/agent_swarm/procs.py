@@ -135,17 +135,57 @@ def self_and_ancestors() -> set[int]:
     return excluded
 
 
-def under(path: str | Path | None, root: Path) -> bool:
+def _canonical(path: str | Path | None) -> Path | None:
+    """One spelling for one directory, or ``None`` if the path cannot be read at all.
+
+    Just ``resolve()``, which collapses `..`, follows links, and -- MEASURED -- expands a Windows
+    8.3 alias: `C:\\PROGRA~1` resolves to `C:\\Program Files`. It does that by asking the FILESYSTEM
+    (`GetFinalPathNameByHandle`), not by string surgery.
+
+    NO ``normcase`` HERE, and the absence is deliberate because the obvious argument for it is
+    FALSE. It was added on the reasoning that Windows paths are case-insensitive while
+    `relative_to` is case-sensitive -- but pathlib's `WindowsPath` already folds case, measured:
+    `Path('...\\DELETED-LANE\\SUB').relative_to(Path('...\\Deleted-Lane'))` returns `SUB`. On POSIX
+    `normcase` is a no-op. So the line could not be distinguished from its own absence by ANY test,
+    and it was removed rather than kept as an untestable comfort with a docstring that lied about
+    the reason.
+
+    THE HOLE THIS DOES NOT CLOSE, named rather than implied: an 8.3 alias can only be expanded for a
+    path that still EXISTS, because the mapping lives on disk. A process whose working directory has
+    been DELETED -- a torn-down worktree, which is routine here -- keeps its short spelling, and
+    nothing in this process can recover the long one. Such a process is attributed by its executable
+    or its command line, or not at all. It is never silently attributed to a DIFFERENT tree, which
+    is the direction that would matter.
+    """
+    try:
+        return Path(path).resolve()
+    except (OSError, ValueError):  # pragma: no cover -- an unreadable or malformed path
+        return None
+
+
+def under(path: str | Path | None, root: str | Path | None) -> bool:
     """Is ``path`` inside ``root``? Path-segment containment, NOT a string prefix.
 
     The distinction is the whole point: ``str.startswith`` would claim a sibling checkout named
     ``<root>-old``, and a fan-out session is exactly where such a sibling exists.
+
+    BOTH SIDES ARE CANONICALISED HERE, and that is a fix rather than tidiness. This resolved only
+    the LEFT side, and every caller in this module happens to hand it an already-resolved root -- so
+    the scope was right BY ACCIDENT, in a public function whose docstring never said the root had to
+    be resolved first. MEASURED: `Path('C:/PROGRA~1/Common Files').relative_to(Path('C:/Program
+    Files'))` raises `ValueError` across two spellings of one directory. A caller passing a root
+    straight from an environment variable or a config file would therefore get False for EVERY
+    process -- and the failure direction is a sweep that finds nothing and reports success, which is
+    the instrument-that-lies shape this module exists to prevent.
     """
-    if not path:
+    if not path or not root:
+        return False
+    here, tree = _canonical(path), _canonical(root)
+    if here is None or tree is None:
         return False
     try:
-        Path(path).resolve().relative_to(root)
-    except (ValueError, OSError):
+        here.relative_to(tree)
+    except ValueError:
         return False
     return True
 
@@ -175,8 +215,9 @@ def is_tree_process(
     user does not own; a missing field is absence of evidence, not evidence of absence, so it simply
     does not vote.
     """
-    tree = Path(root).resolve()
-    if under(exe, tree) or under(cwd, tree):
+    # `under` canonicalises both sides itself, so the root is passed through raw: one place decides
+    # what "the same directory" means, and a caller cannot get a different answer by pre-resolving.
+    if under(exe, root) or under(cwd, root):
         return True
     return any(token in part for part in (cmdline or ()))
 

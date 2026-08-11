@@ -150,6 +150,78 @@ class TestAttributionIsStructural:
         assert not procs.under(sibling, root.resolve())
         assert not procs.is_tree_process(token='mytoken', root=root, cwd=str(sibling))
 
+    def test_the_ROOT_need_not_be_pre_resolved(self, tmp_path):
+        """THE SCOPE THAT WAS RIGHT BY ACCIDENT. `under` used to canonicalise only the LEFT side,
+        and every caller in this module happened to hand it an already-resolved root -- so the gap
+        was invisible while the docstring said nothing about the requirement.
+
+        A root arriving from an environment variable, a config file or a `%TEMP%` expansion is not
+        canonical, and the failure direction is the bad one: False for EVERY process, i.e. a sweep
+        that finds nothing and reports success.
+        """
+        root = tmp_path / 'checkout'
+        (root / 'sub').mkdir(parents=True)
+        # `..`, NOT `.` -- pathlib silently drops a `.` component at construction, so a root spelled
+        # with one is already canonical and the test would assert nothing. Mutation testing caught
+        # exactly that: reverting the fix left this test green.
+        non_canonical = root / '..' / 'checkout'
+
+        assert procs.under(root / 'sub', non_canonical)
+        assert procs.is_tree_process(token='nope', root=non_canonical, cwd=str(root / 'sub'))
+
+    def test_the_two_sides_may_differ_in_CASE(self, tmp_path):
+        """psutil hands back whatever spelling each process reported, so the two sides do differ in
+        case -- including for a path that no longer exists, where `resolve()` cannot repair it.
+
+        WHAT SUPPLIES THIS PROPERTY IS PATHLIB, NOT US, and saying so is the point of the test. I
+        added an `os.path.normcase` here on the reasoning that `relative_to` is case-sensitive.
+        That reasoning is FALSE: `WindowsPath` already folds case, measured --
+        `Path('...\\DELETED-LANE\\SUB').relative_to(Path('...\\Deleted-Lane'))` returns `SUB`, and on
+        POSIX `normcase` is a no-op. So the line could not be distinguished from its own absence by
+        any test I could write, and it was deleted rather than kept as an untestable comfort.
+
+        This test survives it because the PROPERTY is what matters and is genuinely relied on: it
+        still goes red if containment is ever rewritten as a string comparison, which is the change
+        that would actually take it away.
+        """
+        gone = tmp_path / 'Deleted-Lane'
+        worker_cwd = str(gone / 'sub').upper()
+
+        assert procs.under(worker_cwd, gone)
+        assert not procs.under(worker_cwd, tmp_path / 'other-lane')
+
+    @pytest.mark.skipif(not Path(r'C:\PROGRA~1').exists(), reason='needs a Windows 8.3 alias')
+    def test_a_WINDOWS_SHORT_PATH_names_the_same_directory(self):
+        """A REAL alias, not a constructed one: `C:\\PROGRA~1` IS `C:\\Program Files`, and it exists
+        even on boxes where 8.3 CREATION has since been disabled.
+
+        MEASURED, and it is why the fix is in `under` rather than in some replacement for
+        `resolve()`: `resolve()` DOES expand the alias (it asks the filesystem via
+        `GetFinalPathNameByHandle`), so a canonicalised pair compares equal. What raises `ValueError`
+        is an UNRESOLVED root against a resolved path -- the exact asymmetry this function had.
+        """
+        short = Path(r'C:\PROGRA~1')
+        long = Path(r'C:\Program Files')
+
+        assert procs.under(short / 'Common Files', long)
+        assert procs.under(long / 'Common Files', short)
+        assert not procs.under(long, short / 'Common Files'), 'containment is not symmetric'
+
+    def test_a_path_that_no_longer_EXISTS_is_still_compared_by_segment(self, tmp_path):
+        """A NAMED HOLE, pinned so that it stays named. `resolve()` can only expand an alias for a
+        path that EXISTS, because the mapping lives on disk -- so a process whose worktree was
+        deleted keeps whatever spelling it had. Case and `..` still normalise (`normcase` does not
+        touch the disk); an 8.3 alias cannot.
+
+        What must hold either way, and is the direction that would matter: a vanished path is never
+        attributed to the WRONG tree.
+        """
+        root = tmp_path / 'checkout'
+        gone = root / 'deleted-worktree'
+
+        assert procs.under(gone, root), 'a segment comparison does not require the leaf to exist'
+        assert not procs.under(gone, tmp_path / 'other')
+
     def test_missing_fields_do_not_vote(self, tmp_path):
         """`psutil` raises `AccessDenied` per FIELD on a process this user does not own. A missing
         field is absence of evidence, not evidence of absence.
