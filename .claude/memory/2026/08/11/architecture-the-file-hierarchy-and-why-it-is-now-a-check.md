@@ -76,9 +76,64 @@ named rather than resting on a gap. Nothing outside `DEV_TOOL` and `ENTRY` may i
 - **`swarmctl` is 1636 lines, 14% of the package, and never touches `Job`.** It is the only module
   for which "independently shippable" is true today. Splitting it is correct direction and
   **expensive** — it blocks nothing, so it stays.
-- **7 modules have no in-package importer** (`seats` `board` `fabric` `bench` `lanes` `provenance`
-  `rem_bridge`). "AVAILABLE, not ENFORCED" is a **global property of this package**, not a quirk of
-  `seats`: the mechanisms are built, the wiring is elsewhere or absent. That is the next real
-  question, and it is about integration, not about files.
+- **`fabric` has no production entry point** — see the correction below. This is the real one.
 - `loop` / `tick` / `clock` is a good decomposition that **readers will confuse**, and only `clock`'s
   docstring says why the three are separate.
+
+---
+
+## CORRECTION (same day, from an audit): the "7 unimported modules" claim was wrong
+
+I wrote above that seven modules have no in-package importer and that **"AVAILABLE, not ENFORCED" is
+a global property of this package**. That generalised from a count without checking any of the
+seven. Audited one by one:
+
+| module | verdict |
+|---|---|
+| `lanes` | **WIRED** — `motronics/scripts/lanes/new_lane.py:55`, `prune_lanes.py:36` |
+| `rem_bridge` | **WIRED and final** — runnable as `python -m agent_swarm.rem_bridge`; `DEV_TOOL`; no importer is CORRECT |
+| `provenance` | **DECLINED on purpose**, in writing, by its intended consumer |
+| `board` | **OWED but externally BLOCKED**, and it says so itself |
+| `bench` | **OWED an entry point** — the only one truly unreachable |
+| `seats` | **OWED** — needs a user input (seat counts), not a code change |
+| `fabric` | **OWED** — the real gap |
+
+**The error was collapsing "no importer" into "no caller"** — the exact distinction I had warned the
+auditor about one message earlier. A count is not a finding.
+
+### The two facts that make the audit trustworthy rather than a grep
+
+- **Zero dynamic loads inside `agent_swarm`**, so static analysis IS complete for this package —
+  a property, not an assumption.
+- **`motronics/scripts/ci/ci_tick.py:1532-1533` imports `agent_swarm.forge`/`status` via
+  `importlib`**, so over there a `from agent_swarm` grep alone misses live consumers.
+- NOT searched: any other checkout on the box, and the TUI agents' repos. Stated so the reader does
+  not supply "everything".
+
+All seven were introduced 2026-08-10/11. **Nothing here is a rotted orphan**; "DEAD" is the answer
+for none of them.
+
+### `provenance` is the item worth remembering
+
+Its consumer read it and **declined it deliberately**: importing `agent_swarm.provenance` into
+`gate.py` would give the verdict instrument a **version floor on the dependency whose identity it
+exists to record**. The exact state you most want reported — agent_swarm present, its `provenance`
+submodule absent — would then produce **no gate at all** rather than **no provenance line**.
+
+**An instrument that refuses to measure when the thing it measures is unusual is worse than one that
+reports a gap.** The decision is registered with its own cost: the redaction rule now has two
+spellings held together by a sentence in each file, and the note says that mechanism is weak.
+
+`board` is the same shape from the other side — **a guard that names its hole is not the defect; the
+defect is a doc implying there isn't one.**
+
+### The one real gap
+
+**`fabric` / `agent_executor` / `Fleet` are constructed only in TESTS, in both repos.** The chain
+exists and every link is tested; not one is built in production code. `swarmctl` and `workbench_cli`
+are the two real entries and neither builds a `Fleet`.
+
+So it is not "fabric is unimported" — **the entire agent-execution half is built, tested, and
+unreachable.** The missing call site is whatever daemon owns `tick`, and that daemon does not exist
+in either repo. A design decision, not a wiring oversight, and the next milestone after the
+credential pin bump.
