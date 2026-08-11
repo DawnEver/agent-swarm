@@ -106,6 +106,53 @@ class Ticket:
         self.workbench.store.release(self.job, owner=self.owner)
 
 
+@dataclass(frozen=True, slots=True)
+class Survey:
+    """What one look at the queue actually saw. **Its truthiness is deliberately undefined.**
+
+    WHY THE COUNTS TRAVEL WITH THE JOBS. A surface that returned only the jobs forces its caller to
+    render "nothing to do" for four different situations: the queue is empty, this box lacks every
+    capability, everything is already claimed, or the bound stopped us looking. Those need different
+    words in front of a human, and a caller cannot invent the difference after the fact -- so the
+    numbers come back from the layer that knows them.
+
+    THE BAN IS `Claimable`'s, for the reason `Claimable` gives, and it is inherited rather than
+    softened: an empty survey means nothing was VISIBLE, never that nothing exists.
+
+    Attributes:
+        offered: what this box may take, and the only thing safe to hand a `take`.
+        visible: open items of this kind the listing returned. A LOWER BOUND -- a list read can be
+            stale, so this is what was observed and never what exists.
+        capable: how many of those passed the capability filter.
+        examined: how many had their claim state read. Below `capable` exactly when `limit` bit,
+            and that difference is what a caller must say out loud rather than round off.
+        limit: the bound that was applied, or ``None`` for none.
+    """
+
+    offered: Claimable
+    visible: int
+    capable: int
+    examined: int
+    limit: int | None = None
+
+    def __bool__(self) -> bool:
+        msg = (
+            'Survey has no truth value: an empty result means NO WORK VISIBLE, never no work '
+            'exists, because a forge list read can be stale and a bound may have stopped the look '
+            'early. Write `.offered.jobs` and say which question you are asking.'
+        )
+        raise TypeError(msg)
+
+    @property
+    def bound_bit(self) -> bool:
+        """Whether the bound stopped us short of looking at everything this box could do.
+
+        THE ONE FACT A CALLER MUST NOT ROUND OFF. When this is true, "no work available" means "none
+        in the first K", and there may be work just past the edge of the screen.
+        """
+        return self.examined < self.capable
+
+
 class Workbench:
     """One pull-mode executor's view of the queue: what it may take, taking it, and answering.
 
@@ -135,21 +182,22 @@ class Workbench:
         self.owner = owner
         self.capabilities = frozenset(capabilities)
 
-    def available(self, kind: JobKind) -> Claimable:
+    def available(self, kind: JobKind, *, limit: int | None = None) -> Survey:
         """Work of `kind` this box could actually do, in the store's own order.
 
         TWO FILTERS, AND THEY ARE NOT THE SAME KIND OF STATEMENT:
 
-        * **capabilities.** A job whose `requires:` is not a subset of ours is not offered. This is
-          decidable from the listing labels `Claimable` already carries, so it costs nothing, and it
-          is exact -- a missing capability does not become available later.
-        * **already claimed.** ADVISORY, and it costs one comment read per candidate. A list read
-          can be stale and a claim can be taken between this call and the next, so this removes work
-          a person would waste a minute discovering; it decides nothing. `take` is the arbiter, and
-          it refuses.
+        * **capabilities.** A job whose `requires:` is not a subset of ours is not offered. Decidable
+          from the listing labels `Claimable` already carries, so it costs nothing, and it is exact
+          -- a missing capability does not become available later. IT RUNS FIRST, which is what
+          makes work this box cannot do cost zero reads; the order is load-bearing and tested.
+        * **already claimed.** ADVISORY, and it costs one comment read per candidate examined. A
+          list read can be stale and a claim can be taken between this call and the next, so this
+          removes work a person would waste a minute discovering; it decides nothing. `take` is the
+          arbiter, and it refuses.
 
-        **THE COST, MEASURED RATHER THAN JUSTIFIED, AND THE JUSTIFICATION DOES NOT SURVIVE IT.**
-        Against `RecordingForge`, every item claimable and none claimed:
+        **THE COST, MEASURED, AND THE MEASUREMENT IS WHY `limit` EXISTS.** Against `RecordingForge`,
+        every item claimable and none claimed:
 
             open items      10      100      500     1000
             forge calls     11      101      501     1001     (1 list + 1 comment read per item)
@@ -161,39 +209,53 @@ class Workbench:
         from that floor, and labelled a projection because this has never been run against a real
         server: ~0.6 s at 10 items, ~6 s at 100, ~30 s at 500.
 
-        **SO "the resource conserved is a person's attention" HOLDS AT TEN ITEMS AND FAILS AT FIVE
-        HUNDRED.** At 500 the filter spends thirty seconds of a person's attention to save them from
-        occasionally being told "somebody got there first" -- it costs more of the thing it was
-        defending than it saves, while the person watches a terminal do nothing. The argument was
-        written before the number and the number refutes it. It is left standing here, refuted,
-        rather than quietly reworded, because a reader deciding whether to call this on a large
-        queue needs the refutation more than they need the claim.
+        **THE UNBOUNDED FORM'S JUSTIFICATION -- "the resource conserved is a person's attention" --
+        HOLDS AT TEN ITEMS AND FAILS AT FIVE HUNDRED**, and the refutation is left standing rather
+        than reworded: at 500 the filter spends thirty seconds of a person's attention to save them
+        from occasionally being told "somebody got there first". It costs more of the thing it was
+        defending than it saves, while the person watches a terminal do nothing.
 
-        **WHAT WOULD FIX IT, DELIBERATELY NOT FIXED HERE.** The attention argument is about the jobs
-        a person actually SEES, so the read should be paid for those and not for the tail: bound the
-        filter to the first K of the returned order and leave the rest unfiltered. There is no CLI
-        yet, so there is no real screen to derive K from, and inventing one now would be fixing a
-        cost nobody has paid with a number nobody measured. Until then `store.claimable(kind)` is
-        the unfiltered single call, and a caller that cannot afford this should use it directly.
-        `TestTheCostOfOfferingWork` pins the N+1 so the shape cannot regress while the decision is
-        open.
+        **`limit` IS THE REPAIR, AND IT IS A BOUND ON LOOKING, NEVER ON OFFERING.** The attention
+        argument is about the jobs a person actually SEES, so the read is paid for those and not for
+        the tail. It was left unimplemented until a CLI existed, because K cannot be invented -- it
+        is a property of a screen, and `workbench_cli` derives it from the real terminal height.
+        `None` keeps the unbounded behaviour, which is right for a caller with no screen.
 
-        **RETURNS A `Claimable`.** An empty one means nothing VISIBLE, never nothing to do; see the
-        module docstring for why laundering that into a list would matter most here.
+        **WHAT `limit` DOES NOT DO, said because the obvious reading is wrong:** it does not hide
+        work. Jobs past the bound are simply not claim-checked, so they may still be taken by key --
+        and `Survey.bound_bit` says the look stopped early, so a caller can never render "no work
+        available" when the truthful sentence is "none in the first K". Pairing it with
+        `Claimable.preferred` is what stops every owner examining the SAME first K.
+
+        **RETURNS A `Survey`.** Not a bare list, and not a bare `Claimable` either: four different
+        situations produce zero offers and a human needs different words for each. See `Survey`.
         """
-        offered = self.store.claimable(kind)
+        if limit is not None and limit <= 0:
+            # A zero bound examines nothing and offers nothing, which is indistinguishable at the
+            # surface from an empty queue -- the exact confusion `Survey` exists to prevent, arriving
+            # through a parameter rather than through a stale read.
+            msg = f'limit must be positive or None, got {limit!r}; a zero bound offers nothing and says nothing'
+            raise ValueError(msg)
+        listed = self.store.claimable(kind)
+        capable = [job for job in listed.jobs if listed.requirements_for(job) <= self.capabilities]
+        considered = capable if limit is None else capable[:limit]
+
         jobs: list[Job] = []
         requires: dict[str, frozenset[str]] = {}
-        for job in offered.jobs:
-            needed = offered.requirements_for(job)
-            if not needed <= self.capabilities:
-                continue
+        for job in considered:
             if self.store.claim_owner(job) is not None:
                 continue
+            needed = listed.requirements_for(job)
             if needed:
                 requires[job.claim_key()] = needed
             jobs.append(job)
-        return Claimable(jobs=tuple(jobs), requires=requires)
+        return Survey(
+            offered=Claimable(jobs=tuple(jobs), requires=requires),
+            visible=len(listed.jobs),
+            capable=len(capable),
+            examined=len(considered),
+            limit=limit,
+        )
 
     def take(self, job: Job) -> Ticket | None:
         """Claim `job` for this owner. ``None`` if somebody else got there first.

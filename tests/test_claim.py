@@ -28,6 +28,7 @@ import pytest
 from agent_swarm import claim as claim_module
 from agent_swarm.claim import (
     Arbiter,
+    beat_interval,
     ArbitrationUnsound,
     Held,
     Holders,
@@ -279,6 +280,30 @@ class TestTheLeaseAndTheHeartbeat:
         assert hold.needs_beat(now=taken_at + 1.0) is False
         assert hold.needs_beat(now=taken_at + 74.0) is False
         assert hold.needs_beat(now=taken_at + 76.0) is True
+
+    def test_the_cadence_is_NEVER_LONGER_THAN_THE_LEASE_IT_PROTECTS(self):
+        """THE REGRESSION TEST FOR A REAL BUG, found 2026-08-11 by a test that used a short lease.
+
+        `workbench_cli.Beater` floored its own interval at 1.0 s. For any lease under four seconds
+        the first beat therefore landed AFTER the lease had already expired -- a heartbeat that
+        cannot fire in time, which in a diff is indistinguishable from one that can, and which never
+        bound at the production lease. The general property is the one the floor violated: the
+        cadence must always leave room for a beat.
+        """
+        for lease in (0.1, 0.4, 1.0, 4.0, 300.0, 10800.0):
+            assert beat_interval(lease) < lease, f'a lease of {lease}s cannot be beaten in time'
+            assert beat_interval(lease) == pytest.approx(lease / 4)
+
+    def test_a_NON_POSITIVE_lease_has_no_cadence_and_says_so(self):
+        """A cadence of zero is a caller spinning against the forge as fast as it can -- the shape
+        that gets a fleet rate-limited rather than the shape that gets noticed.
+        """
+        for lease in (0.0, -1.0):
+            with pytest.raises(ValueError, match='cannot derive a beat cadence'):
+                beat_interval(lease)
+
+    def test_the_ARBITER_consults_the_one_derivation_and_does_not_repeat_it(self, forge):
+        assert _arbiter(forge, lease_seconds=8.0).beat_every == beat_interval(8.0)
 
     def test_the_cadence_SHRINKS_with_the_lease(self, forge):
         """Derived, not set beside it. A cadence that stayed put while the lease shrank is how a

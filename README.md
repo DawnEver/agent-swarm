@@ -50,6 +50,21 @@ TUI agent. `available` / `take` / `report`, over the primitives the CI runner al
 person and a runner contend for one claim instead of holding two. No new protocol: only one kind of
 executor had ever been built, which is why this looked like part of the gate.
 
+`agent_swarm.workbench_cli` — the way IN to that surface, and without it the third executor kind is
+implemented and unusable. `list` / `take` / `report` over the same claim the CI runner uses:
+
+```bash
+python -m agent_swarm.workbench_cli --repo OWNER/NAME --namespace ns list
+python -m agent_swarm.workbench_cli --repo OWNER/NAME --namespace ns take test-run/abc -- pytest -q
+```
+
+**There is no detached `take`** — a claim is only ever held by a live process, because "claim it and
+walk away" is the parking defect with a friendly name. `take` claims, beats the lease, runs your
+command as a child, reports the verdict and releases. Close the terminal and you lose the ticket in
+minutes rather than hours: the beater dies with the process, and `lifetime` binds the child so the
+work stops too. Every failure is an exit code, and an empty queue (`0`) is a different code from an
+unreachable forge (`3`).
+
 ## No runtime dependencies, by design
 
 This layer *decides*; it does not reach. Facts arrive as arguments, stores arrive through adapters.

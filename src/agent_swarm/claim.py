@@ -88,6 +88,30 @@ from agent_swarm.forge import CommentGone, Forge
 CLAIM_MARKER = 'CLAIM'
 
 
+def beat_interval(lease_seconds: float) -> float:
+    """How often a holder must beat to keep a lease of this length. **The ONE derivation.**
+
+    A QUARTER OF THE LEASE, so three consecutive beats may be lost -- to a 5xx, a retry storm, a GC
+    pause -- before the fleet concludes the holder is dead.
+
+    IT IS A FUNCTION RATHER THAN A NUMBER EACH CALLER PICKS, because the second spelling of this
+    value is a real defect and it was already written once, in this package, by the same hand:
+    `workbench_cli.Beater` floored its own interval at 1.0 s, which for any lease under four seconds
+    is a beat that **can never fire before the lease it is protecting expires** -- the
+    inner-timeout-above-the-outer-ceiling shape, where the mechanism reads as present and is
+    unreachable. It was invisible until a test used a short lease, because at the production lease
+    the floor never bound. Anything needing the cadence calls this; nothing derives it again.
+
+    Raises:
+        ValueError: a non-positive lease. A cadence of zero is a caller spinning as fast as it can
+            against the forge -- the shape that gets a fleet rate-limited rather than noticed.
+    """
+    if lease_seconds <= 0:
+        msg = f'cannot derive a beat cadence from a lease of {lease_seconds!r}'
+        raise ValueError(msg)
+    return lease_seconds / 4
+
+
 class LeaseLost(RuntimeError):
     """The lease this process believed it held is gone, and the work must STOP.
 
@@ -299,9 +323,9 @@ class Arbiter:
         self.item_number = item_number
         self.slots = slots
         self.lease_seconds = lease_seconds
-        #: How often a holder should beat. Derived, never configured separately -- see
-        #: `Held.needs_beat` for why the two are one decision rather than two numbers.
-        self.beat_every = lease_seconds / 4
+        #: How often a holder should beat. From `beat_interval`, never re-derived here -- see that
+        #: function for the defect a second spelling of this number already caused.
+        self.beat_every = beat_interval(lease_seconds)
 
     def take(self, *, owner: str) -> Held | None:
         """Post, read once, and hold if we are inside the first N. ``None`` if we are not.

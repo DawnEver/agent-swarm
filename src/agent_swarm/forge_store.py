@@ -59,7 +59,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import ClassVar, Self
 
-from agent_swarm.claim import Arbiter, Held, LeaseLost, decode_claim
+from agent_swarm.claim import Arbiter, Held, LeaseLost, beat_interval, decode_claim
 from agent_swarm.forge import Forge
 from agent_swarm.item_index import IndexCorruptError, ItemIndex, NotIndexed
 from agent_swarm.job import Job, JobKind
@@ -463,6 +463,16 @@ class ForgeStore:
         mine = arbiter.holders().by(owner)
         if mine is not None:
             arbiter.release(owner=owner, comment_id=mine.comment_id)
+
+    @property
+    def beat_every(self) -> float:
+        """How often a holder of one of THIS store's claims must beat.
+
+        OFFERED SO A CALLER NEVER COMPUTES IT. A process hosting a heartbeat needs the cadence and
+        holds a store, not an arbiter; without this it would divide `lease_seconds` itself, which is
+        the second spelling `claim.beat_interval` exists to prevent.
+        """
+        return beat_interval(self.lease_seconds)
 
     def _arbiter(self, number: int) -> Arbiter:
         """This store's claim, which is the package's ONE claim, at one slot.

@@ -121,40 +121,44 @@ class TestAvailableIsCapabilitiesTimesRequires:
         submitter.register(JOB)
         submitter.register(NEEDY, requires=['a-licensed-tool'])
         bench = _bench(forge, owner='human', capabilities=())
-        assert [j.id for j in bench.available(TEST_RUN).jobs] == ['plain']
+        assert [j.id for j in bench.available(TEST_RUN).offered.jobs] == ['plain']
 
     def test_work_this_box_CAN_do_is_offered(self, forge, submitter):
         submitter.register(NEEDY, requires=['a-licensed-tool'])
         bench = _bench(forge, owner='human', capabilities=['a-licensed-tool', 'spare'])
-        assert [j.id for j in bench.available(TEST_RUN).jobs] == ['needy']
+        assert [j.id for j in bench.available(TEST_RUN).offered.jobs] == ['needy']
 
     def test_EVERY_requirement_must_be_met_not_merely_one(self, forge, submitter):
         """Subset, not intersection. An "any of" reading admits a box holding one of three tools."""
         submitter.register(NEEDY, requires=['one', 'two'])
-        assert _bench(forge, owner='h', capabilities=['one']).available(TEST_RUN).jobs == ()
-        assert len(_bench(forge, owner='h', capabilities=['one', 'two']).available(TEST_RUN).jobs) == 1
+        assert _bench(forge, owner='h', capabilities=['one']).available(TEST_RUN).offered.jobs == ()
+        assert len(_bench(forge, owner='h', capabilities=['one', 'two']).available(TEST_RUN).offered.jobs) == 1
 
     def test_already_CLAIMED_work_is_not_offered(self, forge, submitter):
         submitter.register(JOB)
         _runner(forge).try_claim(JOB, owner='the-ci-runner')
-        assert _bench(forge, owner='human').available(TEST_RUN).jobs == ()
+        assert _bench(forge, owner='human').available(TEST_RUN).offered.jobs == ()
 
     def test_the_requirements_RIDE_ALONG_so_nothing_re_reads_them(self, forge, submitter):
         """The offered set carries what each job needs, from the SAME listing labels. A pull surface
         that asked per job would be the N+1 measured at 101 calls for 100 items and deleted.
         """
         submitter.register(NEEDY, requires=['one', 'two'])
-        offered = _bench(forge, owner='h', capabilities=['one', 'two']).available(TEST_RUN)
+        offered = _bench(forge, owner='h', capabilities=['one', 'two']).available(TEST_RUN).offered
         assert offered.requirements_for(NEEDY) == frozenset({'one', 'two'})
 
     def test_the_result_STILL_refuses_to_be_truthy(self, forge, submitter):
         """The distinction must survive the filter. "No work visible" is not "no work exists", and
         a human reading the second one acts on it.
         """
-        offered = _bench(forge, owner='human').available(TEST_RUN)
-        assert isinstance(offered, Claimable)
+        survey = _bench(forge, owner='human').available(TEST_RUN)
+        assert isinstance(survey.offered, Claimable)
         with pytest.raises(TypeError, match='NO WORK VISIBLE'):
-            bool(offered)
+            bool(survey.offered)
+        # AND THE SURVEY ITSELF, which is the object a caller now holds first. Banning the inner one
+        # while leaving the wrapper truthy would move the laundering up a level, not remove it.
+        with pytest.raises(TypeError, match='NO WORK VISIBLE'):
+            bool(survey)
 
 
 class TestTheCostOfOfferingWork:
@@ -185,9 +189,9 @@ class TestTheCostOfOfferingWork:
         bench = _bench(forge, owner='human')
         forge.reset()
 
-        offered = bench.available(TEST_RUN)
+        survey = bench.available(TEST_RUN)
 
-        assert len(offered.jobs) == items
+        assert len(survey.offered.jobs) == items
         assert forge.calls['list_work_items'] == 1, 'the listing is read more than once'
         assert forge.calls['comments'] == items, 'the claimed filter is not one read per candidate'
         assert sum(forge.calls.values()) == items + 1
@@ -204,9 +208,9 @@ class TestTheCostOfOfferingWork:
         bench = _bench(forge, owner='human', capabilities=[])
         forge.reset()
 
-        offered = bench.available(TEST_RUN)
+        survey = bench.available(TEST_RUN)
 
-        assert offered.jobs == ()
+        assert survey.offered.jobs == ()
         assert forge.calls['labels'] == 0, 'requirements were re-fetched per item'
         # Nothing is read for work this box cannot do: the capability filter runs FIRST, so the
         # expensive half is never reached. Ordering the two the other way round would cost the full
@@ -275,7 +279,7 @@ class TestTakeIsTheRUNNERSOwnCompareAndSwap:
         """
         number = submitter.register(NEEDY)
         bench = _bench(forge, owner='human')
-        offered = bench.available(TEST_RUN)
+        offered = bench.available(TEST_RUN).offered
         assert offered.jobs  # offered while it required nothing
         forge.add_label(number, 'requires:a-licensed-tool')
         with pytest.raises(MissingCapability):
@@ -369,7 +373,7 @@ class TestReportIsTheSameVerdictNamespace:
         submitter.register(JOB)
         bench = _bench(forge, owner='human')
         bench.take(JOB).report(verdict='PASS', detail='')
-        assert bench.available(TEST_RUN).jobs == ()
+        assert bench.available(TEST_RUN).offered.jobs == ()
 
     def test_a_ticket_cannot_be_forged_into_a_verdict_for_someone_else(self, forge, submitter):
         """A hand-built ticket is the shape a caller reaches for when a lease has lapsed."""
