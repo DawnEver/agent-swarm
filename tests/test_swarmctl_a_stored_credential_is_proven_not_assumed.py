@@ -158,8 +158,8 @@ class _Provider:
         self._works = works
         self.base_url, self.org = 'http://host:9000', 'Org'
         self._teams = [
-            {'name': team, 'id': index, 'units_map': dict(units)}
-            for index, (team, units, _scopes) in enumerate(swarmctl.ROLES.values(), start=1)
+            {'name': swarmctl.TEAMS[role], 'id': index, 'units_map': dict(units)}
+            for index, (role, (units, _scopes)) in enumerate(swarmctl.ROLES.items(), start=1)
         ]
         self._member_of = {index: swarmctl.USERS[role] for index, role in enumerate(swarmctl.ROLES, start=1)}
 
@@ -296,7 +296,7 @@ def test_the_endpoint_is_within_every_roles_scopes(swarmctl):
     written out, so a role added without repository read turns this red instead of silently
     reintroducing the scope-vs-auth confusion.
     """
-    for role, (_team, _units, scopes) in swarmctl.ROLES.items():
+    for role, (_units, scopes) in swarmctl.ROLES.items():
         assert any(scope.endswith(':repository') for scope in scopes), (
             f'{role} cannot read the repo, so the credential probe cannot distinguish a scope '
             f'refusal from an authentication refusal for it'

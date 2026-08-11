@@ -70,7 +70,7 @@ class _Provider:
     def create_user(self, username: str) -> None:
         self._server.users.add(username)
 
-    def ensure_team(self, team_name: str, _units) -> tuple[int, str]:
+    def ensure_team(self, team_name: str, _units, *, was_called: str | None = None) -> tuple[int, str]:
         if team_name not in self._server.teams:
             team_id = len(self._server.teams) + 1
             self._server.teams[team_name] = team_id
@@ -94,7 +94,7 @@ def test_a_recreated_user_is_put_back_in_its_team(swarmctl, capsys):
 
     server.provision()
 
-    for role, (team_name, _units, _scopes) in swarmctl.ROLES.items():
+    for role, team_name in swarmctl.TEAMS.items():
         team_id = server.teams[team_name]
         assert swarmctl.USERS[role] in server.members[team_id], f'{team_name} is empty after re-provisioning'
 
