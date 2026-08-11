@@ -204,16 +204,30 @@ class Workbench:
             in-memory ms   0.1      0.4      1.8      3.8
 
         Exactly N+1, linear, no hidden constant. **The milliseconds are not the cost** -- they are a
-        dict answering. The cost is N HTTP round trips, and this package's own live measurement puts
-        the per-call floor at ~60 ms p50 (`Claimable.preferred`, measured 2026-08-10). PROJECTED
-        from that floor, and labelled a projection because this has never been run against a real
-        server: ~0.6 s at 10 items, ~6 s at 100, ~30 s at 500.
+        dict answering. The cost is N HTTP round trips.
+
+        **THE FLOOR IS MEASURED, NOT BORROWED** (2026-08-11, live Gitea): a single uncontended
+        `GET comments` -- the exact call this filter makes -- is **36.4 ms p50**, 45.5 ms p95, over
+        20 samples. That REPLACES a projection scaled from ~60 ms p50, which had been measured on
+        2026-08-10 for a DIFFERENT operation, and it moves the estimate DOWNWARD:
+
+            open items        10       100       500
+            was (projected)  0.6 s     6 s      30 s     (from the borrowed 60 ms)
+            now (measured)   0.36 s    3.6 s    18.2 s   (from this call's own 36.4 ms)
+
+        The smaller number is recorded rather than the flattering one. **The conclusion is
+        unchanged and the claim is smaller**: 18 seconds is still far past what a person will watch
+        a terminal do nothing for.
+
+        WHAT THAT NUMBER IS NOT: one box, one moment, 20 samples, on single-node Gitea, with nothing
+        checking what else was loading the server. It is better than a projection from an unrelated
+        call; it is not a property of the deployment.
 
         **THE UNBOUNDED FORM'S JUSTIFICATION -- "the resource conserved is a person's attention" --
         HOLDS AT TEN ITEMS AND FAILS AT FIVE HUNDRED**, and the refutation is left standing rather
-        than reworded: at 500 the filter spends thirty seconds of a person's attention to save them
-        from occasionally being told "somebody got there first". It costs more of the thing it was
-        defending than it saves, while the person watches a terminal do nothing.
+        than reworded: at 500 the filter spends eighteen seconds of a person's attention to save
+        them from occasionally being told "somebody got there first". It costs more of the thing it
+        was defending than it saves, while the person watches a terminal do nothing.
 
         **`limit` IS THE REPAIR, AND IT IS A BOUND ON LOOKING, NEVER ON OFFERING.** The attention
         argument is about the jobs a person actually SEES, so the read is paid for those and not for

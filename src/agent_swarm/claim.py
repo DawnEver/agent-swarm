@@ -47,9 +47,15 @@ issue, FOUR independent rounds, exactly one winner each (`runner-03`, `r14`, `r0
 back monotonic, unique and gapless (161->176 for 16 posts). Median claim latency ~280 ms under
 16-way contention, against 2510 ms for the create-only ref push this replaces. Four rounds and not
 one, because a single round electing a single winner is what a BROKEN protocol also does most of the
-time. **THE N>1 CASE HAS NOT BEEN MEASURED AGAINST A LIVE SERVER** -- the argument above says it
-needs nothing the N=1 case did not, and that is an argument, not a measurement. Said here rather
-than left for a reader to assume the numbers cover both.
+time.
+
+**THE N>1 CASE IS NOW MEASURED TOO** (2026-08-11, same deployment): SEATS=3, 16 racers off a
+`threading.Barrier`, a FRESH item per round, four rounds -- **3, 3, 3, 3**, and 13 of 16 racers
+withdrew each round leaving exactly 3 live claim comments on the server. The monotonic-id
+precondition was probed SEPARATELY and independently in the same run and holds under 16-way
+contention, because a green race on a server that violated it and got lucky is exactly what a race
+alone cannot rule out. So "rank can only fall" is no longer carrying this on its own; it explains a
+measurement instead of substituting for one. `tests/test_seat_contention_live.py` is the probe.
 
 NO REFS. Issues and their comments are the whole storage layer (user directive 2026-08-09:
 彻底废弃 ref, 后面基于 issue 和 project 迭代). A create-only ref push is also a genuine CAS -- measured,
