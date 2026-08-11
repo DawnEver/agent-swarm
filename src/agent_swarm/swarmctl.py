@@ -36,24 +36,32 @@ THE THING THAT BREAKS FIRST IF YOU SKIP IT -- and it is not permissions:
 
     **Four credentials for one host cannot be told apart without a username.**
 
-`git credential fill` disambiguates on (protocol, host, USERNAME), and git takes that username from
-the remote URL. Store four tokens for one host behind a URL with no username and the lookup is
-ambiguous. So every swarm remote must carry its role:
+Every lookup keys on (protocol, host, USERNAME), and git takes that username from the remote URL.
+Four tokens for one host behind a URL with no username is an ambiguous lookup. So every swarm remote
+must carry its role:
 
     http://swarm-agent@server:9000/org/repo.git
 
 `onboard` prints the exact URLs, `enroll` stores credentials under those usernames, and `verify`
 checks the pair actually resolves. This is a protocol property, not a Gitea one -- it is identical on
-GitHub.
+GitHub, and it is the SAME reason the swarm's own store is keyed by username: a store keyed by host
+alone can hold one of four, which is what the ambient one did.
 
 PROVIDER SEAM. Everything except user creation is provider-neutral: teams, repo attachment, branch
 protection and credential storage all exist on GitHub. User creation does not -- GitHub has no API
 for it, machine users are made by hand or replaced by an App. `GitHubProvider` therefore refuses
 `provision` by NAME, listing what a human must do instead, rather than pretending.
 
-TOKENS ARE NEVER PRINTED. They are piped into `git credential approve`, or written to a bundle whose
-only purpose is one move between machines. Summaries show a truncated sha256 -- a hard project
-invariant: never log tokens, hashes only.
+TOKENS ARE NEVER PRINTED. They go into the SWARM'S OWN owner-only store (`agent_swarm.credentials`),
+or into a bundle whose only purpose is one move between machines. Summaries show a truncated sha256
+-- a hard project invariant: never log tokens, hashes only.
+
+**NOT THE OPERATOR'S CREDENTIAL STORE, and that is a repair rather than a preference.** This used to
+pipe them into `git credential approve`. A credential store holds ONE entry per (protocol, host) and
+four role accounts share one host, so enrolment did not merely risk overwriting the human's identity,
+it necessarily did -- measured 2026-08-11, four days and two machines from cause to symptom. See
+`credentials.py`; a role token is now explicit per invocation, and nothing here writes an ambient
+store.
 
 STDLIB ONLY, and it is the whole package's constraint rather than this file's: this has to run on
 the Gitea host, where no venv exists and nothing is installed. A source checkout plus any Python 3
@@ -71,7 +79,6 @@ import http.client
 import json
 import os
 import secrets
-import shutil
 import socket
 import stat
 import subprocess
@@ -82,6 +89,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from agent_swarm import credentials
 from agent_swarm.forge import _BACKOFF_S as BACKOFF_S
 from agent_swarm.forge import API_ATTEMPTS, _is_retryable_status
 
@@ -124,42 +132,77 @@ _sleep = time.sleep
 #: deliberately and for the same reason `--repo` has none: a check name defaulted wrong protects a
 #: branch against a status nobody publishes, and that reads as a broken gate.
 
-#: role -> (team, unit permissions, token scopes)
+#: role -> (unit permissions, token scopes)
+#:
+#: THE TEAM NAME IS NOT IN THIS TABLE, and that is deliberate -- see `TEAMS`. It used to be the first
+#: element of each tuple, four hand-written literals sitting beside a DERIVED `USERS`. One prefix,
+#: two mechanisms, and only one of them could keep a fifth role honest.
 #:
 #: NOT SERVER-ENFORCED, and stated here so this table is not misread: Gitea has no scope for commit
 #: status -- writing one needs repository write. `swarm-agent` must have that to push branches, so
 #: it can set a status too. "Only swarm-verifier marks a commit green" is carried by which process
 #: holds which credential, NOT by the server. Measured 2026-08-10. GitHub can enforce it (an App may
 #: hold statuses:write without contents:write), which is why the role table is data and not code.
-ROLES: dict[str, tuple[str, dict[str, str], list[str]]] = {
+ROLES: dict[str, tuple[dict[str, str], list[str]]] = {
     'observer': (
-        'Observers',
         {'repo.code': 'read', 'repo.issues': 'read', 'repo.pulls': 'read'},
         ['read:repository', 'read:issue', 'read:organization'],
     ),
     'agent': (
-        'Agents',
         {'repo.code': 'write', 'repo.issues': 'write', 'repo.pulls': 'write'},
         ['write:repository', 'write:issue', 'read:organization'],
     ),
-    'verifier': ('Verifiers', {'repo.code': 'write', 'repo.issues': 'read'}, ['write:repository']),
+    'verifier': ({'repo.code': 'write', 'repo.issues': 'read'}, ['write:repository']),
     'integrator': (
-        'Integrators',
         {'repo.code': 'write', 'repo.pulls': 'write', 'repo.issues': 'read'},
         ['write:repository'],
     ),
 }
 
-USERS = {role: f'swarm-{role}' for role in ROLES}
+#: THE ONE HOME OF THE PREFIX. Both the account names and the team names are built from it, so a
+#: fifth role cannot arrive with an unprefixed team -- there is no literal for it to be spelled in.
+_PREFIX = 'swarm'
 
-#: RESOLVED ONCE to an absolute path. A bare `git` is a partial
-#: executable path; resolving it is the honest answer rather than suppressing the finding, and it
-#: means a machine without git fails once, by name, instead of at every call site.
-_GIT = shutil.which('git') or 'git'
+USERS = {role: f'{_PREFIX}-{role}' for role in ROLES}
 
-#: Resolved for the same reason as `_GIT`: ruff S607 refuses a partial executable path, and a
-#: suppression is a defect deferred. Only ever invoked under `os.name == 'nt'`, where it exists.
-_ICACLS = shutil.which('icacls') or 'icacls'
+#: role -> team name. DERIVED, exactly like `USERS` and for the same reason.
+#:
+#: USER DIRECTIVE 2026-08-11: 「teams 命名很容易引起误解 比如 Agents 让人会误解 teams 名也直接叫
+#: Swarm-Agents Swarm-xxx 更好」. In a SHARED org a team called `Agents` reads as "the agents", not
+#: "this swarm's agents" -- it claims a generic noun the org's humans also use. The prefix is not
+#: decoration; it is the difference between naming a thing and claiming a category.
+TEAMS = {role: f'{_PREFIX.capitalize()}-{role.capitalize()}s' for role in ROLES}
+
+#: old team name -> role. A RENAME IS AN EVENT; THE ABILITY TO RECOGNISE THE PRE-MIGRATION STATE IS A
+#: PROPERTY, so it is registered here rather than remembered.
+#:
+#: WITHOUT THIS, CHANGING `TEAMS` WOULD NOT HAVE RENAMED ANYTHING. `ensure_team` looks a team up BY
+#: NAME, so a fresh constant simply misses the old team and CREATES a new one: eight teams, the live
+#: memberships and repo attachments still on the four old ones, the four new ones empty. Every
+#: machine keeps working -- its token is already issued -- until someone re-provisions, at which
+#: point access moves to teams nobody is in. A silent, delayed failure, which is the same class as
+#: the credential clobber removed earlier tonight.
+#:
+#: It is NOT a compatibility shim and does not belong to a retirement registry: these names are live
+#: DATA on running servers, and recognising server state is not the same as keeping a second spelling
+#: alive in the code. Once no deployment carries them, this mapping is deleted with its migration.
+LEGACY_TEAMS = {f'{role.capitalize()}s': role for role in ROLES}
+
+
+def _old_name_of(role: str) -> str | None:
+    """What this role's team was called before the `Swarm-` prefix, or None if the role is new.
+
+    READ OUT OF `LEGACY_TEAMS` rather than recomputed. A second derivation of the old spelling would
+    be free to drift from the registry documenting it, and the drift would be invisible: both would
+    produce a plausible name and only one would match what a live server actually holds.
+    """
+    return next((old for old, owner in LEGACY_TEAMS.items() if owner == role), None)
+
+
+#: THIS MODULE NO LONGER RUNS `git` AT ALL, and the two resolved executables that used to live here
+#: went with the code that needed them: `_GIT` existed only to drive the credential store this tool
+#: has stopped writing, and `_ICACLS` moved to `credentials` beside the file it hardens. A constant
+#: kept "in case" is a claim that something still uses it.
 
 
 class Fail(RuntimeError):
@@ -554,7 +597,24 @@ class GiteaProvider:
     def teams(self) -> list[dict]:
         return self.api_list('GET', f'/orgs/{self.org}/teams?limit=100')
 
-    def ensure_team(self, name: str, units: dict[str, str]) -> tuple[int, str]:
+    def ensure_team(self, name: str, units: dict[str, str], *, was_called: str | None = None) -> tuple[int, str]:
+        """The team, by id, and what had to happen: `created`, `updated` or `renamed`.
+
+        **`renamed` IS A MIGRATION AND NOT A COSMETIC CASE.** Lookup here is BY NAME, so changing
+        `TEAMS` without `was_called` would not rename anything -- it would MISS the old team and
+        create a new one beside it. The org would then hold eight teams, with every membership and
+        every repo attachment still on the four old ones and the four new ones empty. Nothing breaks
+        at that moment, because a machine's token is already issued; it breaks at the NEXT
+        provisioning, when access moves to teams nobody is in.
+
+        A `PATCH` of the name PRESERVES THE ID, and the id is what members and repo attachments hang
+        off -- which is precisely why this is a rename rather than a create-and-delete. Gitea's team
+        membership and team-repo tables key on the team id, so the grants never lapse and no machine
+        loses access for a moment in the middle.
+
+        IDEMPOTENT IN BOTH DIRECTIONS: the new name is looked for FIRST, so a second run finds it and
+        merely updates; a fresh org matches neither name and creates.
+        """
         body = {
             'name': name,
             'description': 'swarm role -- managed by swarmctl',
@@ -563,12 +623,20 @@ class GiteaProvider:
             'can_create_org_repo': False,
             'units_map': units,
         }
-        for team in self.teams():
+        existing = self.teams()
+        for team in existing:
             if team['name'] == name:
                 # UPDATED IN PLACE. Without this a change to ROLES silently applies only to new
                 # installs, and two deployments drift apart with nothing reporting it.
                 self.api('PATCH', f'/teams/{team["id"]}', body)
                 return team['id'], 'updated'
+        # THE OLD NAME IS ONLY CONSULTED WHEN THE NEW ONE IS ABSENT. Checking it first would rename a
+        # leftover old team over an already-migrated one, and Gitea would refuse the duplicate name --
+        # turning a no-op second run into a hard failure.
+        for team in existing:
+            if was_called and team['name'] == was_called:
+                self.api('PATCH', f'/teams/{team["id"]}', body)
+                return team['id'], 'renamed'
         return self.api_obj('POST', f'/orgs/{self.org}/teams', body)['id'], 'created'
 
     def team_members(self, team_id: int) -> list[str]:
@@ -672,74 +740,36 @@ def build_provider(args: argparse.Namespace) -> GiteaProvider:
 
 
 def read_credential(scheme: str, host: str, username: str) -> str | None:
-    """The stored secret for (scheme, host, username), or None. NEVER PROMPTS.
+    """This role's token, from the ENVIRONMENT or the swarm's own store. Never the operator's vault.
 
-    `git credential fill` falls back to an INTERACTIVE prompt when nothing matches -- on Windows a
-    GUI dialog, which in a non-interactive run hangs until it times out and, worse, invites someone
-    to type a credential into a script's stdin. Both switches are needed: `GIT_TERMINAL_PROMPT=0`
-    stops the terminal prompt and `credential.interactive=never` stops the helper's own UI.
+    THE VAULT IS NOT CONSULTED, and that is the repair rather than an omission. See
+    `agent_swarm.credentials`: a credential store holds one entry per host, four roles share one
+    host, so this tool's writes NECESSARILY overwrote whatever the human had -- measured 2026-08-11
+    as a fleet-wide install failure four days and two machines away from its cause.
 
-    A missing credential must be a QUIET absence -- the caller decides what to do about it.
+    A missing credential is a QUIET absence -- the caller decides what to do about it -- and it is
+    never a prompt.
     """
-    env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-    proc = subprocess.run(
-        [_GIT, '-c', 'credential.interactive=never', 'credential', 'fill'],
-        input=f'protocol={scheme}\nhost={host}\nusername={username}\n\n',
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=60,
-        env=env,
-    )
-    if proc.returncode != 0:
-        return None
-    for line in proc.stdout.splitlines():
-        if line.startswith('password='):
-            return line[len('password=') :]
-    return None
+    return credentials.resolve_token(scheme, host, username)
 
 
 def store_credential(scheme: str, host: str, username: str, token: str) -> None:
-    """Store, then READ IT BACK, and refuse if the helper did not keep it.
+    """Persist a role token into the SWARM's store, read it back, and refuse if it did not keep.
 
-    MEASURED 2026-08-10, and this is the most expensive failure this tool has produced. `git
-    credential approve` exits 0 whether or not the helper kept anything. Git Credential Manager
-    DROPPED two of four credentials for a plain-HTTP remote -- it warns `use of unencrypted HTTP
-    remote URLs is not recommended` and declines to persist -- and `enroll` printed
-    `stored  sha256=...` for all four.
-
-    THE LOSS WAS UNRECOVERABLE. Gitea keeps only a HASH of a token; the plaintext exists exactly
-    once, in the pipe into this function. So two role credentials were gone permanently, and they
-    could not even be re-minted -- Gitea refuses a duplicate token name, so the next `enroll` failed
-    outright with `access token name has been used already`.
-
-    A write that cannot fail is indistinguishable from one that works. Same shape as the reap that
-    swallowed OSError and the warning on an unchanged success return; the read-back is the only
-    thing that separates them, and it costs one subprocess per credential, once per machine.
+    THIS NO LONGER TOUCHES `git credential approve`. The read-back it used to justify survives the
+    move intact and for the same measured reason (2026-08-10: Git Credential Manager silently
+    dropped two of four credentials while `enroll` reported all four stored, and Gitea keeps only a
+    hash, so the plaintext was gone permanently and un-remintable). A write that cannot fail is
+    indistinguishable from one that works, and a file write can fail too.
     """
-    payload = f'protocol={scheme}\nhost={host}\nusername={username}\npassword={token}\n\n'
-    proc = subprocess.run(
-        [_GIT, 'credential', 'approve'], input=payload, text=True, capture_output=True, check=False, timeout=60
-    )
-    if read_credential(scheme, host, username) != token and proc.returncode == 0:
-        msg = (
-            f'the credential helper accepted {username}@{host} and did not keep it.\n'
-            f'  Git Credential Manager declines plain-HTTP remotes by default. Either serve the\n'
-            f'  forge over https, or:  git config --global credential.{scheme}://{host}.provider generic\n'
-            f'  NOTHING ELSE HOLDS THIS SECRET -- the forge stores only a hash, so it is gone now and\n'
-            f'  its name cannot be reused. Re-run with --machine <a different name>.'
-        )
-        raise Fail(msg)
-    if proc.returncode != 0:
-        msg = f'git credential approve failed for {username}: {proc.stderr.strip()[:200]}'
-        raise Fail(msg)
+    try:
+        credentials.store_token(scheme, host, username, token)
+    except (PermissionError, RuntimeError) as exc:
+        raise Fail(str(exc)) from None
 
 
 def erase_credential(scheme: str, host: str, username: str) -> None:
-    payload = f'protocol={scheme}\nhost={host}\nusername={username}\n\n'
-    subprocess.run(
-        [_GIT, 'credential', 'reject'], input=payload, text=True, capture_output=True, check=False, timeout=60
-    )
+    credentials.forget_token(scheme, host, username)
 
 
 # --------------------------------------------------------------------------- verbs
@@ -766,7 +796,8 @@ def cmd_list(provider: GiteaProvider, args: argparse.Namespace) -> int:
 
     say('\nTEAMS')
     by_name = {t['name']: t for t in provider.teams()}
-    for team_name, units, _scopes in ROLES.values():
+    for role, (units, _scopes) in ROLES.items():
+        team_name = TEAMS[role]
         team = by_name.get(team_name)
         if not team:
             say(f'  {team_name:<14} MISSING')
@@ -806,8 +837,9 @@ def cmd_provision(provider: GiteaProvider, _args: argparse.Namespace) -> int:
             say(f'  {username:<18} created')
 
     say('\nteams (units updated in place, so a ROLES change reaches existing installs)')
-    for role, (team_name, units, _scopes) in ROLES.items():
-        team_id, what = provider.ensure_team(team_name, units)
+    for role, (units, _scopes) in ROLES.items():
+        team_name = TEAMS[role]
+        team_id, what = provider.ensure_team(team_name, units, was_called=_old_name_of(role))
         if USERS[role] not in provider.team_members(team_id):
             provider.add_member(team_id, USERS[role])
             what += ', member added'
@@ -832,7 +864,7 @@ def cmd_onboard(provider: GiteaProvider, args: argparse.Namespace) -> int:
     owner, repo = split_repo(args.repo)
     say(f'onboarding {owner}/{repo}')
     by_name = {t['name']: t for t in provider.teams()}
-    for team_name, _units, _scopes in ROLES.values():
+    for team_name in TEAMS.values():
         team = by_name.get(team_name)
         if not team:
             msg = f'team {team_name} does not exist -- run `provision` first'
@@ -866,8 +898,84 @@ def cmd_onboard(provider: GiteaProvider, args: argparse.Namespace) -> int:
 def _enroll_tokens(provider: GiteaProvider, machine: str) -> dict[str, str]:
     return {
         USERS[role]: provider.issue_token(USERS[role], f'{USERS[role]}@{machine}', scopes)
-        for role, (_team, _units, scopes) in ROLES.items()
+        for role, (_units, scopes) in ROLES.items()
     }
+
+
+def required_repositories(args: argparse.Namespace) -> list[str]:
+    """Which repositories every issued identity MUST be able to read.
+
+    IT IS THE CALLER'S DATA, NEVER A CONSTANT HERE. This package onboards machines for ANY project;
+    a built-in list would be `DEFAULT_REPO` under a new spelling -- a vendor-neutral layer holding
+    one project's fact, invisible exactly because the default works.
+    `tests/test_this_package_names_no_specific_project.py` refuses it, and would be right to.
+
+    It reaches this CLI the way every other deployment fact does: `--require-repo` (repeatable),
+    `SWARM_REQUIRED_REPOS`, or the stored config, comma-separated.
+
+    THE FALLBACK IS THE REPO BEING ONBOARDED, not an empty list. An identity minted for a repository
+    it cannot read is the exact defect this check exists to catch, so the one repository already
+    named on the command line is the minimum honest requirement -- and it means the check has teeth
+    on day one, before anybody has configured anything.
+    """
+    declared = list(getattr(args, 'require_repo', None) or ())
+    if not declared and getattr(args, 'required_repos', ''):
+        declared = [part.strip() for part in args.required_repos.split(',') if part.strip()]
+    if not declared and getattr(args, 'repo', ''):
+        declared = [args.repo]
+    return declared
+
+
+def _refuse_identities_without_grants(provider: GiteaProvider, issued: dict[str, str], required: list[str]) -> None:
+    """VERIFY AT ONBOARDING. A missing grant must fail HERE, in the second it is created.
+
+    USER DIRECTIVE 2026-08-11, and it is the systemic half of a diagnosis rather than a new idea:
+    「onboarding 时验证,而不是安装时发现」. Which repositories an identity must be able to read is
+    DATA, and it was nothing at all -- so a role account minted without a grant looked perfectly
+    healthy, and the absence surfaced MONTHS LATER, on a different machine, as a dependency
+    RESOLUTION error with a 404 buried in it. The install-side pre-flight catches it at the far end;
+    this catches it at the near one, which is the second where it is cheap and where the person who
+    can fix it is already at a keyboard.
+
+    UNANSWERABLE IS NOT REFUSED, and that separation is the property this must not lose. A forge that
+    is down produces the same non-success as a missing grant, and an onboarding that fails closed on
+    transience is one an operator learns to bypass -- so it is REPORTED and does not fail the run.
+
+    THE TOKENS ARE ALREADY STORED WHEN THIS RUNS, deliberately. A token exists in plaintext exactly
+    once (Gitea keeps only a hash), and its name cannot be reused, so discarding one to signal a
+    permissions problem would destroy something unrecoverable to report something fixable. Refuse
+    loudly, keep the credential.
+
+    Raises:
+        Fail: at least one identity was REFUSED read on at least one required repository.
+
+    """
+    if not required:
+        return
+    say(f'\ngrants -- every identity must READ: {", ".join(required)}')
+    problems = []
+    for username, token in issued.items():
+        refused, unanswerable = credentials.unreadable_repositories(required, token, call=provider._call)
+        if refused:
+            say(f'  FAIL {username:<18} refused on {", ".join(refused)}')
+            problems += [f'{username} cannot read {name}' for name in refused]
+        if unanswerable:
+            # NOT a problem, and the wording says which. Reporting "not checked" as a pass is how a
+            # silent 403 stayed invisible once; reporting it as a failure is how a check gets
+            # bypassed. It is neither.
+            say(f'  ?    {username:<18} not answered for {", ".join(unanswerable)} (forge unreachable)')
+        if not refused and not unanswerable:
+            say(f'  ok   {username}')
+    if problems:
+        msg = (
+            'these identities were created WITHOUT the read access they are required to have:\n'
+            + '\n'.join(f'  - {problem}' for problem in problems)
+            + '\n  The credentials ARE stored -- a token exists in plaintext once, so none was\n'
+            '  discarded. Grant the missing access on the forge (a team, or a collaborator entry)\n'
+            '  and re-run `verify`. Refusing HERE is the point: found months later, this same gap\n'
+            '  surfaces on another machine as a dependency resolution error nobody can read.'
+        )
+        raise Fail(msg)
 
 
 def cmd_enroll(provider: GiteaProvider, args: argparse.Namespace) -> int:
@@ -877,59 +985,22 @@ def cmd_enroll(provider: GiteaProvider, args: argparse.Namespace) -> int:
         say(f'  {username:<18} stored  sha256={fingerprint(token)}')
     say(f'\n{len(issued)} credentials stored on this machine for {provider.netloc}.')
     say('Losing this machine means revoking exactly these four: `revoke --machine ' + args.machine + '`.')
+    _refuse_identities_without_grants(provider, issued, required_repositories(args))
     return 0
 
 
 def write_secret_file(path: Path, payload: dict) -> None:
-    """Write a bundle of live plaintext credentials so that ONLY THE OWNER CAN READ IT.
+    """A bundle of live plaintext credentials, owner-only. ONE DEFINITION, in `credentials`.
 
-    MEASURED 2026-08-10 on the fleet host. This was `os.open(..., S_IRUSR | S_IWUSR)` plus a line
-    of output saying "owner-readable only". **On Windows the POSIX mode is essentially ignored** --
-    NTFS gives the new file its parent directory's INHERITED ACL, and the one measured read granted
-    `Authenticated Users` Modify and `Users` Read.
-
-    So every authenticated user on the box could modify a file holding four live role credentials,
-    and every user could read it, under a line asserting the opposite. The declaration was the only
-    thing that was owner-only.
-
-    The permission is therefore APPLIED per platform and then READ BACK, and a failure RAISES after
-    deleting the file rather than printing a warning: the whole point of this file is that it
-    crosses a machine boundary, and a caller told it is protected will choose a transport on that
-    belief. A warning on a file that still exists is the forbidden shape.
+    The hardening -- and the measurement behind it, where NTFS quietly ignored a POSIX mode and left
+    four live role credentials readable under a line asserting the opposite -- lives with the store
+    that needs the same guarantee. Two copies of a permission scheme is the duplicated-scheme defect,
+    and the copy that drifts is the one holding secrets.
     """
-    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
-    with os.fdopen(handle, 'w', encoding='utf-8') as out:
-        json.dump(payload, out)
-    if os.name == 'nt':
-        # `icacls` rather than a mode, and `/inheritance:r` is the half that matters: granting the
-        # owner full control while leaving the inherited ACEs in place changes nothing at all.
-        owner = os.environ.get('USERNAME') or ''
-        subprocess.run(
-            [_ICACLS, str(path), '/inheritance:r', '/grant:r', f'{owner}:F'],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
-        shown = subprocess.run([_ICACLS, str(path)], capture_output=True, text=True, check=False, timeout=60).stdout
-        others = [
-            line
-            for line in shown.splitlines()
-            if ':(' in line and owner.lower() not in line.lower() and 'Successfully' not in line
-        ]
-        if others:
-            path.unlink(missing_ok=True)
-            listed = '\n'.join(f'  {line.strip()}' for line in others)
-            msg = (
-                f'could not make {path.name} owner-only; it still granted:\n{listed}\n'
-                '  It held live credentials, so it has been DELETED rather than left readable.\n'
-                '  Write it to a directory you control, or move the credentials another way.'
-            )
-            raise Fail(msg)
-    elif path.stat().st_mode & 0o077:
-        path.unlink(missing_ok=True)
-        msg = f'{path.name} is group- or world-readable; deleted rather than left holding credentials'
-        raise Fail(msg)
+    try:
+        credentials.write_secret_file(path, payload)
+    except PermissionError as exc:
+        raise Fail(str(exc)) from None
 
 
 def cmd_emit(provider: GiteaProvider, args: argparse.Namespace) -> int:
@@ -940,6 +1011,10 @@ def cmd_emit(provider: GiteaProvider, args: argparse.Namespace) -> int:
     mint its own. The bundle is one file, for one machine, consumed once and deleted by `consume`.
     """
     issued = _enroll_tokens(provider, args.machine)
+    # CHECKED ON THE HOST, WHERE THE FIX IS. `emit` runs where the Gitea CLI is, so a missing grant
+    # is refused beside the administrator who can grant it -- rather than on the far machine, which
+    # has the bundle and no way to change a permission.
+    _refuse_identities_without_grants(provider, issued, required_repositories(args))
     path = Path(args.out or f'swarm-enroll-{args.machine}.json').resolve()
     payload = {'scheme': provider.scheme, 'host': provider.netloc, 'machine': args.machine, 'credentials': issued}
     write_secret_file(path, payload)
@@ -1250,7 +1325,8 @@ def cmd_verify(provider: GiteaProvider, args: argparse.Namespace) -> int:
         say('configuration problems: ' + (str(len(problems)) if problems else 'none'))
         return 1 if problems else 0
 
-    for role, (team_name, units, _scopes) in ROLES.items():
+    for role, (units, _scopes) in ROLES.items():
+        team_name = TEAMS[role]
         team = by_name.get(team_name)
         if not team:
             problems.append(f'team {team_name} missing')
@@ -1299,7 +1375,7 @@ def cmd_destroy(provider: GiteaProvider, args: argparse.Namespace) -> int:
         msg = 'refusing: pass --confirm DESTROY. This purges four users and their history.'
         raise Fail(msg)
     for team in provider.teams():
-        if team['name'] in {name for name, _u, _s in ROLES.values()}:
+        if team['name'] in set(TEAMS.values()) | set(LEGACY_TEAMS):
             provider.api('DELETE', f'/teams/{team["id"]}', allow=(404,))
             say(f'  team {team["name"]} deleted')
     for username in USERS.values():
@@ -1323,7 +1399,17 @@ def split_repo(value: str) -> tuple[str, str]:
 
 #: Config keys, in the same spelling as the CLI flags they back. Anything not here cannot be
 #: persisted -- `--confirm` or `--all` remembered across runs would be a loaded gun.
-CONFIG_KEYS = ('provider', 'base_url', 'org', 'repo', 'gitea_exe', 'admin_user', 'branch', 'status_context')
+CONFIG_KEYS = (
+    'provider',
+    'base_url',
+    'org',
+    'repo',
+    'gitea_exe',
+    'admin_user',
+    'branch',
+    'status_context',
+    'required_repos',
+)
 
 
 def config_path() -> str:
@@ -1469,6 +1555,13 @@ def parse_argv(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--machine', default=socket.gethostname())
     parser.add_argument('--branch', default=setting('branch', 'main'))
     parser.add_argument('--status-context', default=setting('status_context'))
+    parser.add_argument('--required-repos', default=setting('required_repos', ''))
+    parser.add_argument(
+        '--require-repo',
+        action='append',
+        help='enroll/emit: a repository every issued identity must be able to READ. Repeatable. '
+        'Defaults to --repo, so the check has teeth before anything is configured.',
+    )
     parser.add_argument('-p', '--protect', action='store_true', help='onboard: also enable branch protection')
     # prune-issues. THE DEFAULTS ARE THE SAFETY: a week's grace, dry-run, and open items untouchable
     # at any age. `--yes` is the entire confirmation, and it is honoured only AFTER the count and the

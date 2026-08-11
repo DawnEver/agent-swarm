@@ -47,6 +47,7 @@ import argparse
 
 import pytest
 
+from agent_swarm import credentials
 from agent_swarm import swarmctl as _swarmctl
 
 pytestmark = pytest.mark.unit
@@ -68,24 +69,36 @@ def swarmctl():
 
 
 @pytest.fixture
-def helper(swarmctl, monkeypatch):
-    """A credential helper whose keep/drop behaviour is scriptable, driven through the REAL
-    `store_credential` so the read-back under test is the one that ships.
+def helper(swarmctl, monkeypatch, tmp_path):
+    """A store whose keep/drop behaviour is scriptable, driven through the REAL `store_credential`
+    so the read-back under test is the one that ships.
+
+    THE MEDIUM MOVED AND THE PROPERTY DID NOT. This used to script `git credential approve`, because
+    that is where role tokens were written -- into the OPERATOR's credential store, which is the
+    defect measured 2026-08-11 and removed in `agent_swarm.credentials`. Tokens now go to the
+    swarm's own owner-only file, so the double is a file write that can drop.
+
+    The reasoning survives the move unchanged, and that is why these tests did not: a write that
+    cannot fail is indistinguishable from one that works. It was never an argument about GCM
+    specifically. A file write can fail too -- a full disk, a roaming profile that does not sync, an
+    ACL that silently discards -- so the read-back is still the only thing separating the two.
     """
     kept: dict[str, str] = {}
     drop: set[str] = set()
+    store = tmp_path / 'credentials.json'
+    really_write = credentials.write_secret_file
 
-    def approve(_argv, **kwargs):
-        # `**kwargs` rather than naming the parameter `input`: subprocess's keyword shadows the
-        # builtin, which needs a suppression, and a suppression is a defect deferred. Reading it out
-        # of the dict costs one line and removes the waiver.
-        fields = dict(line.split('=', 1) for line in kwargs['input'].strip().splitlines())
-        if fields['username'] not in drop:
-            kept[fields['username']] = fields['password']
-        return argparse.Namespace(returncode=0, stdout='', stderr='')
+    def username_of(key: str) -> str:
+        return key.split('//', 1)[1].split('@', 1)[0]
 
-    monkeypatch.setattr(swarmctl.subprocess, 'run', approve)
-    monkeypatch.setattr(swarmctl, 'read_credential', lambda _s, _h, user: kept.get(user))
+    def dropping_write(path, payload):
+        surviving = {key: value for key, value in payload.items() if username_of(key) not in drop}
+        really_write(path, surviving)
+        kept.clear()
+        kept.update({username_of(key): value for key, value in surviving.items()})
+
+    monkeypatch.setattr(credentials, 'store_path', lambda: store)
+    monkeypatch.setattr(credentials, 'write_secret_file', dropping_write)
     return {'kept': kept, 'drop': drop}
 
 

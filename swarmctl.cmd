@@ -38,12 +38,11 @@ if not defined PY (
   exit /b 2
 )
 
-where git >nul 2>&1
-if errorlevel 1 (
-  echo   No git on PATH. Required: credentials are stored by piping them into 1>&2
-  echo   `git credential approve`, which is what keeps them off the screen. 1>&2
-  exit /b 2
-)
+rem NO GIT CHECK, and its removal is the point rather than a tidy-up. There was one, and its stated
+rem reason -- credentials being stored by piping them into `git credential approve` -- stopped being
+rem true when role tokens moved out of the operator's credential store (agent_swarm.credentials).
+rem swarmctl now runs no git at all. A guard that outlives its reason does not become harmless: it
+rem refuses to start over a dependency nothing uses, and it asserts a mechanism that is gone.
 
 rem PREPENDED, never assigned over: a caller may already be pointing PYTHONPATH somewhere, and
 rem losing that silently is how a launcher starts deciding things it was written not to decide.
