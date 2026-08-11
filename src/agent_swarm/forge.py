@@ -32,8 +32,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import json
-import os
-import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -41,7 +39,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from agent_swarm import roles
+from agent_swarm import credentials, roles
 
 _HTTP_TIMEOUT = 60.0
 
@@ -539,58 +537,67 @@ class GiteaForge:
         raise ForgeError(msg)
 
     def _credential(self) -> str:
-        """The API token for THIS ROLE, from `git credential fill`, held in memory only.
+        """The API token for THIS ROLE, from the SWARM'S OWN store, held in memory only.
 
         NEVER LOGGED, PRINTED OR PERSISTED -- a hard project invariant. Note what this does NOT do:
         it takes no token argument (which would invite a caller to hard-code one) and it reads no
         environment variable at import time.
 
         THE USERNAME IS LOAD-BEARING, and omitting it was a defect rather than a simplification.
-        `git credential fill` keys on (protocol, host, USERNAME). Four role credentials share one
-        host, so a query with no username returns whichever the helper happens to hold -- measured
-        on the live host 2026-08-10, where the bare-host key belonged to `OAUTH_USER`, an entry
-        nothing in this system issued.
+        Resolution keys on (protocol, host, USERNAME). Four role credentials share one host, so a
+        query with no username returns whichever entry the store happens to hold -- measured on the
+        live host 2026-08-10, where the bare-host key belonged to `OAUTH_USER`, an entry nothing in
+        this system issued.
 
         WHAT THAT SILENTLY DEFEATED. Gitea has no scope for commit status, so "only the verifier
         marks a commit green" is carried by WHICH PROCESS HOLDS WHICH CREDENTIAL -- that is stated
         in `swarmctl`'s role table and it is the only thing separating the roles at all. A client
         that cannot select its role does not weaken that boundary; it removes it, while every call
         still succeeds and every test still passes.
+
+        **IT NO LONGER READS THE OPERATOR'S CREDENTIAL STORE, and that is the last half of the
+        2026-08-11 repair.** `swarmctl` stopped WRITING that store; this was still READING it, which
+        is the more dangerous direction of the two. A write clobbers an identity and is at least a
+        change somebody could notice; a read SUCCEEDS as whoever the vault happens to hold. The
+        `OAUTH_USER` measurement above is exactly that failure, and it stayed invisible because
+        every call worked.
+
+        THERE IS NO FALLBACK TO THE AMBIENT STORE, deliberately. A fallback would preserve precisely
+        the hazard being removed -- authenticating, plausibly and successfully, as the wrong
+        identity -- and would announce it in a log nobody reads on a run that returned 200. An
+        un-enrolled machine RAISES here, naming the role and the remedy.
         """
         if self._token is not None:
             return self._token
         host = urllib.parse.urlsplit(self.base_url)
-        filled = self._run_credential_helper(host.scheme, host.netloc, self.username)
-        for line in filled.stdout.splitlines():
-            if line.startswith('password='):
-                self._token = line[len('password=') :]
-                return self._token
-        msg = f'no stored credential for {self.username}@{host.netloc} -- run `swarmctl enroll` on this machine'
-        raise ForgeError(msg)
+        token = self._resolve_token(host.scheme, host.netloc, self.username)
+        if token is None:
+            msg = (
+                f'no stored credential for {self.username}@{host.netloc} -- run `swarmctl enroll` on '
+                f"this machine, or set {credentials.env_var_for(self.username)}. The operator's git "
+                f'credential store is deliberately NOT consulted.'
+            )
+            raise ForgeError(msg)
+        self._token = token
+        return self._token
 
-    def _run_credential_helper(self, scheme: str, netloc: str, username: str) -> subprocess.CompletedProcess[str]:
-        """Shell out to `git credential fill`. A SEAM, extracted so the cache above it is testable.
+    def _resolve_token(self, scheme: str, netloc: str, username: str) -> str | None:
+        """Ask `credentials` for this role's token. A SEAM, so the cache above it is testable.
 
-        The caching in `_credential` exists ONLY to avoid this subprocess -- it is a pure cost
+        The caching in `_credential` exists ONLY to avoid repeating this lookup -- it is a pure cost
         optimisation -- and with the call inlined there was no way to observe whether it worked. A
         component whose entire reason to exist is COST, with no test that can see cost, is green
         whether it works or is inert; that is the class the index bug belonged to. This seam is what
-        lets a test COUNT the calls instead of trusting the code, and creating it was cheaper than
-        continuing to hope.
+        lets a test COUNT the calls instead of trusting the code.
+
+        IT IS NO LONGER A SUBPROCESS, and the cost argument survives that unchanged: it was never
+        specifically about `fork`, it was about a repeated lookup on a 7x24 fleet. What DID change is
+        that the hazard the old implementation needed guarding against -- `git credential fill`
+        falling back to an interactive prompt, on Windows a GUI dialog that hangs an unattended
+        runner -- is now structurally absent rather than suppressed by an environment variable. No
+        git is executed, so there is nothing that can prompt.
         """
-        return subprocess.run(
-            ['git', 'credential', 'fill'],
-            # THE USERNAME MUST BE IN THE QUERY, not merely in this function's signature. Measured
-            # 2026-08-10: it was threaded through the parameter and never written into the input, so
-            # the fill stayed host-only and returned `swarm-verifier` while the client believed it
-            # was `swarm-agent`. The live contract test then 403'd with
-            # `token scope=write:repository` -- the verifier's scope set, named in its own error.
-            input=f'protocol={scheme}\nhost={netloc}\nusername={username}\n\n',
-            capture_output=True,
-            text=True,
-            check=False,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
-        )
+        return credentials.resolve_token(scheme, netloc, username)
 
 
 #: MEASURED on a real GitHub repo (`DawnEver/optimi-lab`, 2026-08-09). What SURVIVED the second

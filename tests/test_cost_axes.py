@@ -27,7 +27,6 @@ what makes the avoidance observable. Replacing the cache would be the other thin
 
 from __future__ import annotations
 
-import subprocess
 
 import pytest
 
@@ -59,9 +58,9 @@ class CountingGitea(GiteaForge):
             return {'id': 7}
         return {}
 
-    def _run_credential_helper(self, scheme: str, netloc: str, username: str) -> subprocess.CompletedProcess[str]:
+    def _resolve_token(self, scheme: str, netloc: str, username: str) -> str | None:
         self.credential_calls += 1
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout='password=not-a-real-token\n', stderr='')
+        return 'not-a-real-token'
 
 
 class TestTheInProcessItemCacheActuallyCaches:
@@ -113,20 +112,26 @@ class TestTheLabelIdCacheActuallyCaches:
 
 
 class TestTheCredentialCacheActuallyCaches:
-    """It exists to avoid one subprocess per request. With the call inlined there was no way to see
-    whether it did; the seam was extracted so this could count instead of hope."""
+    """It exists to avoid one credential lookup per request. With the call inlined there was no way
+    to see whether it did; the seam was extracted so this could count instead of hope.
 
-    def test_the_helper_runs_ONCE_across_many_requests(self):
+    THE LOOKUP IS NO LONGER A SUBPROCESS -- role tokens moved out of the operator's git credential
+    store on 2026-08-11 -- and the cost argument survives that unchanged, because it was never
+    specifically about `fork`. It was about a repeated lookup on a 7x24 fleet, and a file read per
+    API call is still a cost worth not paying.
+    """
+
+    def test_the_lookup_runs_ONCE_across_many_requests(self):
         forge = CountingGitea()
         for _ in range(5):
             forge._credential()
-        assert forge.credential_calls == 1, f'shelled out {forge.credential_calls} times for 5 requests'
+        assert forge.credential_calls == 1, f'looked up {forge.credential_calls} times for 5 requests'
 
     def test_the_seam_EXISTS_so_this_can_be_counted_at_all(self):
-        """The generalisation, as an assertion. If a later refactor inlines the subprocess again,
-        the cache silently becomes unobservable -- and unobservable is where the index bug lived.
+        """The generalisation, as an assertion. If a later refactor inlines the lookup again, the
+        cache silently becomes unobservable -- and unobservable is where the index bug lived.
         """
-        assert hasattr(GiteaForge, '_run_credential_helper')
+        assert hasattr(GiteaForge, '_resolve_token')
 
 
 @pytest.mark.parametrize('name', ['_item_numbers', '_label_ids', '_token'])
