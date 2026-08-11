@@ -148,9 +148,35 @@ class Workbench:
           a person would waste a minute discovering; it decides nothing. `take` is the arbiter, and
           it refuses.
 
-        The claimed filter is the expensive half and it is here on purpose: the executor is a HUMAN,
-        and the resource being conserved is a person's attention, not an API call. A CI loop with a
-        different trade can rank `store.claimable(kind)` itself -- this surface is not in its path.
+        **THE COST, MEASURED RATHER THAN JUSTIFIED, AND THE JUSTIFICATION DOES NOT SURVIVE IT.**
+        Against `RecordingForge`, every item claimable and none claimed:
+
+            open items      10      100      500     1000
+            forge calls     11      101      501     1001     (1 list + 1 comment read per item)
+            in-memory ms   0.1      0.4      1.8      3.8
+
+        Exactly N+1, linear, no hidden constant. **The milliseconds are not the cost** -- they are a
+        dict answering. The cost is N HTTP round trips, and this package's own live measurement puts
+        the per-call floor at ~60 ms p50 (`Claimable.preferred`, measured 2026-08-10). PROJECTED
+        from that floor, and labelled a projection because this has never been run against a real
+        server: ~0.6 s at 10 items, ~6 s at 100, ~30 s at 500.
+
+        **SO "the resource conserved is a person's attention" HOLDS AT TEN ITEMS AND FAILS AT FIVE
+        HUNDRED.** At 500 the filter spends thirty seconds of a person's attention to save them from
+        occasionally being told "somebody got there first" -- it costs more of the thing it was
+        defending than it saves, while the person watches a terminal do nothing. The argument was
+        written before the number and the number refutes it. It is left standing here, refuted,
+        rather than quietly reworded, because a reader deciding whether to call this on a large
+        queue needs the refutation more than they need the claim.
+
+        **WHAT WOULD FIX IT, DELIBERATELY NOT FIXED HERE.** The attention argument is about the jobs
+        a person actually SEES, so the read should be paid for those and not for the tail: bound the
+        filter to the first K of the returned order and leave the rest unfiltered. There is no CLI
+        yet, so there is no real screen to derive K from, and inventing one now would be fixing a
+        cost nobody has paid with a number nobody measured. Until then `store.claimable(kind)` is
+        the unfiltered single call, and a caller that cannot afford this should use it directly.
+        `TestTheCostOfOfferingWork` pins the N+1 so the shape cannot regress while the decision is
+        open.
 
         **RETURNS A `Claimable`.** An empty one means nothing VISIBLE, never nothing to do; see the
         module docstring for why laundering that into a list would matter most here.

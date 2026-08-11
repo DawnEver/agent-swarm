@@ -53,6 +53,38 @@ JOB = Job(id='plain', kind=TEST_RUN)
 NEEDY = Job(id='needy', kind=TEST_RUN)
 
 
+class _CountingForge(RecordingForge):
+    """Records what the caller ASKED FOR, which is what decides the cost.
+
+    Counting the REQUESTS rather than timing them, for the reason
+    `test_read_cost_does_not_grow_with_history.py` gives: a wall clock measures this box under
+    whatever else it is running, while the call count is exact and reproducible.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = dict.fromkeys(('list_work_items', 'comments', 'labels', 'work_item'), 0)
+
+    def reset(self) -> None:
+        self.calls = dict.fromkeys(self.calls, 0)
+
+    def list_work_items(self, *, state: str = 'all'):
+        self.calls['list_work_items'] += 1
+        return super().list_work_items(state=state)
+
+    def comments(self, number: int):
+        self.calls['comments'] += 1
+        return super().comments(number)
+
+    def labels(self, number: int):
+        self.calls['labels'] += 1
+        return super().labels(number)
+
+    def work_item(self, number: int):
+        self.calls['work_item'] += 1
+        return super().work_item(number)
+
+
 class TestTheSurfaceIsPULLAndTheROLEIsStructural:
     def test_a_SUBMITTER_store_is_refused(self, forge):
         """A pull executor that could create work items is a second creator, which is the race the
@@ -123,6 +155,64 @@ class TestAvailableIsCapabilitiesTimesRequires:
         assert isinstance(offered, Claimable)
         with pytest.raises(TypeError, match='NO WORK VISIBLE'):
             bool(offered)
+
+
+class TestTheCostOfOfferingWork:
+    """The N+1, pinned as a SHAPE so it cannot regress while the design decision is open.
+
+    MEASURED 2026-08-11 against `RecordingForge`, ladder 10 / 100 / 500 / 1000 open items, every one
+    claimable and none claimed:
+
+        open items      10      100      500     1000
+        forge calls     11      101      501     1001
+        in-memory ms   0.1      0.4      1.8      3.8
+
+    Exactly one list plus one comment read per candidate, linear, no hidden constant. What that
+    costs against a real server -- and why it REFUTES this method's own justification at 500 items
+    -- is written at `Workbench.available`, where the caller reads it.
+    """
+
+    @pytest.mark.parametrize('items', [10, 100])
+    def test_offering_work_costs_ONE_list_plus_one_read_per_candidate(self, items):
+        """The ladder's small rungs, as a test. 500 and 1000 were measured once (above) and are not
+        re-run every suite: they assert nothing 100 does not, and they would spend seconds of a
+        tier whose speed is the reason anybody runs it.
+        """
+        forge = _CountingForge()
+        submitter = ForgeStore(NAMESPACE, forge, role=Role.SUBMITTER)
+        for i in range(items):
+            submitter.register(Job(id=f'g/j{i}', kind=TEST_RUN))
+        bench = _bench(forge, owner='human')
+        forge.reset()
+
+        offered = bench.available(TEST_RUN)
+
+        assert len(offered.jobs) == items
+        assert forge.calls['list_work_items'] == 1, 'the listing is read more than once'
+        assert forge.calls['comments'] == items, 'the claimed filter is not one read per candidate'
+        assert sum(forge.calls.values()) == items + 1
+
+    def test_the_CAPABILITY_filter_costs_NOTHING_extra(self):
+        """It rides on labels the listing already returned. If it ever needed a per-item fetch it
+        would DOUBLE the N+1, and the cheap half of this method would silently become the expensive
+        half -- invisible, because the result would be identical.
+        """
+        forge = _CountingForge()
+        submitter = ForgeStore(NAMESPACE, forge, role=Role.SUBMITTER)
+        for i in range(20):
+            submitter.register(Job(id=f'g/j{i}', kind=TEST_RUN), requires=['a-licensed-tool'])
+        bench = _bench(forge, owner='human', capabilities=[])
+        forge.reset()
+
+        offered = bench.available(TEST_RUN)
+
+        assert offered.jobs == ()
+        assert forge.calls['labels'] == 0, 'requirements were re-fetched per item'
+        # Nothing is read for work this box cannot do: the capability filter runs FIRST, so the
+        # expensive half is never reached. Ordering the two the other way round would cost the full
+        # N+1 to offer nothing, and no test would have noticed.
+        assert forge.calls['comments'] == 0
+        assert sum(forge.calls.values()) == 1
 
 
 class TestTakeIsTheRUNNERSOwnCompareAndSwap:
