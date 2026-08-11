@@ -621,3 +621,39 @@ class TestReap:
 
         assert procs.reap(targets) == []
         assert not procs.alive([p.pid for p in targets])
+
+
+class TestASeedThatExitsMidWalkIsOmittedNotRaised:
+    """MEASURED 2026-08-11: one full-suite run in 1223 died with `psutil.NoSuchProcess (pid=18116)`
+    out of `close_over_children` -- a seed that exited between `psutil.Process(pid)` and
+    `proc.children()`, two syscalls with a gap between them.
+
+    A CENSUS WALKS PROCESSES IT DOES NOT OWN, so one vanishing mid-enumeration is the normal case,
+    not the exceptional one. Raising there converts somebody else's ordinary exit into a failure of
+    OUR read -- and it does so most often on a busy box, which is precisely when the census is being
+    consulted. The flake also lands on whoever is gating at the time, reading as their defect.
+    """
+
+    def test_children_raising_NoSuchProcess_omits_the_seed(self, monkeypatch):
+        class _Vanished:
+            pid = 999999
+
+            def children(self, recursive=False):  # noqa: ARG002 -- psutil's signature
+                raise psutil.NoSuchProcess(self.pid)
+
+        monkeypatch.setattr(procs.psutil, 'Process', lambda _pid: _Vanished())
+        assert procs.close_over_children({999999}) == []
+
+    def test_a_LIVE_seed_is_still_returned(self, monkeypatch):
+        """The control. `except: continue` around the whole block passes the test above even if it
+        also swallows every living process -- an omission that would report an empty fleet as
+        calmly as a correct one."""
+
+        class _Alive:
+            pid = 4242
+
+            def children(self, recursive=False):  # noqa: ARG002 -- psutil's signature
+                return []
+
+        monkeypatch.setattr(procs.psutil, 'Process', lambda _pid: _Alive())
+        assert [p.pid for p in procs.close_over_children({4242})] == [4242]

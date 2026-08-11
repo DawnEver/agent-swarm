@@ -243,12 +243,26 @@ def close_over_children(seeds: set[int]) -> list[psutil.Process]:
     _require_psutil()
     found: dict[int, psutil.Process] = {}
     for pid in seeds:
+        # THE LOOKUP AND THE WALK ARE ONE ATTEMPT, because they are two syscalls with a gap between
+        # them. `children()` used to sit outside this `try`, so a seed that exited in that gap raised
+        # `NoSuchProcess` out of a census -- MEASURED as a flake in
+        # `test_a_query_that_matches_OUR_OWN_command_line_does_not_return_us`, once in 1223, and
+        # worse on a busy box, which is exactly when a census is being read.
+        #
+        # A PROCESS VANISHING MID-ENUMERATION IS NORMAL, NOT EXCEPTIONAL. Anything this function
+        # walks is by definition something it does not own; the only honest answer is to omit what
+        # is already gone. `AccessDenied` is likewise omission and not failure -- a census that
+        # raised on the first unreadable process would report nothing about the many it could read.
         try:
             proc = psutil.Process(pid)
-        except psutil.NoSuchProcess:
+            children = proc.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+        # RECORDED AFTER THE WALK, NOT BEFORE. `psutil.Process(pid)` succeeds against a process that
+        # has already exited but not been reaped, and `children()` is where that surfaces -- so
+        # recording first would return a pid the caller then kills or reports as live.
         found[pid] = proc
-        for child in proc.children(recursive=True):
+        for child in children:
             try:
                 if (child.name() or '').lower().startswith('python'):
                     found[child.pid] = child
