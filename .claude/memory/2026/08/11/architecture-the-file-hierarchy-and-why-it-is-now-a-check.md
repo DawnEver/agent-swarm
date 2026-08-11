@@ -84,6 +84,9 @@ named rather than resting on a gap. Nothing outside `DEV_TOOL` and `ENTRY` may i
 
 ## CORRECTION (same day, from an audit): the "7 unimported modules" claim was wrong
 
+**THE COUNT WAS NEVER THE FINDING.** Read this section for the method, not the table — a reader who
+takes only the table will re-derive the wrong one.
+
 I wrote above that seven modules have no in-package importer and that **"AVAILABLE, not ENFORCED" is
 a global property of this package**. That generalised from a count without checking any of the
 seven. Audited one by one:
