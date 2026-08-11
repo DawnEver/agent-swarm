@@ -44,8 +44,6 @@ from agent_swarm.forge_store import (
     ForgeStore,
     NotVisible,
     Role,
-    decode_claim,
-    encode_claim,
 )
 from agent_swarm.job import TEST_RUN, Job, JobKind
 from agent_swarm.store import VERDICTS, Store
@@ -112,58 +110,6 @@ def recording_forge():
 @pytest.fixture
 def memory_store(recording_forge):
     return ForgeStore('ns', recording_forge, role=Role.SUBMITTER)
-
-
-# --------------------------------------------------------------------------------------------
-# The claim comment, pure.
-# --------------------------------------------------------------------------------------------
-
-
-class TestTheClaimCommentIsReadableBothWays:
-    def test_it_round_trips(self):
-        claim = decode_claim(encode_claim(owner='runner-a', expires_at=1000.0), comment_id=7)
-        assert claim.owner == 'runner-a'
-        assert claim.expires_at == pytest.approx(1000.0)
-        assert claim.comment_id == 7
-
-    def test_it_is_readable_by_a_HUMAN_scrolling_the_issue(self):
-        """The forge is also the UI. An operator must be able to see who holds a job, and until
-        when, without running a tool.
-        """
-        assert encode_claim(owner='runner-a', expires_at=1000.0).startswith('CLAIM ')
-        assert 'runner-a' in encode_claim(owner='runner-a', expires_at=1000.0)
-
-    def test_an_owner_containing_a_SPACE_survives_the_round_trip(self):
-        """The expiry is encoded first so the owner can be the whole remainder. Truncating an owner
-        at its first word would give two machines one identity -- and a release by either would
-        then free the other's claim.
-        """
-        assert decode_claim(encode_claim(owner='box 7 runner a', expires_at=1.0)).owner == 'box 7 runner a'
-
-    def test_a_NON_claim_comment_decodes_to_None(self):
-        """Claims and verdicts share one comment stream, so 'this is not a claim' must be an
-        ordinary answer rather than an error.
-        """
-        assert decode_claim('**PASS**\n\n```\n10646 passed\n```') is None
-
-    def test_a_MALFORMED_claim_RAISES_instead_of_decoding_to_None(self):
-        """THE DISTINCTION IS THE WHOLE POINT. If an unreadable claim returned `None` it would be
-        skipped exactly like a verdict comment -- so a live claim in a format this version cannot
-        read would be invisible, and a second runner would take a running job.
-        """
-        with pytest.raises(ValueError, match='claim'):
-            decode_claim('CLAIM not-a-number runner-a')
-        with pytest.raises(ValueError, match='claim'):
-            decode_claim('CLAIM 12345')
-
-    def test_a_fresh_claim_is_not_expired(self):
-        assert decode_claim(encode_claim(owner='a', expires_at=time.time() + 300)).is_expired(now=time.time()) is False
-
-    def test_a_claim_past_its_expiry_IS_expired(self):
-        assert decode_claim(encode_claim(owner='a', expires_at=1000.0)).is_expired(now=1000.5) is True
-
-    def test_the_boundary_instant_is_still_HELD(self):
-        assert decode_claim(encode_claim(owner='a', expires_at=1000.0)).is_expired(now=1000.0) is False
 
 
 class TestNoRefMechanismSURVIVED:

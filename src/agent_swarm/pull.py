@@ -1,0 +1,232 @@
+"""The PULL surface: how an executor that cannot be commanded takes work anyway.
+
+THE EXECUTOR IS A KIND, NOT A LAYER
+===================================
+
+fabric can be COMMANDED -- open a session, send a turn, read the result. A human at a keyboard and a
+TUI agent someone is already talking to cannot be: nothing may reach into a person's terminal and
+start a job there. They can only be INFORMED. So the work boundary for those executors is PULL, and
+that is a property of the executor's KIND rather than a second architectural layer with its own
+queue.
+
+**NO NEW PROTOCOL IS NEEDED, AND THAT IS THE FINDING RATHER THAN THE SHORTCUT.** The reason a pull
+surface did not exist is not that the primitives were missing; it is that only ONE kind of executor
+had ever been built -- the gate -- so the store's list/claim/verdict calls had exactly one caller and
+looked like part of it. Three verbs over the primitives the CI runner already uses:
+
+    available   what THIS box may take: capabilities x `requires`, minus what is claimed
+    take        the SAME compare-and-swap and the SAME lease, so a human and a runner cannot
+                both take one item
+    report      the SAME verdict vocabulary -- gate.py's three words, no fourth
+
+If `take` were a different claim, the whole property would be gone: two mechanisms claiming one
+item is two mechanisms that do not see each other, which is duplicate execution with extra steps.
+So this module implements NO claiming of its own. It calls `ForgeStore.try_claim`, and a test
+tokenises it to keep it that way.
+
+IDENTITY IS ALREADY SOLVED, so nothing here invents one: `swarmctl consume` puts a credential on a
+machine, and a TUI agent is another `Role.RUNNER` separated by the runner-id salt. What a caller
+supplies is an `owner` string, exactly as the CI runner does.
+
+A HEARTBEAT IS REQUIRED, NOT OPTIONAL, AND THE REASON IS THE HUMAN
+==================================================================
+
+The failure this surface would otherwise introduce is the one `ci_tick.claim` already produced once:
+a holder that stops existing parks the work for the whole lease. With a human executor that is not
+an edge case, it is Tuesday -- somebody takes an item, gets pulled into a meeting and closes the
+terminal, and the item is unavailable for three hours with nothing anywhere saying why.
+:meth:`Ticket.beat` is `ForgeStore.renew_claim`, so a taken item is reclaimable minutes after its
+holder stops beating, and a holder that has lost its claim finds out by exception rather than by
+discovering someone else's verdict on its work.
+
+**A `Claimable` GOES IN AND A `Claimable` COMES OUT.** Filtering must not launder the distinction
+its ban on truthiness protects: an empty result here means no work VISIBLE to a possibly-stale list
+read, never that this box has nothing to do. Returning a plain list would have thrown that away at
+precisely the surface where a human is the reader -- and a human reading "nothing to do" acts on it.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+from agent_swarm.claim import LeaseLost
+from agent_swarm.forge_store import Claimable, ForgeStore, Role
+from agent_swarm.job import Job, JobKind
+from agent_swarm.store import VERDICTS
+
+
+class MissingCapability(RuntimeError):
+    """This box was asked to take work whose `requires:` it does not declare.
+
+    **RAISED RATHER THAN RETURNED AS "NO", because the two mean opposite things to the caller.**
+    `take` returning ``None`` says "somebody beat you, try the next item" -- a retryable, ordinary
+    outcome. A box taking work it cannot do is not retryable at all: retrying is the worst possible
+    response, and the caller would do it forever while the item looked contended. Collapsing both
+    into a ``None`` would make a misconfigured box indistinguishable from a busy one, which is the
+    shape that gets diagnosed as "the queue is slow".
+
+    It is also the honest signal for a HUMAN, who is the executor this surface exists for: "you do
+    not have FEMM" is actionable and "no work for you" is not.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class Ticket:
+    """Proof that this owner holds this job, and the handle for keeping it.
+
+    NOT A RECEIPT. It is only true while the lease is beaten, and every method on it can raise
+    `LeaseLost` -- which is the honest model, because a claim held by a machine that stopped
+    beating IS lost, whatever an object in its memory says.
+    """
+
+    workbench: Workbench
+    job: Job
+    owner: str
+
+    def beat(self) -> float:
+        """Extend the claim. Returns the new expiry.
+
+        Raises:
+            LeaseLost: the claim is gone. STOP: another executor may already have taken the work.
+        """
+        return self.workbench.store.renew_claim(self.job, owner=self.owner)
+
+    def report(self, *, verdict: str, detail: str) -> None:
+        """Record the outcome and give the item back. See :meth:`Workbench.report`."""
+        self.workbench.report(self, verdict=verdict, detail=detail)
+
+    def abandon(self) -> None:
+        """Put the work back without answering it. Owner-checked by the store; never a steal.
+
+        A FIRST-CLASS OUTCOME, not a failure path. A human who takes an item and finds it is not
+        what they thought must be able to return it in one call -- otherwise the shortest correct
+        path is to walk away, and walking away costs the fleet the whole lease.
+        """
+        self.workbench.store.release(self.job, owner=self.owner)
+
+
+class Workbench:
+    """One pull-mode executor's view of the queue: what it may take, taking it, and answering.
+
+    Args:
+        store: a RUNNER-role store. Required to be a runner, and checked -- a submitter-role store
+            would let a pull executor CREATE work items, which is the concurrent-creation race the
+            role split exists to make unreachable. A human at a keyboard is exactly the caller who
+            would reach for it by hand.
+        owner: who this is, in the same namespace the CI runner claims under. That shared namespace
+            is what makes a human and a runner contend rather than coexist.
+        capabilities: what this box HAS, as opaque tokens compared for equality against `requires:`.
+            The caller declares them; nothing here knows what any of them mean.
+    """
+
+    def __init__(self, store: ForgeStore, *, owner: str, capabilities: Iterable[str] = ()) -> None:
+        if store.role is not Role.RUNNER:
+            msg = (
+                f'a Workbench needs a {Role.RUNNER.value} store, got {store.role.value}. A pull '
+                f'executor discovers and claims; creating work items is the submitter lifecycle, '
+                f'and two creators is the race the roles exist to remove.'
+            )
+            raise ValueError(msg)
+        if not owner:
+            msg = 'a Workbench must name its owner; an unnamed holder cannot be released or reported on'
+            raise ValueError(msg)
+        self.store = store
+        self.owner = owner
+        self.capabilities = frozenset(capabilities)
+
+    def available(self, kind: JobKind) -> Claimable:
+        """Work of `kind` this box could actually do, in the store's own order.
+
+        TWO FILTERS, AND THEY ARE NOT THE SAME KIND OF STATEMENT:
+
+        * **capabilities.** A job whose `requires:` is not a subset of ours is not offered. This is
+          decidable from the listing labels `Claimable` already carries, so it costs nothing, and it
+          is exact -- a missing capability does not become available later.
+        * **already claimed.** ADVISORY, and it costs one comment read per candidate. A list read
+          can be stale and a claim can be taken between this call and the next, so this removes work
+          a person would waste a minute discovering; it decides nothing. `take` is the arbiter, and
+          it refuses.
+
+        The claimed filter is the expensive half and it is here on purpose: the executor is a HUMAN,
+        and the resource being conserved is a person's attention, not an API call. A CI loop with a
+        different trade can rank `store.claimable(kind)` itself -- this surface is not in its path.
+
+        **RETURNS A `Claimable`.** An empty one means nothing VISIBLE, never nothing to do; see the
+        module docstring for why laundering that into a list would matter most here.
+        """
+        offered = self.store.claimable(kind)
+        jobs: list[Job] = []
+        requires: dict[str, frozenset[str]] = {}
+        for job in offered.jobs:
+            needed = offered.requirements_for(job)
+            if not needed <= self.capabilities:
+                continue
+            if self.store.claim_owner(job) is not None:
+                continue
+            if needed:
+                requires[job.claim_key()] = needed
+            jobs.append(job)
+        return Claimable(jobs=tuple(jobs), requires=requires)
+
+    def take(self, job: Job) -> Ticket | None:
+        """Claim `job` for this owner. ``None`` if somebody else got there first.
+
+        **THE SAME COMPARE-AND-SWAP THE CI RUNNER USES**, and nothing else -- this method does not
+        post a comment, invent a marker or keep a local record. A second claiming mechanism would be
+        a second thing to be lowest on, and a human and a runner would each hold "the" claim.
+
+        THE CAPABILITY CHECK IS RE-READ HERE, BY NUMBER, rather than trusted from `available`. That
+        read is the one measured fresh on both forges, and the listing that fed `available` is the
+        one measured stale -- so a job may have gained a requirement since it was offered, and this
+        is the last moment anything can notice. It also covers the caller who never called
+        `available` at all, which on a human-facing surface is not a hypothetical.
+
+        Raises:
+            MissingCapability: this box does not declare what the job requires. Not a ``None``; see
+                that class for why the distinction is the whole point.
+        """
+        needed = self.store.requirements(job)
+        if not needed <= self.capabilities:
+            msg = (
+                f'{self.owner!r} cannot take {job.claim_key()!r}: it requires '
+                f'{sorted(needed - self.capabilities)}, which this box does not declare. '
+                f'Declared here: {sorted(self.capabilities)}.'
+            )
+            raise MissingCapability(msg)
+        if not self.store.try_claim(job, owner=self.owner):
+            return None
+        return Ticket(workbench=self, job=job, owner=self.owner)
+
+    def report(self, ticket: Ticket, *, verdict: str, detail: str) -> None:
+        """Answer the work in the ONE verdict vocabulary, then give the claim back.
+
+        **THE CLAIM IS PROVEN BEFORE THE VERDICT IS WRITTEN.** A holder that stopped beating has
+        lost the job, and by then another executor may have taken it, run it and answered it --
+        writing our verdict over theirs would replace a live answer with a stale one, and neither
+        would be marked. So a lost lease RAISES and nothing is written.
+
+        THE ORDER IS `record_verdict` THEN `release`, and it is load-bearing. `record_verdict`
+        closes the item, so after it the work is no longer claimable and the leftover claim comment
+        can harm nobody; a release first would leave a window in which the item is open, unclaimed
+        and unanswered, and a second executor would start a job whose verdict is one call away.
+
+        Raises:
+            LeaseLost: this owner no longer holds the job. Nothing has been written.
+            ValueError: `verdict` is not one of gate.py's three words -- refused BEFORE the lease is
+                checked, since a caller that invented a fourth state has a bug either way and the
+                clearer error is the one about the word.
+        """
+        if verdict not in VERDICTS:
+            msg = f'verdict must be one of {sorted(VERDICTS)}, got {verdict!r}'
+            raise ValueError(msg)
+        holder = self.store.claim_owner(ticket.job)
+        if holder != ticket.owner:
+            who = 'nobody' if holder is None else repr(holder)
+            msg = (
+                f'{ticket.owner!r} cannot report on {ticket.job.claim_key()!r}: it is held by '
+                f'{who}. Nothing was written -- another executor may already have answered it.'
+            )
+            raise LeaseLost(msg)
+        self.store.record_verdict(ticket.job, verdict=verdict, detail=detail)
+        self.store.release(ticket.job, owner=ticket.owner)

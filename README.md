@@ -35,6 +35,21 @@ values and return a reason or a bool:
 had been running and measured for months. Every constant is a measurement — `SHARED_SLOWDOWN` is a
 box that really slowed 1.9×, not a guess.
 
+`agent_swarm.seats` — a **fleet-wide** resource with N holders (a floating licence, a bench of
+physical rigs). `admission`'s `vendor:*` class plus `exclusive`'s lock already serialise one box;
+a file in `%TEMP%` cannot see another host, so ten boxes each holding their own local lock is ten
+concurrent sessions against a four-seat licence. `SeatPool` generalises the comment-id claim from
+"lowest wins" to "the lowest N win" — the soundness argument is unchanged, because your rank among
+live claims can only fall. `seats(tool) -> int` is configuration the CALLER supplies; an undeclared
+tool raises rather than defaulting, since 1 serialises a site that bought four and anything larger
+invents capacity. CAS *and* lease *and* owner-checked release *and* a heartbeat: `ci_tick.claim`
+traded the first for the second and parked jobs for hours, and the trade was never necessary.
+
+`agent_swarm.pull` — the surface for executors that can be INFORMED but not COMMANDED: a human, a
+TUI agent. `available` / `take` / `report`, over the primitives the CI runner already uses, so a
+person and a runner contend for one claim instead of holding two. No new protocol: only one kind of
+executor had ever been built, which is why this looked like part of the gate.
+
 ## No runtime dependencies, by design
 
 This layer *decides*; it does not reach. Facts arrive as arguments, stores arrive through adapters.

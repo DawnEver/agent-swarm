@@ -4,46 +4,12 @@ NO REFS. Issues and their comments are the whole storage layer (user directive 2
 彻底废弃 ref, 后面基于 issue 和 project 迭代). The ref-push claim this file used to carry is
 deleted, not deprecated.
 
-THE CLAIM PROTOCOL: A SERVER-ASSIGNED MONOTONIC ORDERING KEY
-============================================================
-
-    1. POST a comment `CLAIM <expiry> <owner>` on the job's work item.
-    2. GET the comment list. LOWEST LIVE COMMENT ID WINS.
-    3. If that id is not yours, DELETE your comment and return False.
-
-**THIS IS NOT A COMPARE-AND-SWAP, and calling it one would be the lie.** It is post-then-arbitrate,
-the same SHAPE as motronics' `ci_tick.claim()` that `store.py` was written to condemn. What makes it
-sound is not the shape but **who chooses the ordering key**:
-
-* `ci_tick`'s key is `<epoch>-<runner>`, chosen by the CLIENT. A racer arriving LATER can carry a
-  LOWER key and dethrone a runner that has already started. Correctness then requires every runner
-  to observe the full set at resolve time -- a window that is narrowed by hope, never closed.
-* This key is the comment id, assigned by the SERVER at insert, monotonically. Anything created
-  after your comment necessarily sorts HIGHER, so a runner that reads the list and finds itself
-  lowest **cannot be dethroned by any future arrival**; and a lower id, by definition, was inserted
-  earlier and is already committed.
-
-That converts "correct if everyone sees everything simultaneously" into "correct after one read".
-`Store.try_claim`'s contract -- return False, never resolve a tie on the caller's behalf -- is
-satisfied: a loser refuses at the call and does not compute a winner for anyone else.
-
-MEASURED, not reasoned: Gitea 1.26.4, 16 threads released from a `threading.Barrier` onto one fresh
-issue, FOUR independent rounds, exactly one winner each (`runner-03`, `r14`, `r02`, `r15`). Ids came
-back monotonic, unique and gapless (161->176 for 16 posts). Median claim latency ~280 ms under
-16-way contention, against 2510 ms for the create-only ref push this replaces. Four rounds and not
-one, because a single round electing a single winner is what a BROKEN protocol also does most of
-the time.
-
-THE PRECONDITION, WHICH IS A PROPERTY OF THE DEPLOYMENT AND NOT OF THE PROTOCOL
-==============================================================================
-
-Soundness rests on **read-after-write consistency**: a comment with a lower id must be visible to
-any reader that posts after it. That holds on a single-node Gitea backed by one database, which is
-what was measured. Put the forge behind a read replica and a runner can read a stale list, find
-itself lowest, and start work a second runner has already begun. **The lease is the mitigation, not
-the fix** -- it bounds how long a duplicated claim persists, it does not prevent one. If that day
-comes, `.claude/memory/2026/08/09/measurement-a-pure-issue-claim-protocol-that-holds-comment-id-
-arbitration.md` is where to look, and `GITHUB_UNMEASURED` names the probe.
+THE CLAIM PROTOCOL IS NOT HERE. It is `agent_swarm.claim`, one implementation shared by this
+store (`slots=1`) and by the fleet seat pool (`slots=N`) -- including the reasoning, the measured
+numbers and the deployment precondition. **The explanation lives with the code for the same reason
+the code does:** a second copy of the argument drifts from the implementation exactly as a second
+copy of the arbitration drifts from the first, and a docstring that has drifted is worse than none
+because it is still believed.
 
 CREATION IS A RACE, AND IT IS DELETED RATHER THAN MITIGATED
 ==========================================================
@@ -89,11 +55,11 @@ import enum
 import re
 import threading
 import hashlib
-import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar, Self
 
+from agent_swarm.claim import Arbiter, Held, LeaseLost, decode_claim
 from agent_swarm.forge import Forge
 from agent_swarm.item_index import IndexCorruptError, ItemIndex, NotIndexed
 from agent_swarm.job import Job, JobKind
@@ -103,10 +69,6 @@ from agent_swarm.store import VERDICTS
 #: (30 minutes, `AGENTS.md`) plus the slack a shared box costs; short enough that a dead machine
 #: does not park a job for a working day.
 DEFAULT_LEASE_SECONDS = 3 * 3600.0
-
-#: The first word of a claim comment. Human-readable on purpose: the forge is also the UI, and an
-#: operator scrolling an issue should be able to see who holds it and until when without a tool.
-CLAIM_MARKER = 'CLAIM'
 
 #: The label a verdict wears. Lower-case because labels are read by humans on a board; the VALUE is
 #: always `store.VERDICTS`' upper-case word, and this mapping is the only translation between them.
@@ -152,6 +114,18 @@ READY_LABEL = 'swarm:ready'
 #: request, they would be too stale to carry an answer.
 _KIND_LABEL_PREFIX = 'run:'
 
+#: Prefix for the labels naming what an executor must HAVE in order to do this work.
+#:
+#: DECLARED BY THE SUBMITTER, MATCHED BY THE EXECUTOR, AND NEVER INTERPRETED HERE. `requires:femm`
+#: is an opaque token to this package: it is compared for equality against whatever capability
+#: strings the caller declares for its box, and nothing in this module knows that FEMM is a solver,
+#: that it is licensed, or that it exists. The moment this file could enumerate the legal values it
+#: would be the vendor registry `admission.is_known_class` refuses to be.
+#:
+#: SAME LABEL FETCH AS THE VERDICT AND THE HANDOVER, which is why `claimable` can answer "what can
+#: this box take" without a second round trip per item -- see `Claimable.requires`.
+_REQUIRES_LABEL_PREFIX = 'requires:'
+
 
 @dataclass(frozen=True, slots=True)
 class Claimable:
@@ -173,6 +147,23 @@ class Claimable:
     """
 
     jobs: tuple[Job, ...]
+
+    #: claim key -> what an executor must HAVE to do it, from `requires:` labels.
+    #:
+    #: CARRIED HERE RATHER THAN FETCHED LATER, and the reason is the one already paid for in
+    #: `claimable`: the listing response carries the labels, so reading them per job afterwards
+    #: would be the N+1 that was measured at 101 calls for 100 items and then deleted. A pull
+    #: surface that has to ask "can this box do it" for every offered job is precisely the caller
+    #: that would have reintroduced it.
+    #:
+    #: A JOB MISSING FROM THIS MAP REQUIRES NOTHING. That is not the same as "unknown": every job in
+    #: `jobs` was built from the same listing entry, so its absence here means the submitter
+    #: declared no requirement, and `requirements_for` returns an empty set rather than raising.
+    requires: dict[str, frozenset[str]] = field(default_factory=dict)
+
+    def requirements_for(self, job: Job) -> frozenset[str]:
+        """What `job` needs. Empty means nothing was declared, which is a real answer here."""
+        return self.requires.get(job.claim_key(), frozenset())
 
     def __bool__(self) -> bool:
         msg = (
@@ -336,56 +327,6 @@ class NotVisible:
 
 #: "The list cannot see it." Never "it does not exist".
 NOT_VISIBLE = NotVisible()
-# --------------------------------------------------------------------------------------------
-# The claim comment -- pure, so it is testable without a network or a forge.
-# --------------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class Claim:
-    """A parsed claim comment. `comment_id` is the ordering key and is the server's, never ours."""
-
-    owner: str
-    expires_at: float
-    comment_id: int = -1
-
-    def is_expired(self, *, now: float) -> bool:
-        """Has the lease run out? The boundary instant is still HELD, not free."""
-        return now > self.expires_at
-
-
-def encode_claim(*, owner: str, expires_at: float) -> str:
-    """`CLAIM <expiry> <owner>`.
-
-    The expiry comes FIRST so that the owner can be the whole remainder of the line: an owner with
-    a space in it would otherwise be silently truncated to its first word, and two machines would
-    then share one identity -- a release by either freeing the other's claim.
-    """
-    return f'{CLAIM_MARKER} {expires_at:.3f} {owner}'
-
-
-def decode_claim(body: str, *, comment_id: int = -1) -> Claim | None:
-    """Parse a claim comment. ``None`` if `body` is not a claim comment at all.
-
-    Raises:
-        ValueError: `body` announces itself as a claim and then cannot be read as one. THE
-            DISTINCTION MATTERS MORE THAN IT LOOKS: "not a claim" and "an unreadable claim" would
-            both be skipped if this returned ``None`` for each, and skipping a live claim hands a
-            running job to a second runner. A verdict comment is the first case; a truncated or
-            future-format claim is the second, and it must stop the caller.
-    """
-    if not body.startswith(f'{CLAIM_MARKER} '):
-        return None
-    parts = body.split(maxsplit=2)
-    if len(parts) != 3:
-        msg = f'unreadable claim comment: {body[:80]!r}'
-        raise ValueError(msg)
-    try:
-        expires_at = float(parts[1])
-    except ValueError as exc:
-        msg = f'unreadable claim comment expiry: {body[:80]!r}'
-        raise ValueError(msg) from exc
-    return Claim(owner=parts[2], expires_at=expires_at, comment_id=comment_id)
 
 
 class ForgeStore:
@@ -441,23 +382,62 @@ class ForgeStore:
     # -- claims ------------------------------------------------------------------------------
 
     def try_claim(self, job: Job, *, owner: str) -> bool:
-        """Post a claim, then read the list once. Lowest live comment id wins."""
+        """Take `job` for `owner`. ``False`` if somebody already holds it.
+
+        ONE SLOT, AND THE ARBITRATION IS `agent_swarm.claim`'s -- the same code the fleet seat pool
+        runs at N slots. This store used to carry its own copy of it; the copy is deleted rather
+        than kept in step, because two implementations of one protocol are two places every future
+        fix has to land and the missed one is never the one being looked at.
+
+        Raises:
+            ArbitrationUnsound: the backend could not read a comment it had just written, so no
+                claim on it means anything. This used to be a quiet ``False``, which made a broken
+                deployment indistinguishable from a busy one.
+        """
         number = self._item_number(job, create=True)
         assert not isinstance(number, NotVisible)
-        mine = self.forge.add_comment(number, encode_claim(owner=owner, expires_at=time.time() + self.lease_seconds))
+        return self._arbiter(number).take(owner=owner) is not None
 
-        holder = self._holder(number, now=time.time())
-        if holder is not None and holder.comment_id == mine:
-            return True
-        # ARBITRATED BY COMMENT ID, NOT BY OWNER, which is what refuses a re-claim by the holder
-        # itself: the contract requires that, because a runner that lost track of its own claim must
-        # not reset the lease and keep a hung job locked forever.
-        #
-        # Withdrawing is not tidiness -- see the module docstring. An abandoned claim comment becomes
-        # the lowest live one the moment the holder releases, and this runner would then read itself
-        # as owning a job it was refused and never started.
-        self.forge.delete_comment(number, mine)
-        return False
+    def renew_claim(self, job: Job, *, owner: str) -> float:
+        """Beat the heart of an existing claim. Returns the NEW expiry.
+
+        **THE LEASE IS WHAT MAKES A DEAD HOLDER RECOVERABLE, AND THE HEARTBEAT IS WHAT MAKES THE
+        LEASE SHORT.** Without one, the only safe lease is longer than the longest job -- three
+        hours, here -- so a laptop that claims a job and closes its lid parks it for three hours. A
+        holder that beats can be leased for minutes, and a holder that stops beating is reclaimed in
+        minutes. Nothing else in the protocol changes.
+
+        THE HOLD IS RECOVERED FROM THE SERVER, NOT REMEMBERED. This store keeps no handle between
+        calls -- it re-reads who holds the item and rebuilds the record from the comment -- so a
+        runner that restarts mid-job can go on beating a claim it took in a previous process. A
+        cached handle would have made that impossible while looking like an optimisation.
+
+        WHY IT REFUSES A CLAIM THAT IS NOT OURS rather than taking it over: the holder may be
+        somebody else because our lease lapsed and the ordinary arbitration elected them. Beating
+        then would produce two live holders, which is the one outcome the protocol exists to make
+        impossible -- so the answer is that WE have lost, and the caller must stop.
+
+        Raises:
+            LeaseLost: our claim is gone -- expired and taken, pruned, or never held.
+        """
+        number = self._item_number(job)
+        if isinstance(number, NotVisible):
+            # A claim we cannot even find the item for is not a claim we can prove we hold. Reported
+            # as LOST rather than as "probably fine": the safe direction for a heartbeat is to stop
+            # a runner that is still healthy, never to reassure one that is not.
+            msg = f'cannot renew {job.claim_key()!r}: its work item is not visible from here'
+            raise LeaseLost(msg)
+        arbiter = self._arbiter(number)
+        holders = arbiter.holders()
+        mine = holders.by(owner)
+        if mine is None:
+            who = 'nobody' if not holders.claims else repr(holders.claims[0].owner)
+            msg = (
+                f'{owner!r} no longer holds {job.claim_key()!r} -- it is held by {who}. '
+                f'Stop the work: something else may already have taken it.'
+            )
+            raise LeaseLost(msg)
+        return arbiter.renew(Held(arbiter=arbiter, owner=owner, comment_id=mine.comment_id, expires_at=mine.expires_at))
 
     def claim_owner(self, job: Job) -> str | None:
         number = self._item_number(job)
@@ -466,33 +446,32 @@ class ForgeStore:
             # which risks a duplicate run; the lease bounds that, and the alternative -- reporting a
             # claim we cannot read -- would deadlock the job instead.
             return None
-        holder = self._holder(number, now=time.time())
-        return holder.owner if holder else None
+        claims = self._arbiter(number).holders().claims
+        return claims[0].owner if claims else None
 
     def release(self, job: Job, *, owner: str) -> None:
-        """Release `job` if `owner` holds it. A non-owner's release is a no-op, never a steal."""
+        """Release `job` if `owner` holds it. A non-owner's release is a no-op, never a steal.
+
+        THE COMMENT ID IS LOOKED UP RATHER THAN PASSED, because `Store.release` is specified in
+        terms of the JOB and the OWNER and this store keeps no handle. At one slot that lookup is
+        unambiguous -- there is only ever one holder to be.
+        """
         number = self._item_number(job)
         if isinstance(number, NotVisible):
             return
-        holder = self._holder(number, now=time.time())
-        if holder is not None and holder.owner == owner:
-            self.forge.delete_comment(number, holder.comment_id)
+        arbiter = self._arbiter(number)
+        mine = arbiter.holders().by(owner)
+        if mine is not None:
+            arbiter.release(owner=owner, comment_id=mine.comment_id)
 
-    def _holder(self, number: int, *, now: float) -> Claim | None:
-        """The live claim with the lowest comment id, or ``None``.
+    def _arbiter(self, number: int) -> Arbiter:
+        """This store's claim, which is the package's ONE claim, at one slot.
 
-        EXPIRED CLAIMS ARE SKIPPED RATHER THAN REMOVED, and that is what makes a takeover need no
-        second code path: a dead machine's comment simply stops counting, the next racer's comment
-        is the lowest LIVE one, and the ordinary arbitration elects it. A separate takeover path
-        would be a second way to win, and a second way to win is where a protocol quietly acquires
-        two winners.
+        Built per call rather than cached: construction is pure, and a cached arbiter would be a
+        second place the item number is remembered -- `_item_numbers` is already that place, and
+        two caches of one fact is the shape this refactor exists to remove.
         """
-        live = [
-            claim
-            for claim in (decode_claim(c.body, comment_id=c.id) for c in self.forge.comments(number))
-            if claim is not None and not claim.is_expired(now=now)
-        ]
-        return min(live, key=lambda claim: claim.comment_id) if live else None
+        return Arbiter(self.forge, item_number=number, slots=1, lease_seconds=self.lease_seconds)
 
     # -- verdicts ----------------------------------------------------------------------------
 
@@ -615,6 +594,7 @@ class ForgeStore:
         """
         prefix = f'{_ITEM_TITLE_ROOT} {self.namespace}/'
         jobs: list[Job] = []
+        requires: dict[str, frozenset[str]] = {}
         for item in self.forge.list_work_items(state='open'):
             if item.state != 'open' or not item.title.startswith(prefix):
                 continue
@@ -633,8 +613,18 @@ class ForgeStore:
             # between them would read as claimable on one line and withdrawn on the next.
             if READY_LABEL not in labels:
                 continue
+            # FROM THE SAME `labels`, for the same reason the two checks above share it: a second
+            # observation of a mutable thing can disagree with the first, and here that would mean
+            # offering a job under one set of requirements and admitting it under another.
+            declared = frozenset(
+                label.removeprefix(_REQUIRES_LABEL_PREFIX)
+                for label in labels
+                if label.startswith(_REQUIRES_LABEL_PREFIX)
+            )
+            if declared:
+                requires[job.claim_key()] = declared
             jobs.append(job)
-        return Claimable(jobs=tuple(jobs))
+        return Claimable(jobs=tuple(jobs), requires=requires)
 
     def newest_open(self, kind: JobKind, *, group: str) -> Job | None:
         """The newest OPEN item whose id starts with ``group/``, or ``None`` for none visible.
@@ -677,7 +667,31 @@ class ForgeStore:
                 best = (item.number, job)
         return None if best is None else best[1]
 
-    def register(self, job: Job, *, requests: Iterable[str] = ()) -> int:
+    def requirements(self, job: Job) -> frozenset[str]:
+        """What an executor must HAVE to do `job`. Empty means the submitter declared nothing.
+
+        BY NUMBER, like `requested_runs` and for the identical reason: this is the read measured
+        fresh on both forges, and a caller holding a Job has already survived the staleness
+        question. `Claimable.requires` is the BULK answer for a caller that is still choosing;
+        this is the authoritative one for a caller about to commit.
+
+        THE TWO MUST NOT DRIFT, so the prefix is a module constant consulted by both rather than a
+        string spelled twice -- the duplicated-derivation defect that `requested_runs` records.
+        """
+        number = self._item_number(job)
+        if isinstance(number, NotVisible):
+            # NOT an empty set meaning "requires nothing". An invisible item cannot tell us what it
+            # needs, and answering "nothing" would let a box take work it cannot do -- so this is
+            # the one place the distinction is worth an exception rather than a value.
+            msg = f'cannot read the requirements of {job.claim_key()!r}: its work item is not visible from here'
+            raise LookupError(msg)
+        return frozenset(
+            label.removeprefix(_REQUIRES_LABEL_PREFIX)
+            for label in self.forge.labels(number)
+            if label.startswith(_REQUIRES_LABEL_PREFIX)
+        )
+
+    def register(self, job: Job, *, requests: Iterable[str] = (), requires: Iterable[str] = ()) -> int:
         """Create this job's work item ONCE, from the single writer that owns submitting it.
 
         **THIS IS THE FIX, AND EVERYTHING BELOW IT IS MITIGATION.** Concurrent creation is a race
@@ -702,7 +716,18 @@ class ForgeStore:
         # registered job -- measured at 2.0 calls per job against a create-only 1.0, i.e. half the
         # registration throughput spent on a label -- and it left a window in which the item existed
         # WITHOUT the label that makes it claimable.
-        number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`', labels=[READY_LABEL])
+        # THE REQUIREMENTS RIDE ON THE CREATE, not on a follow-up `add_label`, and that is the same
+        # window argument the handover label already makes: between the create and a second call the
+        # item is claimable and declares NO requirement, so a box without the capability can take it
+        # and the declaration arrives too late to matter. `requests` stays a follow-up because it is
+        # read only by a runner that already holds the item, where a late arrival costs nothing.
+        labels = [READY_LABEL]
+        for required in sorted(set(requires)):
+            if not required:
+                msg = 'a requirement must be named; an empty requirement is not a requirement'
+                raise ValueError(msg)
+            labels.append(f'{_REQUIRES_LABEL_PREFIX}{required}')
+        number = self.forge.create_work_item(title=title, body=f'`{job.claim_key()}`', labels=labels)
         self._item_numbers[title] = number
         for requested in sorted(set(requests)):
             if not requested:
