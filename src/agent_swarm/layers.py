@@ -55,6 +55,11 @@ LAYERS: dict[str, int] = {
     'forge': DRIVER,
     'testing': DRIVER,
     # JOB -- the layer this package exists to be.
+    # FORCED, NOT CHOSEN, and the arrow is what forces it: both adapters take a `Job`, so a DRIVER
+    # placement would point UP. They are also here rather than in `agent_executor` because
+    # `TestTheSeamDoesNotLeakL0Vocabulary` refuses `subprocess` in that file -- a module that both
+    # DECLARES the seam and reaches the OS through it has stopped being a seam.
+    'adapters': JOB,
     'admission': JOB,
     'agent_executor': JOB,
     'allocator': JOB,
@@ -75,6 +80,10 @@ LAYERS: dict[str, int] = {
     'bench': ENTRY,
     'board': ENTRY,
     'clock': ENTRY,
+    # The production entry the execution path never had. ENTRY, and a ONE-SHOT: it takes one turn
+    # and exits, so it cannot become the unattended runner this design forbids. The loop is
+    # `clock`'s and `clock` is a human's.
+    'fleet_cli': ENTRY,
     'rem_bridge': ENTRY,
     'swarmctl': ENTRY,
     'tick': ENTRY,

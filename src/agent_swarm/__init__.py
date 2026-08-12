@@ -28,6 +28,7 @@ scheduler. It is stdlib-only by construction, so the move was a file move.
 # from five modules, so `claim` -- the arbitration everything else is built on -- was invisible from
 # the front door. `test_the_dependency_arrow_is_enforced.py` asserts this list stays complete.
 from agent_swarm import (
+    adapters,
     admission,
     agent_executor,
     allocator,
@@ -90,6 +91,7 @@ __all__ = [
     'LockOwner',
     'Outcome',
     'Store',
+    'adapters',
     'admission',
     'admission_blockers',
     'agent_executor',
