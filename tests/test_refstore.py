@@ -23,12 +23,13 @@ from pathlib import Path
 import pytest
 
 from agent_swarm.refstore import GitRefStore, RefStore, RefUnreachable
+from agent_swarm.testing import InMemoryRefStore
 
 
 def _never() -> bool:
     """The rehearsal predicate for a store under test: these tests exercise the REAL writes."""
     return False
-from agent_swarm.testing import InMemoryRefStore
+
 
 pytestmark = pytest.mark.unit
 

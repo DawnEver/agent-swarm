@@ -1,10 +1,14 @@
 [build-system]
-requires = ["hatchling"]
+# `hatch-vcs` is a BUILD-TIME dependency and is absent from the installed wheel. The stdlib-only
+# property asserted under `dependencies` below is about what gets INSTALLED onto the Gitea host; it
+# was never a claim about how the wheel is produced.
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "agent-swarm"
-version = "0.1.0"
+# THE VERSION IS DERIVED FROM GIT, NEVER WRITTEN HERE -- see [tool.hatch.version].
+dynamic = ["version"]
 description = "L1 job layer: store adapters, job model, atomic claim, admission, lifecycles"
 requires-python = ">=3.11"
 # NO RUNTIME DEPENDENCIES, and that is a design constraint rather than a happy accident. This layer
@@ -29,14 +33,96 @@ dependencies = []
 procs = ["psutil>=5.9"]
 # psutil is in `dev` too: the procs suite spawns real processes and would otherwise be silently
 # unrunnable, which for a module about "is it actually dead" is the worst possible thing to skip.
-dev = ["pytest>=8", "ruff>=0.6", "psutil>=5.9"]
+# DEV-TIME, and that distinction is load-bearing rather than tidy: nothing in this list is importable
+# from `src/agent_swarm`, so none of it reaches the Gitea host, where the package runs from a
+# checkout with no venv and no installer. `setuptools-scm` is here because
+# `tests/test_the_version_moves_with_the_commit.py` computes versions with the same engine the build
+# backend uses; `pre-commit` and `commitizen` are what .pre-commit-config.yaml drives.
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "psutil>=5.9",
+    "pre-commit",
+    "commitizen",
+    "setuptools-scm",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_swarm"]
 
+# THE VERSION IS A FACT ABOUT THE COMMIT, not a string somebody remembered to edit.
+#
+# MEASURED 2026-08-12 in the consuming project. This package is consumed as a NON-EDITABLE git
+# dependency, and reinstalling across a real push produced:
+#
+#     - agent-swarm==0.1.0 (...@e77417da...)
+#     + agent-swarm==0.1.0 (...@3c90de56...)
+#
+# Byte-identical version strings across genuinely different code. The consumer keys cached test
+# verdicts on a resolved-environment key, so a verdict earned against one commit was being served
+# for another. A hardcoded `version = "0.1.0"` is a declaration asserting an identity the artifact
+# does not have; this section makes the string a consequence of the tree instead of a claim about it.
+#
+# WHY hatch-vcs AND NOT setuptools_scm DIRECTLY: the build backend here is hatchling, and hatch-vcs
+# is its version source. (motronics uses setuptools_scm because its backend is setuptools. The
+# DISCIPLINE is the shared thing -- derive, never write -- not the package name.) hatch-vcs delegates
+# to setuptools_scm and passes `raw-options` through unchanged, which is why the test below can
+# compute the same answer without invoking a build.
+[tool.hatch.version]
+source = "vcs"
+# NO `fallback-version`, DELIBERATELY. A build with no SCM data and no PKG-INFO cannot know which
+# commit it is, and a fallback would answer anyway -- reinstating exactly the constant-string defect
+# this section exists to remove, but harder to see because it would only appear off the git path.
+# hatch-vcs RAISES instead. sdists are unaffected: hatch-vcs writes the resolved version into
+# PKG-INFO at sdist build time, so installing from an sdist reads a real version.
+
+[tool.hatch.version.raw-options]
+# `guess-next-dev`: an untagged commit spells itself as a dev release of the NEXT patch, so it sorts
+# BELOW that release rather than above it -- an untagged build must never outrank the tag it precedes.
+version_scheme = "guess-next-dev"
+# `node-and-date` is the part that actually closes the hole above. The distance component alone
+# (`0.1.1.dev3`) is NOT unique: two sibling commits off one base are both distance 3 and would share
+# a string again. The `+g<sha>` local segment is what makes two different commits unable to spell
+# themselves the same way, and the test asserts precisely that with two siblings.
+local_scheme = "node-and-date"
+
+# THE FIRST TAG IS `v0.1.0` AND NOTHING HAS MINTED IT YET -- this repo has zero tags as of 3c90de5.
+# `tools/bump-version.sh` mints it on the first push of the default branch (it starts at 0.1.0 rather
+# than 0.0.1 so the tagged history begins where the old hardcoded string left off, with no version
+# ever going backwards). Until then, `guess-next-dev` with no tag in sight spells a build
+# `0.1.dev<N>+g<sha>` -- already unique per commit, and already lower than the `0.1.0` that follows.
+[tool.commitizen]
+name = "cz_conventional_commits"
+# THE TAG IS THE VERSION'S ONLY HOME. `version_provider = "scm"` means `cz` reads git and writes
+# nothing into this file -- if it wrote a version here, the [project] section would once again carry
+# a hand-edited string that hatch-vcs is contractually ignoring, i.e. two answers to one question.
+version_provider = "scm"
+tag_format = "v$version"
+update_changelog_on_bump = false
+
 [tool.ruff]
 line-length = 120
 src = ["src", "tests"]
+
+# THE RULE SET IS DECLARED, for the same reason the quote style below is, and the omission was
+# already costing something. With no `select`, ruff enforces whatever ITS current default happens to
+# be -- and MEASURED 2026-08-12 with ruff 0.16.1 that default has grown well past the documented
+# `E4, E7, E9, F`: the undeclared tree reported 39 errors (RUF100, I001, B023, SIM117, TRY004, ...)
+# against code that has never been red. An undeclared set means the bar moves whenever ruff updates,
+# which turns "take latest, fix a break by updating" into "the linter picks the project's standards".
+# That is the one thing a floating dependency must not be allowed to do.
+#
+# The set below is ruff's DOCUMENTED default, written down. The tree is measured clean against it
+# (0 errors, 2026-08-12), so the pre-commit hook that runs it blocks for real rather than being a
+# permanent wall of pre-existing red that everyone learns to `--no-verify` past.
+#
+# A HOLE, NAMED RATHER THAN IMPLIED AWAY: `PLC0415` (no lazy imports) is NOT selected, and 22 lines
+# in this tree carry a `# noqa: PLC0415` that therefore suppresses nothing. Selecting it is a real
+# piece of work -- 39 sites, only 22 of them annotated -- and it is a decision about this package's
+# import discipline, not a line in a lint config. Until then those comments state an intent, not an
+# enforced rule, and this paragraph is what keeps a reader from assuming otherwise.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 # The quote style is DECLARED, not left to the default. Without this, running ruff from a sibling
 # checkout picks up that project's config and rewrites every string in this one -- a diff of pure

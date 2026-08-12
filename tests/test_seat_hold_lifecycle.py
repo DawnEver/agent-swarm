@@ -173,14 +173,18 @@ class TestTheUnreachablePolicyIsTheCALLERS:
         assert state() == SEATS_UNARBITRATED
 
     def test_refuse_refuses(self, catalog):
-        with pytest.raises(SeatRefused, match='unreachable'), _hold(
-            self._Down(), catalog, when_unreachable=REFUSE_WHEN_UNREACHABLE
+        with (
+            pytest.raises(SeatRefused, match='unreachable'),
+            _hold(self._Down(), catalog, when_unreachable=REFUSE_WHEN_UNREACHABLE),
         ):
             pass
 
     def test_an_unstated_policy_is_a_ValueError_not_a_guess(self, forge, catalog):
-        with pytest.raises(ValueError, match='no default'), hold_for_class(
-            'vendor:jmag', owner='x', namespace=NAMESPACE, catalog=catalog, forge=forge, when_unreachable='maybe'
+        with (
+            pytest.raises(ValueError, match='no default'),
+            hold_for_class(
+                'vendor:jmag', owner='x', namespace=NAMESPACE, catalog=catalog, forge=forge, when_unreachable='maybe'
+            ),
         ):
             pass
 

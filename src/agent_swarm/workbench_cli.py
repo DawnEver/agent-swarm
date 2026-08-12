@@ -76,7 +76,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
