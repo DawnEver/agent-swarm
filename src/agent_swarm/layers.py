@@ -42,6 +42,9 @@ LAYERS: dict[str, int] = {
     # the cheapest possible demonstration that the census is exhaustive by machine and not by care.
     # HOST because it imports nothing and every layer may read it.
     'layers': HOST,
+    # HOST: a hostname, a registry read, a file under /etc, a hash. No job vocabulary at all --
+    # which is what the layer definition asks, and identity is the fact every OTHER layer keys on.
+    'identity': HOST,
     'lanes': HOST,
     'lifetime': HOST,
     'procs': HOST,
@@ -89,6 +92,9 @@ LAYERS: dict[str, int] = {
     'refs': JOB,
     'roadmap': JOB,
     'seats': JOB,
+    # JOB because the three words it folds -- PASS, FAIL, INCONCLUSIVE -- are the verdict
+    # vocabulary. It imports nothing; the placement is about what it SPEAKS, not what it needs.
+    'shards': JOB,
     'spool': JOB,
     'status': JOB,
     'store': JOB,

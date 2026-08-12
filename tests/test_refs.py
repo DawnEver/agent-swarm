@@ -14,12 +14,23 @@ import pytest
 
 from agent_swarm.refs import (
     ATTEMPTS_ROOT,
+    GROUPS_ROOT,
     SHARDS_ROOT,
     VERDICTS_ROOT,
     aged_globs,
     attempt_glob,
     attempt_number,
     attempt_ref,
+    capability_glob,
+    capability_of,
+    capability_ref,
+    group_attempt_key,
+    group_name,
+    group_ref,
+    heartbeat_glob,
+    heartbeat_ref,
+    heartbeat_stamp,
+    runner_of,
     shard_index,
     shard_prefix,
     shard_ref,
@@ -142,3 +153,110 @@ def test_shards_are_deliberately_NOT_age_swept():
     collected by lifecycle -- with the composed verdict that made them garbage -- which is exact and
     O(1), where an age sweep can only guess how long a partition may legitimately stay open."""
     assert not any(pattern.startswith(SHARDS_ROOT) for pattern in aged_globs())
+
+
+# --------------------------------------------------------------------------- liveness
+
+
+def test_the_heartbeat_stamp_is_in_the_PATH():
+    """Not in the object. A ref pointing at whatever the head commit is encodes no time at all, and
+    a server-side ref's update time is not queryable over the ordinary git protocol -- so the
+    heartbeat could not distinguish the two states it exists to distinguish."""
+    assert heartbeat_ref('boxA-1234abcd', 1755000000) == 'refs/ci/heartbeat/boxA-1234abcd/1755000000'
+
+
+def test_the_stamp_comes_back_as_an_INT():
+    """This namespace is swept by "delete every stamp but the newest". Picking the maximum by
+    STRING order names the wrong survivor the moment the digit count changes -- and the survivor is
+    the only thing standing between this runner and reading as dead."""
+    refs = [heartbeat_ref('r', 999999999), heartbeat_ref('r', 1000000000)]
+    assert max(refs, key=heartbeat_stamp) == refs[1]  # type: ignore[arg-type]
+
+
+def test_a_ref_with_no_stamp_yields_None():
+    assert heartbeat_stamp('refs/ci/heartbeat/boxA') is None
+
+
+def test_the_FLEET_WIDE_glob_has_a_wildcard_per_segment():
+    """One short and the fleet reads as empty, which is indistinguishable from every runner being
+    dead -- the exact confusion this namespace exists to remove."""
+    assert heartbeat_glob() == 'refs/ci/heartbeat/*/*'
+    assert heartbeat_glob('boxA') == 'refs/ci/heartbeat/boxA/*'
+
+
+def test_the_fleet_wide_glob_MATCHES_what_one_runner_writes():
+    """The pair a drift would break silently. Asserted by shape rather than by eye, because the two
+    are written and read in different files."""
+    ref = heartbeat_ref('boxA', 1)
+    root, _, pattern = heartbeat_glob().partition('*')
+    assert ref.startswith(root) and pattern == '/*'
+
+
+def test_a_runner_id_with_HYPHENS_survives_the_parse():
+    """Runner ids are `<hostname>-<salt>`, so a parse that counted segments from the right or split
+    on a hyphen would mangle every real one."""
+    assert runner_of(heartbeat_ref('some-box-1234abcd', 17)) == 'some-box-1234abcd'
+
+
+def test_runner_of_refuses_a_ref_from_another_namespace():
+    """The discriminating half: a parser that just took a segment would happily name a testkey as a
+    runner and report a fleet member nobody owns."""
+    assert runner_of(verdict_ref('K', 'fast', 'ENV')) is None
+
+
+# --------------------------------------------------------------------------- capability
+
+
+def test_a_capability_is_ONE_REF_not_a_list():
+    """A list means fetching and parsing an object to answer "who can do X"; a ref per capability
+    makes it a prefix listing, and makes REVOCATION a deletion rather than a read-modify-write two
+    runners can lose."""
+    assert capability_ref('boxA', 'native_fea') == 'refs/ci/fleet/boxA/native_fea'
+
+
+def test_the_capability_and_the_runner_are_both_recoverable():
+    ref = capability_ref('some-box-1234abcd', 'vendor:thing')
+    assert runner_of(ref) == 'some-box-1234abcd'
+    assert capability_of(ref) == 'vendor:thing'
+
+
+def test_capability_of_refuses_a_heartbeat():
+    """The two namespaces have the same DEPTH, so only the root can tell them apart -- and reading
+    an epoch as a capability would advertise the fleet as able to do "1755000000"."""
+    assert capability_of(heartbeat_ref('boxA', 1755000000)) is None
+
+
+def test_the_capability_globs_match_what_is_written():
+    assert capability_glob() == 'refs/ci/fleet/*/*'
+    assert capability_glob('boxA') == 'refs/ci/fleet/boxA/*'
+
+
+# --------------------------------------------------------------------------- groups
+
+
+def test_a_group_ref_is_ONE_ref_overwritten():
+    """The question is "how long since this ran", and only the most recent answer can address it --
+    so unlike an attempt, a group's conclusion is a single mutable ref."""
+    assert group_ref('slow') == 'refs/ci/groups/slow'
+    assert group_name(group_ref('slow')) == 'slow'
+
+
+def test_group_name_refuses_another_namespace():
+    assert group_name('refs/ci/fleet/boxA/cap') is None
+    assert group_name(GROUPS_ROOT) is None
+
+
+def test_a_groups_attempts_borrow_the_attempt_namespace_under_a_PREFIXED_key():
+    """A group has no tree, so it cannot have a testkey. The `group-` prefix is STRUCTURAL: a
+    counter takes the name from this segment and never from the `kind` beside it, because the two
+    are written together and only this one is guaranteed."""
+    key = group_attempt_key('slow')
+    assert key == 'group-slow'
+    assert attempt_ref(key, 'slow', 3) == 'refs/ci/attempts/group-slow/slow/3'
+
+
+def test_a_group_attempt_is_still_an_attempt():
+    """It must age out on the same retention sweep as everything else, or the namespace grows
+    forever in the one place nobody thinks to look."""
+    assert attempt_number(attempt_ref(group_attempt_key('slow'), 'slow', 3)) == 3
+    assert f'{ATTEMPTS_ROOT}/*/*/*' in aged_globs()
