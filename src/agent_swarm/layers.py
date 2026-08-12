@@ -58,6 +58,10 @@ LAYERS: dict[str, int] = {
     # jobs, and its capacity source ARRIVES as a callable rather than being reached for.
     'scaling': HOST,
     'provenance': HOST,
+    # HOST: it reads TEXT a test runner printed and does arithmetic on it. No job vocabulary at all
+    # -- it knows nothing of issues, verdicts or who asked; the run-level kill markers whose
+    # vocabulary IS a consumer's arrive as an argument, which is what keeps the placement true.
+    'testlog': HOST,
     # HOST, and the placement follows the layer's definition rather than the word "verdict" in its
     # docstring: it measures a MACHINE -- this interpreter, this installed set, these files on this
     # disk -- and knows nothing about issues, jobs or who is asking. Its two project facts (which
