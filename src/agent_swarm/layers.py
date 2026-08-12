@@ -76,6 +76,12 @@ LAYERS: dict[str, int] = {
     # disk -- and knows nothing about issues, jobs or who is asking. Its two project facts (which
     # distribution roots the closure, which local paths the tests read) arrive as arguments.
     'environment': HOST,
+    # HOST, and FORCED by `environment`'s reason rather than chosen: it is a projection OF that
+    # module's manifest and imports it, so anything lower would point up and anything higher would
+    # separate a relation from the record it reduces. It speaks no job vocabulary -- an interpreter,
+    # an installed set and a dependency closure -- and the closure, its one consumer fact, arrives
+    # as an argument.
+    'manifest': HOST,
     # HOST: `pre-commit run`, `git diff --cached`, `git add`. Processes and an index, nothing more.
     'hooks': HOST,
     # HOST for `environment`'s reason: it measures THIS interpreter's installed set and THIS disk,
@@ -111,6 +117,11 @@ LAYERS: dict[str, int] = {
     'agent_executor': JOB,
     'allocator': JOB,
     'claim': JOB,
+    # JOB, and the vocabulary test decides it against the pull of "it is just a dataclass": the
+    # record exists to say what a VERDICT rests on, and its `effects` field is the declared intent
+    # of a SUBMISSION held against what a run observably did. Needing those words at all puts it
+    # here. It imports nothing.
+    'evidence': JOB,
     'exclusive': JOB,
     'fabric': JOB,
     'forge_store': JOB,
@@ -141,6 +152,10 @@ LAYERS: dict[str, int] = {
     'spool': JOB,
     'status': JOB,
     'store': JOB,
+    # JOB: it counts INTEGRATIONS and prices GATES, both job words, and the ceiling it computes is
+    # a statement about verdict capacity. It imports nothing but the stdlib -- the placement is
+    # about what it speaks, exactly as `shards` and `refs` are.
+    'throughput': JOB,
     # ENTRY -- commands, projections, and the schedule that pulls a tick.
     'bench': ENTRY,
     'board': ENTRY,
