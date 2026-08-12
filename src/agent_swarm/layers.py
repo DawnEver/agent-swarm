@@ -76,6 +76,12 @@ LAYERS: dict[str, int] = {
     # disk -- and knows nothing about issues, jobs or who is asking. Its two project facts (which
     # distribution roots the closure, which local paths the tests read) arrive as arguments.
     'environment': HOST,
+    # HOST: `pre-commit run`, `git diff --cached`, `git add`. Processes and an index, nothing more.
+    'hooks': HOST,
+    # HOST for `environment`'s reason: it measures THIS interpreter's installed set and THIS disk,
+    # and knows nothing about issues, jobs or who is asking. Its consumer facts -- which
+    # distributions are in-tree, which licence strings are curated -- arrive as arguments.
+    'notices': HOST,
     # DRIVER -- the outside world and its stand-ins.
     'credentials': DRIVER,
     'forge': DRIVER,
@@ -89,6 +95,11 @@ LAYERS: dict[str, int] = {
     # DRIVER: it is a git remote behind a subprocess. The four-operation PROTOCOL could sit lower,
     # but splitting a seam from its only real implementation buys nothing and costs a file.
     'refstore': DRIVER,
+    # DRIVER, and FORCED rather than chosen: it runs `git ls-remote` and `git credential fill`
+    # against a real server to tell "you may not see this repository" from "the host is down". The
+    # decision half takes the requirement strings already parsed, exactly as `policy` does, so it
+    # never reaches for a manifest path it was not told about.
+    'installer': DRIVER,
     'testing': DRIVER,
     # JOB -- the layer this package exists to be.
     # FORCED, NOT CHOSEN, and the arrow is what forces it: both adapters take a `Job`, so a DRIVER
@@ -134,9 +145,17 @@ LAYERS: dict[str, int] = {
     'swarmctl': ENTRY,
     'tick': ENTRY,
     'workbench_cli': ENTRY,
+    # THE FOUR THAT ARRIVED 2026-08-12, and ENTRY is what they are: each is a command with its own
+    # `main`, nothing in this package imports any of them, and every consumer fact they need --
+    # a store directory, the trees to sweep, which roots hold importable code, which package and
+    # distribution to resolve against -- is a required argument. They are `DEV_TOOL` below.
+    'pins': ENTRY,
+    'callsites': ENTRY,
+    'staged_imports': ENTRY,
+    'installed_symbols': ENTRY,
 }
 
-DEV_TOOL = frozenset({'bench', 'rem_bridge'})
+DEV_TOOL = frozenset({'bench', 'rem_bridge', 'pins', 'callsites', 'staged_imports', 'installed_symbols'})
 """Development conveniences that happen to live here, NOT part of the job layer.
 
 Borrowed from motronics' four-valued PLACEMENT and for its stated reason: generic makes a module
@@ -145,6 +164,14 @@ dev-tool drawer. `rem_bridge` is the sharp case -- it parses one specific plugin
 it passes `test_this_package_names_no_specific_project.py` only because "rem" is not in that
 guard's noun list. The guard's SCOPE is narrower than its name, so the exemption is named here
 instead of resting on that.
+
+THIS SET IS THE "SHARED DEV-TOOLS HOME" THAT DID NOT EXIST, 2026-08-12. motronics' migration table
+had classified four modules `DEV_TOOL` with the reason "they wait here until a shared dev-tools home
+exists to want them" -- and no such home was ever built, so "waiting for a destination" and "nobody
+did the work" looked identical in that tree. They are the same shape as `bench`: a command, with a
+`main`, that nothing in this package imports. So the home is HERE, it is this list plus the ENTRY
+layer, and the four are in it. The alternative -- keeping a fourth verdict value alive in a consumer
+for a destination nobody was building -- is how legacy debt is created on purpose.
 
 Naming them is not blessing them. The guard keeps the drawer from deepening: nothing outside
 `DEV_TOOL` and ENTRY may import one, so no load-bearing path can come to depend on a convenience.
