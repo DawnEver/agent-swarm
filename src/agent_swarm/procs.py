@@ -675,7 +675,10 @@ def stop(
             return [f'pid {pid} does not exist -- nothing to stop'], NOTHING_TO_STOP
     else:
         tree = as_forest(discover())
-        recount = lambda: [found.pid for found in discover()]  # one expression, one use
+
+        def recount() -> Sequence[int]:
+            return [found.pid for found in discover()]
+
         if not tree:
             return ['no matching processes found -- nothing to stop'], STOPPED
 

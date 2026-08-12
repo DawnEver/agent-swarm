@@ -43,7 +43,9 @@ def built():
 
 def test_every_flag_reaches_the_field_it_names(built) -> None:
     recorder, build = built
-    assert clock.run_cli(build, description='x', argv=['--interval', '7', '--wake-host', '::1', '--wake-port', '0']) == 0
+    assert (
+        clock.run_cli(build, description='x', argv=['--interval', '7', '--wake-host', '::1', '--wake-port', '0']) == 0
+    )
     assert recorder.kwargs == {'interval': 7.0, 'once': False, 'wake_host': '::1', 'wake_port': 0}
 
 
