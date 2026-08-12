@@ -27,14 +27,67 @@ its liveness to somebody else's repository while every local check passes.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import shutil
 import subprocess
+import sys
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 #: Resolved once: a partial executable path is a lint finding worth honouring rather than
 #: suppressing, and a box without git then fails at the first call with a name.
 _GIT = shutil.which('git') or 'git'
+
+#: git verbs that WRITE to the shared remote. `push` is the whole set on purpose: it covers ref
+#: DELETION too (`push --delete`), which is the destructive half. `fetch` is deliberately ABSENT --
+#: it writes only this checkout's remote-tracking refs, and a caller measuring how far behind it is
+#: needs it to answer at all, so forbidding it would make a rehearsal report a staleness it could
+#: not measure.
+FORGE_MUTATING_VERBS = frozenset({'push'})
+
+#: Whether the CURRENT pass may write to the shared remote. Module-scoped rather than per-instance
+#: because the writes it governs sit several frames below whoever armed it, and threading a flag
+#: through every signature in between would put the decision in N places again -- which is the
+#: defect :meth:`GitRefStore.run` exists to remove. Read through the predicate a consumer supplies,
+#: never directly: a consumer with its own flag must be able to keep it.
+_WITHHOLDING: ContextVar[bool] = ContextVar('agent_swarm_refstore_withholding', default=False)
+
+
+def withholding_writes() -> bool:
+    """The predicate for a consumer that wants THIS module's `withholding()` to govern its store.
+
+    Offered so the ordinary wiring -- `GitRefStore(root, remote, withhold_writes=withholding_writes)`
+    -- is one obvious spelling rather than a lambda each consumer writes differently. It is still
+    PASSED rather than assumed: a consumer whose rehearsal flag lives somewhere else supplies its
+    own, and nothing here reaches for a global on its behalf.
+    """
+    return _WITHHOLDING.get()
+
+
+@contextlib.contextmanager
+def withholding(active: bool) -> Iterator[None]:
+    """Arm :func:`withholding_writes` for the length of one pass, and ALWAYS disarm it.
+
+    MODULE-LEVEL BECAUSE THE STATE IS, and saying so matters: the flag governs writes several frames
+    below whoever armed it, so it cannot be per-store without threading it through every signature
+    in between -- the very dispersal :meth:`GitRefStore.run` exists to remove. A caller holding a
+    store may spell it `store.withholding(...)`, which forwards here; a caller holding a TEST DOUBLE
+    can still arm the real flag, which a method-only form would have made impossible.
+
+    A `ContextVar` AND `reset(token)`, never `= False`: that restores what was there BEFORE, where
+    the assignment would hardcode a guess about the outer state. Nothing nests passes today; a
+    restore that guesses is how that stops being true safely one day and unsafely the next. The
+    `finally` is not padding -- a pass that RAISES must not leave the refusal armed for a later
+    caller in the same interpreter, which is exactly the arrangement a test suite is.
+    """
+    token = _WITHHOLDING.set(active)
+    try:
+        yield
+    finally:
+        _WITHHOLDING.reset(token)
 
 
 class RefUnreachable(RuntimeError):
@@ -96,22 +149,113 @@ class RefStore(Protocol):
 
 
 class GitRefStore:
-    """A :class:`RefStore` backed by a git remote.
+    """A :class:`RefStore` backed by a git remote, and THE ONE PLACE A CONSUMER SPAWNS GIT.
 
-    BOTH ARGUMENTS ARE REQUIRED. `root` is the checkout the commands run in and `remote` is the
-    name they push to; defaults for either would be this package deciding a consumer's deployment,
-    which is the coupling it deletes rather than adds.
+    IT IS MORE THAN THE FOUR OPERATIONS, AND THAT IS THE POINT rather than scope creep. The four
+    are what a liveness DECISION needs; a consumer that also publishes results needs `rev-parse`,
+    `hash-object`, `mktree`, `commit-tree`, `update-ref` and `show`, and if this class offers only
+    four it will build its own `subprocess.run` for the rest -- which is exactly what motronics'
+    `ci_tick.py` did. It grew FOUR git entry points, then a fifth `RefStore` implementation of its
+    own, precisely so that all of them could pass through one withholding check. Extracting the
+    four and leaving the funnel behind would have moved the decisions and stranded the seam.
+
+    ALL THREE CONSTRUCTOR ARGUMENTS ARE REQUIRED. `root` is the checkout the commands run in,
+    `remote` is the name they push to, and `withhold_writes` says whether a REHEARSAL is in
+    progress. Defaults for the first two would be this package deciding a consumer's deployment.
+    A default for the third is worse: it would be `lambda: False`, so every consumer that forgot to
+    wire its rehearsal flag would reach the real remote while its own `--dry-run` reported
+    otherwise -- a default that is invisible precisely because it works, which is the defect this
+    package removed from `default_forge` and must not reintroduce on the destructive path.
+
+    A PREDICATE, NOT A BOOLEAN. The flag is armed for the length of one pass, after the store is
+    built -- consumers construct this at module scope -- so a value captured at construction would
+    be the value at import time, forever.
     """
 
-    def __init__(self, root: Path, remote: str) -> None:
+    def __init__(self, root: Path, remote: str, *, withhold_writes: Callable[[], bool]) -> None:
         self.root = root
         self.remote = remote
+        self._withhold_writes = withhold_writes
 
-    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([_GIT, '-C', str(self.root), *args], capture_output=True, text=True, check=False)
+    @staticmethod
+    def mutates_the_forge(args: Sequence[str]) -> bool:
+        """Does this git argv WRITE to the shared remote.
+
+        THE VERB IS `args[0]`, NOT `verb in args`. A membership test would also fire on any argv
+        that merely CONTAINED the word -- a branch or a ref named `push` -- and a guard that refuses
+        reads it was never asked to refuse is how a safety flag becomes one people route around.
+        """
+        return bool(args) and args[0] in FORGE_MUTATING_VERBS
+
+    def run(self, *args: str, cwd: Path | None = None, **kwargs) -> subprocess.CompletedProcess:
+        """THE SEAM. Every git call a consumer makes goes through here, and so does the refusal.
+
+        WHY A SEAM RATHER THAN A GUARD PER WRITE SITE. A guard at each write site is N places to
+        forget, and the next writer added does not know to add an N+1th -- which is the shape that
+        produced the original defect: four entry points, each with its own `subprocess.run`, and a
+        `--dry-run` that only one of them consulted.
+
+        A REFUSED WRITE IS ANNOUNCED, NOT SWALLOWED. Returning a synthetic success silently would
+        make a rehearsal indistinguishable from a real run, which is the same class of lie the flag
+        was introduced to remove. The caller still gets a SUCCESS-shaped result, deliberately: a
+        rehearsal must not take the FAILURE branch either, or a liveness writer would report that
+        the fleet cannot see this box -- alarming, and false.
+        """
+        if self._withhold_writes() and self.mutates_the_forge(args):
+            sys.stdout.write(f'[refstore] WITHHELD -- no forge write in a rehearsal: git {" ".join(args)}\n')
+            return subprocess.CompletedProcess([_GIT, *args], 0, stdout='', stderr='')
+        return subprocess.run(
+            [_GIT, '-C', str(cwd or self.root), *args], capture_output=True, text=True, check=False, **kwargs
+        )
+
+    def text(self, *args: str, check: bool = True, cwd: Path | None = None) -> str:
+        """Stdout, stripped. `check` RAISES with git's own words rather than returning ''.
+
+        An empty string is a legitimate answer from several plumbing commands, so a caller that
+        cannot tell it from a failure will read one as the other.
+        """
+        out = self.run(*args, cwd=cwd)
+        if check and out.returncode != 0:
+            msg = f'git {" ".join(args)} failed: {out.stderr.strip() or "(nothing on stderr)"}'
+            raise RuntimeError(msg)
+        return out.stdout.strip()
+
+    def ok(self, *args: str) -> bool:
+        """Did this call SUCCEED. For writes whose failure must change what happens next.
+
+        :meth:`text` drops the return code, which is right for a best-effort read and WRONG
+        whenever the next statement depends on the write having landed. A swallowed code there is
+        why an empty liveness namespace on a live box once took a remote inspection to explain.
+        """
+        return self.run(*args).returncode == 0
+
+    def stdin_text(self, payload: str, *args: str) -> str:
+        r"""A git call that reads stdin (`hash-object`, `mktree`). BYTES, NOT TEXT, deliberately.
+
+        `text=True` wraps the pipe in a TextIOWrapper with `newline=None`, which on Windows rewrites
+        every `\n` as `\r\n`. For `hash-object` that silently changes the CONTENT hashed; for
+        `mktree` the `\r` lands INSIDE the filename, and the first real payload published this way
+        held `<name>\r`, so `git cat-file -p <ref>:<name>` -- the documented read path -- answered
+        *path does not exist*. A plumbing payload is a byte string by definition and must not be
+        line-ending-translated on the way to the process.
+        """
+        out = subprocess.run(
+            [_GIT, '-C', str(self.root), *args], input=payload.encode('utf-8'), capture_output=True, check=True
+        )
+        return out.stdout.decode('utf-8').strip()
+
+    @staticmethod
+    def withholding(active: bool):
+        """The ergonomic spelling of :func:`withholding` for a caller that is holding a store.
+
+        A `staticmethod` AND NOT AN INSTANCE ONE, deliberately: the flag is module state, so binding
+        it to a store would imply a per-store scope this does not have -- and a reader who believed
+        that would arm one store and be surprised by another. It forwards; it does not decide.
+        """
+        return withholding(active)
 
     def head(self) -> str:
-        out = self._run('rev-parse', 'HEAD')
+        out = self.run('rev-parse', 'HEAD')
         if out.returncode != 0:
             msg = f'cannot resolve HEAD in {self.root}: {out.stderr.strip()}'
             raise RefUnreachable(msg)
@@ -120,7 +264,7 @@ class GitRefStore:
     def list(self, pattern: str) -> dict[str, str]:
         """One `ls-remote`. THE NON-ZERO EXIT IS RAISED, which is this class's whole reason for
         being explicit about it -- see the module docstring for the incident."""
-        out = self._run('ls-remote', self.remote, pattern)
+        out = self.run('ls-remote', self.remote, pattern)
         if out.returncode != 0:
             msg = f'cannot list {pattern!r} on {self.remote}: {out.stderr.strip() or "(nothing on stderr)"}'
             raise RefUnreachable(msg)
@@ -132,9 +276,31 @@ class GitRefStore:
         return found
 
     def write(self, ref: str, commit: str) -> tuple[bool, str]:
-        out = self._run('push', self.remote, f'{commit}:{ref}', '--force')
+        out = self.run('push', self.remote, f'{commit}:{ref}', '--force')
         return out.returncode == 0, out.stderr
 
     def delete(self, ref: str) -> bool:
         """Exit status only. See the protocol's note: git exits 0 for an absent ref."""
-        return self._run('push', self.remote, '--delete', ref).returncode == 0
+        return self.run('push', self.remote, '--delete', ref).returncode == 0
+
+    def write_payload(self, ref: str, payload: Mapping, message: str, *, filename: str) -> str:
+        """Store `payload` as JSON in an ORPHAN COMMIT and point `ref` at it, LOCALLY. Returns the commit.
+
+        NOTHING IS PUSHED. Splitting the durable half from the fragile half is what lets a consumer
+        record an expensive answer before touching the network -- see :mod:`agent_swarm.spool` for
+        the inversion this exists to serve.
+
+        AN ORPHAN COMMIT RATHER THAN A REF POINTING STRAIGHT AT A BLOB: a blob-ref works locally but
+        is an unusual thing to push and server behaviour varies. A commit is the boring choice that
+        works everywhere, and `git cat-file -p <ref>:<filename>` reads it back with no tooling.
+
+        `filename` HAS NO DEFAULT. It is the name the reader will `cat-file` and therefore half of a
+        contract between a writer here and a reader somewhere else; a default would let the two
+        drift while both kept passing, which is the failure this package has already paid for once
+        at a repository boundary.
+        """
+        blob = self.stdin_text(json.dumps(dict(payload), indent=2), 'hash-object', '-w', '--stdin')
+        tree = self.stdin_text(f'100644 blob {blob}\t{filename}\n', 'mktree')
+        commit = self.text('commit-tree', tree, '-m', message)
+        self.text('update-ref', ref, commit)
+        return commit
