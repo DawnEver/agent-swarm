@@ -50,6 +50,11 @@ LAYERS: dict[str, int] = {
     # lowest consumer to reach, so `forge` grew its own literals instead.
     'roles': HOST,
     'provenance': HOST,
+    # HOST, and the placement follows the layer's definition rather than the word "verdict" in its
+    # docstring: it measures a MACHINE -- this interpreter, this installed set, these files on this
+    # disk -- and knows nothing about issues, jobs or who is asking. Its two project facts (which
+    # distribution roots the closure, which local paths the tests read) arrive as arguments.
+    'environment': HOST,
     # DRIVER -- the outside world and its stand-ins.
     'credentials': DRIVER,
     'forge': DRIVER,
@@ -78,6 +83,10 @@ LAYERS: dict[str, int] = {
     'job': JOB,
     'loop': JOB,
     'pull': JOB,
+    # JOB rather than HOST, and the vocabulary test is what decides it: a verdict, an attempt and a
+    # shard are job words. It imports nothing -- it is pure path grammar -- so the placement costs
+    # nothing and keeps "needing the word verdict puts you in this layer" true.
+    'refs': JOB,
     'roadmap': JOB,
     'seats': JOB,
     'spool': JOB,
