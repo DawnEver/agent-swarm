@@ -265,6 +265,47 @@ def stamp_heartbeat(path: Path, *, now: float | None = None, pid: int | None = N
         pass
 
 
+#: How many polls a beat may be late before the clock is called STALE. A MULTIPLE OF THE INTERVAL,
+#: never a constant: the same age means different things at a 10 s poll and at an hour's, and a
+#: fixed threshold would call a slow clock dead the moment somebody widened its cadence. Generous on
+#: purpose -- a false "runner down" is exactly how a reader learns to skip the one line that matters.
+MISSED_BEATS = 8
+
+#: The three readings of :func:`read_heartbeat`. NAMED, so a caller comparing against a literal that
+#: drifts is a change to this tuple rather than a silent mismatch.
+HEARTBEAT_STATES = ('ALIVE', 'STALE', 'DEAD')
+
+
+def read_heartbeat(path: Path, *, now: float, poll_seconds: float, missed_beats: int = MISSED_BEATS) -> tuple[str, str]:
+    """``(ALIVE|STALE|DEAD, detail)`` for the clock that writes ``path``. The inverse of the stamp.
+
+    IT LIVES BESIDE ITS WRITER, and that is the whole reason it is here rather than at the consumer.
+    :func:`stamp_heartbeat` decides the file's SHAPE -- the `at` key, the `pid` key, JSON -- and the
+    reader that decodes it was in another repository, so nothing connected the two. A format the
+    writer owns and the reader guesses at is one rename away from a status line that reports DEAD
+    about a clock beating perfectly well, with both halves passing their own tests.
+
+    **DEAD AND STALE ARE KEPT APART**, and the distinction is the reason the function returns a word
+    rather than a bool. DEAD means no readable stamp: nobody ever started this clock on this box, so
+    the action is to start it. STALE means it started and stopped, so the action is to find out why.
+    Collapsing them sends every reader down the wrong one half the time.
+
+    AN UNREADABLE FILE IS DEAD, NOT AN ERROR. A truncated write during a status report must not
+    raise a traceback over whatever the reader actually came to see -- and "I cannot read the
+    liveness file" is, for the reader's purposes, the same as there being none.
+    """
+    try:
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+        at = float(payload['at'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 'DEAD', f'no readable heartbeat at {path} -- the clock has never run on this box'
+    age = now - at
+    limit = missed_beats * poll_seconds
+    if age > limit:
+        return 'STALE', f'last beat {age:.0f}s ago, over {missed_beats} x {poll_seconds:g}s poll ({limit:.0f}s)'
+    return 'ALIVE', f'last beat {age:.0f}s ago (pid {payload.get("pid", "?")})'
+
+
 def wait_for_work(wake: threading.Event, interval: float) -> bool:
     """Wait up to ``interval`` for a wake. ``True`` if one arrived, ``False`` if the POLL fired.
 
