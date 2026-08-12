@@ -74,6 +74,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
+from agent_swarm import lifetime
+
 #: The documented range is 30-60 s. Polling faster buys nothing against jobs of 25+ minutes, and
 #: every tick costs a round trip to the control plane -- the machine this whole design refuses to
 #: load. Used only when a policy file stays SILENT about the cadence.
@@ -503,7 +505,25 @@ class Clock:
         A BAD SPAWN IS REPORTED AND THE CLOCK KEEPS GOING. A loop that exits on one failed spawn
         stops being a clock, and stops QUIETLY -- the failure mode this whole design is built to
         make impossible. `__post_init__` already refused the one such failure that is permanent.
+
+        IT BINDS TO THE TERMINAL FIRST. The line above claimed "closing the terminal is the stop"
+        and NOTHING MADE THAT TRUE -- a declaration that lies, in the loop that spawns every tick.
+        Each iteration is a FRESH CHILD PROCESS, so an unbound clock leaves ticks that outlive the
+        window, and a closed window that stopped nothing is indistinguishable from a clock that was
+        never started.
+
+        USER DIRECTIVE, restated 2026-08-12: **CI and every loop is started by a human, in a
+        terminal. Always. That is the design, not a gap.** 7x24 means a long-lived loop somebody
+        STARTED and can SEE -- never an unattended one. A Scheduled Task version of this was deleted
+        at the source once, and the measured failure was a task reporting itself present while its
+        `LastRunTime` read 1932. So this binding is not defence in depth: it is what makes "is it
+        running?" answerable by looking at a window.
         """
+        # BEFORE THE FIRST TICK. A failure to bind must be fatal rather than a warning: a warning on
+        # an unchanged success return is the shape this project forbids, and here it would mean a
+        # fleet nobody can stop by the only stop its operator has been given.
+        binding = lifetime.bind_children_to_this_process()
+        out.write(f'[clock] terminal-bound via {binding.mechanism}; closing this window stops every tick it spawns\n')
         interval = poll_interval(self.policy_path) if interval is None else interval
         out.write(f'[clock] ticking every {interval:g}s -- Ctrl-C, or close this terminal, to stop\n')
         out.flush()
