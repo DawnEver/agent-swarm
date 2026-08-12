@@ -34,6 +34,7 @@ from agent_swarm import (
     agent_executor,
     allocator,
     claim,
+    evidence,
     exclusive,
     fabric,
     forge_store,
@@ -51,6 +52,7 @@ from agent_swarm import (
     spool,
     status,
     store,
+    throughput,
 )
 from agent_swarm.admission import (
     CHEAP,
@@ -121,6 +123,7 @@ __all__ = [
     'claim',
     'claim_key',
     'classes_conflict',
+    'evidence',
     'exclusive',
     'exclusive_lock',
     'fabric',
@@ -148,6 +151,7 @@ __all__ = [
     'staleness_blocker',
     'status',
     'store',
+    'throughput',
     'time_blocker',
     'workers_for',
 ]
