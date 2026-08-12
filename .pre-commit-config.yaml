@@ -1,16 +1,148 @@
+# agent-swarm's pre-commit discipline. Modelled on motronics' config, which carries a comment per
+# past incident; what follows says which of those incidents apply HERE and which do not, because
+# copying a hook whose reason does not hold is how a config starts asserting checks nobody needs.
+#
+# THE RUNTIME/DEV DISTINCTION IS LOAD-BEARING. This package is stdlib-only at runtime by design and
+# must run from a bare checkout on the Gitea host, which has no venv and no installer. Nothing below
+# adds a runtime dependency: `pre-commit`, `commitizen`, `ruff` and `pytest` are dev-time, live in
+# the `dev` extra, and never enter `[project] dependencies`. `hatch-vcs` is build-time, in
+# `[build-system] requires`, and is absent from the installed wheel.
+#
+# ON `rev:` AND "NEVER PIN A VERSION". The directive is about the versions this project DEPENDS on
+# -- nothing in pyproject.toml carries a tag, sha or upper bound, and that stays true. `rev:` is a
+# required field of pre-commit's own format (it refuses a mutable ref), so the tension cannot be
+# resolved by deleting it. It is resolved by SCOPE instead: the only two `rev:`-bearing entries are
+# upstream hook repos that never touch this project's dependency graph, and every hook that runs
+# against OUR code resolves through the interpreter below with no version constraint at all. So the
+# thing the directive protects -- "a break is fixed by updating, not by holding still" -- holds where
+# it matters, and the two pinned refs are refreshed with `pre-commit autoupdate`.
+
+fail_fast: false
+
 repos:
-  - repo: https://example.invalid/upstream
+  - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
-      - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
       - id: check-toml
+      - id: debug-statements
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.6.0
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
+      - id: commitizen-branch
+        stages: [pre-push]
+        # Only the commits AHEAD of the remote's main -- never re-check already-pushed history. The
+        # hook's default range is origin/HEAD..HEAD, and origin/HEAD can point at a stale branch,
+        # which drags in hundreds of old commits and fails on any legacy non-conventional message.
+        args: ['--rev-range', 'origin/main..HEAD']
+
+  - repo: local
+    # ONE RUFF, RESOLVED THROUGH AN INTERPRETER -- never through PATH, and never through a mirror.
+    # A mirror repo resolves its own copy; `entry: ruff check` with `language: system` resolves
+    # whatever PATH offers. motronics measured both halves of that on 2026-08-12: `ruff` on PATH was
+    # 0.15.15 from a global Python 3.13 install while `python -m ruff` in its venv was 0.16.1, and
+    # the two disagreed about the formatting of the same file -- the hook rewrote the tree one way
+    # and the gate judged it the other. Pinning the two to one version is forbidden and, worse, only
+    # postpones the divergence to whoever bumps one of them; removing the second copy is the fix.
+    #
+    # HOW *THIS* REPO RESOLVES ONE, given it has no venv of its own: `tools/with-venv.sh` tries
+    # $AGENT_SWARM_PYTHON, then this checkout's `.venv`, then the main checkout's, and REFUSES if
+    # none resolves. It does not fall back to PATH -- that fallback IS the second copy. Developers
+    # here keep the dev extras in an interpreter they name explicitly; see that script's header.
+    hooks:
+      - id: ruff
+        name: ruff (the resolved interpreter's, via -m)
+        entry: bash tools/with-venv.sh ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff-format (the resolved interpreter's, via -m)
+        entry: bash tools/with-venv.sh ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+  - repo: local
+    # THE RUNNER `staged_imports` NEVER HAD. This repo OWNS that mechanism -- it was extracted here
+    # from motronics precisely so any repository could use it -- and until this hook, nothing in this
+    # repository invoked it on this repository. Its tests build a synthetic repo under `tmp_path`, so
+    # they prove the logic and are silent about whether it ever runs.
+    #
+    # `always_run` with `pass_filenames: false`: the question is about the whole STAGED SET. An
+    # importer and the module it imports are two different files, and a per-file hook cannot see that
+    # the second one is missing.
+    hooks:
+      - id: staged-imports
+        name: no staged file imports an untracked module
+        entry: bash tools/with-venv.sh tools/check_staged_imports.py
+        language: system
+        always_run: true
+        pass_filenames: false
+        require_serial: true
 
   - repo: local
     hooks:
-      - id: commit-message
-        stages: [commit-msg]
-      - id: the-suite
-        name: the whole suite
+      - id: pytest
+        name: pytest (the whole suite)
+        # THE WHOLE SUITE, NOT A DIFF-SELECTED SUBSET. motronics selects by diff because
+        # `pytest tests/unit` cannot fit its 5-10 minute pre-commit budget -- measured, it reached
+        # 24% of the suite inside a 300 s ceiling. That reason does not hold here: measured
+        # 2026-08-12 on this tree, the full suite is 1697 tests in 99 s. A selector exists to buy
+        # time nobody needs to buy, and it costs the thing a selector always costs -- the risk of
+        # selecting nothing and reporting green.
+        #
+        # At pre-push, not pre-commit: 99 s per commit is a tax on the granularity this project wants
+        # from commits, and what a push ships is the thing a verdict should be about.
+        entry: bash tools/with-venv.sh pytest -q
+        language: system
+        always_run: true
+        pass_filenames: false
         stages: [pre-push]
+      # THE VERSION BUMP. Unlike motronics' equivalent, a bump that cannot happen FAILS THE PUSH
+      # rather than logging into a discarded stdout -- see the header of tools/bump-version.sh for
+      # why that tradeoff is taken. It runs LAST so a push that is going to be rejected on its
+      # commit messages or its tests does not mint a tag first.
       - id: bump-version
+        name: mint and publish the next version tag
+        entry: bash tools/bump-version.sh
+        language: system
+        always_run: true
+        pass_filenames: false
         stages: [pre-push]
+
+# DROPPED FROM motronics' CONFIG, with the reason, so that "absent" and "forgotten" are different:
+#
+#   check-added-large-files --maxkb=20000
+#       The 20 MB ceiling is sized for that project's mesh and FEA artifacts. This repo stores no
+#       binaries at all, so the hook's 500 kB default is the honest bound; raising it 40x here would
+#       be a ceiling chosen for somebody else's data.
+#
+#   pyright (gated-clean leaf)
+#       That hook blocks for real because its scope is MEASURED at zero errors and pinned in
+#       `[tool.pyright] include=`. There is no such measurement here and no pyright config, so
+#       carrying it across would ship a checker whose scope nothing has ever verified -- a
+#       report-only stub that rots into a false green. Adding pyright to this repo is a real piece of
+#       work with a real baseline; it is not a line in this file.
+#
+#   covering_tests.py / pytest-smoke-guarded.sh
+#       Both are motronics scripts and neither exists here. Their two jobs are diff selection
+#       (unnecessary at 99 s, see above) and refusing to start a second pytest session while one is
+#       already running on the box (that guard belongs to a fan-out of heavy FEA runs; this suite
+#       spawns no vendor tools and holds no licence seat).
+#
+#   check_installed_symbols.py
+#       This repo owns the mechanism (`agent_swarm.installed_symbols`) but is the wrong end of it:
+#       the check asks whether the CONSUMER's imports resolve against the INSTALLED agent-swarm, so
+#       it belongs in the consuming project's config, where it already runs. Running it here would
+#       compare this package against a copy of itself.
