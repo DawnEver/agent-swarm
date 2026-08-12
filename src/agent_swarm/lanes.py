@@ -468,3 +468,37 @@ def remove(path: Path) -> str | None:
     """
     out = _git('worktree', 'remove', str(path))
     return None if out.returncode == 0 else (out.stderr.strip() or f'exit {out.returncode}')
+
+
+def render_survey(surveyed: Sequence[tuple[Path, str, list[str]]]) -> tuple[list[str], list[Path]]:
+    """``(report lines, removable paths)`` for a :func:`survey` result.
+
+    EVERY reason is printed, not the first, and that is the whole reason this is not an ``if`` at a
+    call site: :func:`reasons_to_keep` returns all of them precisely because a refusal naming one of
+    three sends the reader to fix the wrong thing, and a renderer that showed only ``keep[0]`` would
+    undo that at the last step.
+
+    RETURNS the removable set rather than removing it. The split is :func:`survey`'s, carried one
+    layer further out: a caller that only wants the report never touches the removal, so "print what
+    I would do" cannot drift from "do it" -- both read this one list.
+    """
+    lines: list[str] = []
+    removable: list[Path] = []
+    for path, branch, keep in surveyed:
+        if keep:
+            lines.append(f'KEEP   {path.name:34s} [{branch}]')
+            lines.extend(f'         - {reason}' for reason in keep)
+        else:
+            removable.append(path)
+            lines.append(f'PRUNE  {path.name:34s} [{branch}]  clean, fully upstream, idle')
+    return lines, removable
+
+
+def remove_all(paths: Sequence[Path]) -> list[tuple[Path, str | None]]:
+    """Remove each path, pairing it with :func:`remove`'s refusal (``None`` when it went).
+
+    NEVER STOPS AT THE FIRST REFUSAL. git declining one worktree says nothing about the next, and a
+    loop that aborted there would leave the rest of a surveyed-clean set behind with no report -- the
+    caller would see one error and no way to tell whether anything else was even attempted.
+    """
+    return [(path, remove(path)) for path in paths]

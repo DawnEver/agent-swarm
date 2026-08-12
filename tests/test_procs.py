@@ -657,3 +657,177 @@ class TestASeedThatExitsMidWalkIsOmittedNotRaised:
 
         monkeypatch.setattr(procs.psutil, 'Process', lambda _pid: _Alive())
         assert [p.pid for p in procs.close_over_children({4242})] == [4242]
+
+
+# --------------------------------------------------------------------- the census and the stop
+
+
+class _FakeProc:
+    """The members a census and a forest read off a discovered process.
+
+    A DOUBLE HERE AND REAL PROCESSES ABOVE, and the split is deliberate. The classes above test
+    ATTRIBUTION -- which processes are mine -- and a double would agree with any implementation of
+    that, including the broken ones this module exists to prevent. What follows tests ARITHMETIC and
+    SEQUENCING over a population that has already been decided, and for those a real process is a
+    worse instrument: its RSS moves while you read it.
+    """
+
+    def __init__(self, pid: int, ppid: int, rss: int = 0, create_time: float = 0.0) -> None:
+        self.pid = pid
+        self._ppid = ppid
+        self._rss = rss
+        self._create = create_time
+
+    def ppid(self) -> int:
+        return self._ppid
+
+    def as_dict(self, attrs):  # psutil's signature; this double answers all of them
+        return {
+            'pid': self.pid,
+            'ppid': self._ppid,
+            'memory_info': type('_M', (), {'rss': self._rss})(),
+            'create_time': self._create,
+        }
+
+
+class TestTheCensus:
+    def test_it_totals_what_it_was_handed(self):
+        snapshot = procs.census([_FakeProc(1, 0, rss=100), _FakeProc(2, 1, rss=300)])
+        assert snapshot['count'] == 2
+        assert snapshot['total_rss'] == 400
+        assert snapshot['max_rss'] == 300
+
+    def test_rows_are_largest_first(self):
+        """The table is read by a human hunting the process that is eating the box; the one that
+        matters must not be at the bottom of thirty rows."""
+        snapshot = procs.census([_FakeProc(1, 0, rss=10), _FakeProc(2, 0, rss=900), _FakeProc(3, 0, rss=50)])
+        assert [row['pid'] for row in snapshot['procs']] == [2, 3, 1]
+
+    def test_an_empty_population_is_zero_and_not_an_error(self):
+        """A quiet box is a legitimate answer. `max()` over nothing raises without a default, and a
+        census that crashed on an idle machine would be run exactly when it is least useful."""
+        snapshot = procs.census([])
+        assert snapshot['count'] == 0
+        assert snapshot['total_rss'] == 0
+        assert snapshot['max_rss'] == 0
+
+    def test_a_process_that_dies_mid_walk_is_DROPPED_not_counted_at_zero(self):
+        """THE DISCRIMINATING CASE. A census walks a moving table, so `NoSuchProcess` is normal --
+        and attributing 0 bytes to a process that merely exited understates the total in exactly the
+        direction that makes a busy machine look idle.
+        """
+
+        class _Vanishing(_FakeProc):
+            def as_dict(self, attrs):
+                raise psutil.NoSuchProcess(self.pid)
+
+        snapshot = procs.census([_FakeProc(1, 0, rss=500), _Vanishing(2, 0)])
+        assert snapshot['count'] == 1, 'the dead process must not appear as a row'
+        assert snapshot['total_rss'] == 500
+
+    def test_rendering_shows_every_row_and_the_totals(self):
+        lines = procs.render_census(procs.census([_FakeProc(77, 1, rss=2 * 1024**2)]))
+        assert 'procs=1' in lines[0]
+        assert any('77' in line for line in lines[1:])
+
+
+class TestStopChoosesItsVerdict:
+    """The named-pid / discovered-population asymmetry, which is the half a call site kept getting
+    wrong -- invisibly, because both spellings report success.
+    """
+
+    @pytest.fixture
+    def killed(self, monkeypatch):
+        """Records the order handed to the kill and answers with the survivors it is told to."""
+
+        class _Kills:
+            def __init__(self):
+                self.order: list[int] = []
+                self.survivors: list[int] = []
+
+            def __call__(self, order):
+                self.order.extend(order)
+                return list(self.survivors)
+
+        kills = _Kills()
+        monkeypatch.setattr(procs, 'kill_ordered', kills)
+        return kills
+
+    def test_children_are_killed_before_their_parents(self, killed, monkeypatch):
+        """The wrapper dies LAST. Parent-first is how the measured orphans were made."""
+        tree = {100: 0, 101: 100, 102: 100, 103: 101}
+        monkeypatch.setattr(procs, 'subtree', lambda _pid: tree)
+
+        _lines, code = procs.stop(pid=100, discover=list, dry_run=False)
+
+        assert code == procs.STOPPED
+        assert sorted(killed.order) == sorted(tree), 'the kill must cover the whole tree'
+        for child, parent in ((101, 100), (102, 100), (103, 101)):
+            assert killed.order.index(child) < killed.order.index(parent), (
+                f'{child} must be killed before its parent {parent}; got {killed.order}'
+            )
+
+    def test_dry_run_prints_the_plan_and_kills_nothing(self, killed, monkeypatch):
+        monkeypatch.setattr(procs, 'subtree', lambda _pid: {100: 0, 101: 100, 102: 101})
+        lines, code = procs.stop(pid=100, discover=list, dry_run=True)
+        assert code == procs.STOPPED
+        assert killed.order == [], 'a dry run must never reach the kill'
+        for pid in ('100', '101', '102'):
+            assert any(pid in line for line in lines)
+
+    def test_a_survivor_of_a_named_subtree_is_STILL_ALIVE(self, killed, monkeypatch):
+        monkeypatch.setattr(procs, 'subtree', lambda _pid: {100: 0, 101: 100})
+        killed.survivors = [100, 101]
+        lines, code = procs.stop(pid=100, discover=list, dry_run=False)
+        assert code == procs.STILL_ALIVE
+        assert any('FAILED' in line and '101' in line for line in lines)
+
+    def test_a_named_subtree_does_NOT_re_run_discovery(self, killed, monkeypatch):
+        """THE ASYMMETRY, asserted in the direction that would otherwise pass by luck. A stop aimed
+        at one pid must not be failed by an unrelated process the discovery happens to find -- the
+        caller asked about a subtree, and widening the verdict silently would make it unusable on a
+        busy box.
+        """
+        monkeypatch.setattr(procs, 'subtree', lambda _pid: {100: 0})
+        calls = []
+
+        def discover():
+            calls.append(1)
+            return [_FakeProc(999, 0)]
+
+        _lines, code = procs.stop(pid=100, discover=discover, dry_run=False)
+        assert code == procs.STOPPED
+        assert calls == [], 'a named subtree must not consult discovery at all'
+
+    def test_a_discovered_population_IS_re_probed_after_the_kill(self, killed):
+        """The other half, and the one that catches a respawn or a missed process. 200 was aimed at
+        and died; 299 was never aimed at, and its mere presence means the sweep is not stopped.
+        """
+        found = [[_FakeProc(200, 0)], [_FakeProc(299, 0)]]
+        lines, code = procs.stop(pid=None, discover=lambda: found.pop(0), dry_run=False)
+        assert code == procs.STILL_ALIVE
+        assert killed.order == [200], '200 was aimed at; 299 was only found'
+        assert any('299' in line for line in lines)
+
+    def test_a_discovered_population_that_is_gone_is_STOPPED(self, killed):
+        """The discriminating control for the test above: a re-probe that always failed would pass
+        it, and would make the tool useless."""
+        found = [[_FakeProc(200, 0), _FakeProc(201, 200)], []]
+        lines, code = procs.stop(pid=None, discover=lambda: found.pop(0), dry_run=False)
+        assert code == procs.STOPPED
+        assert sorted(killed.order) == [200, 201]
+        assert any('verified none remain' in line for line in lines)
+
+    def test_a_stale_pid_is_NOTHING_TO_STOP_not_STOPPED(self, killed, monkeypatch):
+        """'Already gone' must not render identically to 'I stopped it' -- they are different claims
+        and only one of them is evidence the caller did anything."""
+        monkeypatch.setattr(procs, 'subtree', lambda _pid: {})
+        _lines, code = procs.stop(pid=99999, discover=list, dry_run=False)
+        assert code == procs.NOTHING_TO_STOP
+        assert killed.order == []
+
+    def test_a_quiet_box_is_a_noop_success(self, killed):
+        lines, code = procs.stop(pid=None, discover=list, dry_run=False)
+        assert code == procs.STOPPED
+        assert killed.order == []
+        assert any('nothing to stop' in line for line in lines)

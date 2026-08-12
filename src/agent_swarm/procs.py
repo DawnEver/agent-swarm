@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 try:
@@ -553,3 +553,141 @@ def reap(targets: Sequence[psutil.Process]) -> list[int]:
             by_pid[pid].kill()
     psutil.wait_procs(still, timeout=REAP_KILL_S)
     return alive(order)
+
+
+# ------------------------------------------------------------------ the census, and the stop tool
+#
+# WHAT THESE ARE AND WHY THEY ARE HERE. Everything above answers "which processes" and "make them
+# stop". These two answer "how much are they costing" and "run that as ONE operation that cannot
+# half-succeed" -- the shapes every consumer of this module had written for itself. Neither knows
+# WHICH processes it is about: the population arrives, and the caller who owns the tree supplies it.
+
+
+def census(processes: Sequence[psutil.Process]) -> dict:
+    """One measurement over a supplied population: count, total/max RSS, and system free memory.
+
+    THE POPULATION IS AN ARGUMENT AND HAS NO DEFAULT. "Which processes are mine" is the one question
+    this package must never answer on its own -- a census that guessed would be a plausible number
+    about somebody else's tree, and plausible is the failure mode that survives review.
+
+    Processes that die mid-walk are DROPPED, not counted at zero: a census is a snapshot of a moving
+    table, and attributing 0 bytes to a process that merely exited understates the total in exactly
+    the direction that makes a machine look idle.
+    """
+    _require_psutil()
+    rss: list[int] = []
+    rows: list[dict] = []
+    for proc in processes:
+        try:
+            info = proc.as_dict(['pid', 'ppid', 'memory_info', 'create_time'])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        value = info['memory_info'].rss
+        rss.append(value)
+        rows.append(
+            {
+                'pid': info['pid'],
+                'ppid': info['ppid'],
+                'rss': value,
+                'age_s': round(time.time() - info['create_time'], 1),
+            }
+        )
+    return {
+        'time': time.strftime('%H:%M:%S'),
+        'count': len(rows),
+        'total_rss': sum(rss),
+        'max_rss': max(rss, default=0),
+        'available': psutil.virtual_memory().available,
+        'procs': sorted(rows, key=lambda row: -row['rss']),
+    }
+
+
+def render_census(snapshot: dict) -> list[str]:
+    """The summary line plus one line per process, largest first."""
+    gb = 1024**3
+    lines = [
+        (
+            f'{snapshot["time"]}  procs={snapshot["count"]}  total={snapshot["total_rss"] / gb:.2f} GB  '
+            f'max={snapshot["max_rss"] / 1024**2:.0f} MB  available={snapshot["available"] / gb:.2f} GB'
+        )
+    ]
+    lines.extend(
+        f'  pid {row["pid"]:>7} ppid {row["ppid"]:>7}  {row["rss"] / 1024**2:>8.1f} MB  age {row["age_s"]:>8.1f}s'
+        for row in snapshot['procs']
+    )
+    return lines
+
+
+def reap_and_recount(targets: Sequence[psutil.Process], *, recount: Callable[[], Sequence[psutil.Process]]) -> dict:
+    """Reap ``targets``, then take a FRESH census and return it. The verdict is in that census.
+
+    ``recount`` IS REQUIRED AND TAKES NO DEFAULT, and it is the entire point of the function. The
+    honest question after a kill is not "did the processes we aimed at go" but "is anything still
+    running" -- 2026-08-05 is on record as the day a cleanup reported success while 36 processes and
+    7.4 GB stayed up, because it read :func:`reap`'s report about the set it was handed. Re-running
+    DISCOVERY is what closes that, and only the caller knows what discovery means for its tree.
+    """
+    reap(targets)
+    return census(recount())
+
+
+#: What :func:`stop` answers with. A REPORT PLUS A CODE, because the three outcomes -- stopped,
+#: nothing to stop, still alive -- are not orderable and a caller that had to re-derive which one
+#: happened from the survivor list would be re-deriving the verdict this function exists to give.
+STOPPED = 0
+STILL_ALIVE = 1
+NOTHING_TO_STOP = 2
+
+
+def stop(
+    *,
+    pid: int | None,
+    discover: Callable[[], Sequence[psutil.Process]],
+    dry_run: bool,
+) -> tuple[list[str], int]:
+    """Stop one subtree or everything ``discover`` finds. Returns ``(report lines, exit code)``.
+
+    CHILDREN-FIRST is not a preference. Killing the parent first is how orphans are made: the
+    children are reparented, keep running, and nothing left names them -- the measured defect (three
+    times in one session, 2026-07-29) this whole path exists to prevent.
+
+    THE ASYMMETRY BETWEEN THE TWO TARGETS IS THE POINT, and it lives here rather than at a call site
+    because getting it wrong is invisible: both spellings report success.
+
+    * A NAMED SUBTREE is verified by :func:`kill_ordered`'s survivor list, and that is the whole
+      truth -- there is nothing wider to ask about one pid.
+    * ``discover``'s POPULATION is not. Anything discovery still finds afterwards means the sweep is
+      not stopped, whether it was aimed at or not; a process that respawned, or that the first walk
+      missed, is exactly the case a survivor list cannot see. So this re-runs discovery and folds
+      the result in.
+
+    ``discover`` HAS NO DEFAULT. "Which processes are mine" is the one question this package must
+    never answer on its own, and it is needed even for the ``pid`` path's absence -- passing it is
+    what makes the caller state the scope it is working in.
+
+    A MISSING TARGET IS ``NOTHING_TO_STOP``, NEVER ``STOPPED``. A stale pid means "already gone",
+    which must not render identically to "I stopped it".
+    """
+    if pid is not None:
+        tree = subtree(pid)
+        recount: Callable[[], Sequence[int]] | None = None
+        if not tree:
+            return [f'pid {pid} does not exist -- nothing to stop'], NOTHING_TO_STOP
+    else:
+        tree = as_forest(discover())
+        recount = lambda: [found.pid for found in discover()]  # one expression, one use
+        if not tree:
+            return ['no matching processes found -- nothing to stop'], STOPPED
+
+    order = children_first(tree)
+    plan = [f'  pid {each:>7}  (parent {tree.get(each) or "-"})' for each in order]
+    if dry_run:
+        return [f'--dry-run: would kill {len(order)} process(es), children first:', *plan], STOPPED
+
+    lines = [f'killing {len(order)} process(es), children first:', *plan]
+    survivors = kill_ordered(order)
+    if recount is not None:
+        survivors = sorted({*survivors, *recount()})
+    if survivors:
+        return [*lines, f'FAILED -- still alive after kill: {survivors}'], STILL_ALIVE
+    return [*lines, f'stopped {len(order)} process(es); verified none remain'], STOPPED
