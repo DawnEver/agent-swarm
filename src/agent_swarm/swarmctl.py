@@ -252,6 +252,7 @@ class GiteaProvider:
         admin_user: str | None,
         *,
         ask_password: bool = False,
+        admin_token_name: str | None = None,
     ) -> None:
         split = urllib.parse.urlsplit(base_url)
         # THE SCHEME IS CHECKED AGAINST AN ALLOWLIST, not merely for being non-empty: it selects
@@ -273,6 +274,21 @@ class GiteaProvider:
         self.exe_configured = exe
         self.exe = exe if exe and Path(exe).is_file() else None
         self.admin_user = admin_user
+        #: The name a CLI-minted admin token is created under. Defaults to this machine's hostname.
+        #:
+        #: OVERRIDABLE BECAUSE THE DEFAULT IS A WEDGE, MEASURED 2026-08-12 ON THE GITEA HOST. The
+        #: name was fixed at `swarmctl-admin@<gethostname()>`, and the local store and the server
+        #: can desync -- a cleared store, a re-imaged box, a lost store write, or (what actually
+        #: happened) a 403 that made `_forget_stored_admin` erase the local half. From then on every
+        #: run tries the same taken name, Gitea refuses it, and the value is unrecoverable because
+        #: Gitea shows it once. The ONLY recovery was `revoke`, which needs the operator's PASSWORD
+        #: -- so a fleet tool built to keep human credentials out of its own path had a failure mode
+        #: whose sole exit was to reach for one.
+        #:
+        #: AN EXPLICIT OVERRIDE RATHER THAN AN AUTOMATIC SUFFIX. Auto-disambiguating would restore
+        #: the N-tokens design this file argued its way out of, silently, one per desync. A flag
+        #: keeps the count deliberate: the operator names the token, so they can also revoke it.
+        self.admin_token_name = admin_token_name
         self._token: str | None = None
         #: Where `_token` came from. Only a credential READ FROM THE STORE may be forgotten on a
         #: refusal -- one minted THIS run that 401s means something else is wrong, and erasing it
@@ -401,8 +417,11 @@ class GiteaProvider:
                 f'a token named {token_name!r} already exists on the SERVER, but this machine has\n'
                 f'  no copy of it. Gitea shows a token value once, so it cannot be recovered -- and\n'
                 f'  every run will fail here identically until the server-side one is removed.\n'
-                f'  On the Gitea host, revoke it and let the next run mint a fresh one:\n'
-                f'      swarmctl revoke --token-name {token_name}\n'
+                f'  TWO WAYS OUT. The second needs no password and is the one to reach for:\n'
+                f'      swarmctl --admin-token-name {token_name}-2 <verb>    (mint under a free name)\n'
+                f'      swarmctl revoke --token-name {token_name}            (needs the operator PASSWORD)\n'
+                f'  Prefer the first: token management is the one route Gitea refuses to token auth,\n'
+                f'  so revoking drags a human credential into a path built to keep them out of it.\n'
                 f'  This is NOT a login failure and NOT a scope problem: the credential is fine,\n'
                 f'  there are simply two halves of one pairing and only the server has its half.'
             )
@@ -465,9 +484,10 @@ class GiteaProvider:
         if not self.admin_user:
             msg = 'this verb needs --admin-user (an existing Gitea admin) for the API'
             raise Fail(msg)
+        token_name = self.admin_token_name or f'{self.ADMIN_CRED_USER}@{socket.gethostname()}'
         self._token = self.issue_token(
             self.admin_user,
-            f'{self.ADMIN_CRED_USER}@{socket.gethostname()}',
+            token_name,
             ['write:organization', 'write:repository', 'write:admin', 'write:user'],
         )
         # STORED BEFORE IT IS USED, so a run that crashes mid-verb still leaves the credential
@@ -475,10 +495,7 @@ class GiteaProvider:
         # fail, and the next run then mints a second token with the same name.
         store_credential(self.scheme, self.netloc, self.ADMIN_CRED_USER, self._token)
         say(f'minted and stored an admin credential for {self.ADMIN_CRED_USER}@{self.netloc}')
-        say(
-            f'  sha256={fingerprint(self._token)}  -- revoke with: swarmctl revoke --token-name '
-            f'{self.ADMIN_CRED_USER}@{socket.gethostname()}'
-        )
+        say(f'  sha256={fingerprint(self._token)}  -- revoke with: swarmctl revoke --token-name {token_name}')
         return self._token
 
     def _forget_stored_admin(self) -> None:
@@ -785,6 +802,7 @@ def build_provider(args: argparse.Namespace) -> GiteaProvider:
         getattr(args, 'gitea_exe', None),
         getattr(args, 'admin_user', None),
         ask_password=getattr(args, 'ask_password', False),
+        admin_token_name=getattr(args, 'admin_token_name', None),
     )
 
 
@@ -1656,6 +1674,16 @@ def parse_argv(argv: list[str] | None = None) -> argparse.Namespace:
         '--ask-password',
         action='store_true',
         help='prompt for the admin password (token management needs it; never prompted for otherwise)',
+    )
+    parser.add_argument(
+        '--admin-token-name',
+        metavar='NAME',
+        help=(
+            "mint this machine's admin token under NAME instead of swarmctl-admin@<hostname>. "
+            'THE UNWEDGE: when the hostname-derived name is already taken on the server and this '
+            'machine holds no copy, that value is unrecoverable and every run fails identically. '
+            'This is the way out that does NOT need the operator password'
+        ),
     )
     parser.add_argument(
         '--ephemeral',

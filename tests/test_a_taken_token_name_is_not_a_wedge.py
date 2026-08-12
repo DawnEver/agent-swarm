@@ -81,3 +81,43 @@ class TestVerifyCannotReportNoProblemsWithoutLooking:
         """The control. INCOMPLETE collapsing onto either neighbour is the whole defect, so the
         constants must not collide -- a `2` that equalled `0` would restore the bug silently."""
         assert swarmctl.EXIT_INCOMPLETE not in (0, 1)
+
+
+class TestTheUnwedgeDoesNotNeedTheOperatorsPassword:
+    """MEASURED 2026-08-12 ON THE GITEA HOST, and this is the sharp part: `revoke` -- the ONLY
+    documented exit from the wedge -- needs the operator's Gitea PASSWORD, because token management
+    is the one route Gitea refuses to token auth.
+
+    So a fleet tool built expressly to keep human credentials out of its own path had a failure mode
+    whose sole remedy was to reach for one. The wedge was not an oversight in the recovery; the
+    recovery WAS the oversight.
+
+    `--admin-token-name` is the way out. EXPLICIT rather than an automatic suffix: auto-generating a
+    fresh name on every collision would silently restore the N-standing-tokens design this file
+    argued its way out of, one token per desync, with nobody counting.
+    """
+
+    def test_the_override_replaces_the_hostname_derived_name(self):
+        provider = swarmctl.GiteaProvider(
+            'http://forge.invalid:9000', 'Org', None, 'admin', admin_token_name='swarmctl-admin@chosen'
+        )
+        assert provider.admin_token_name == 'swarmctl-admin@chosen'
+
+    def test_the_default_is_still_the_hostname(self):
+        """The control: an override that was always set would make the collision unreachable and
+        this whole family untestable against the real default."""
+        provider = swarmctl.GiteaProvider('http://forge.invalid:9000', 'Org', None, 'admin')
+        assert provider.admin_token_name is None
+
+    def test_the_refusal_offers_the_PASSWORDLESS_route_first(self):
+        """A remedy list whose only entry needs a password is what created this. Both routes are
+        named, and the one that does not drag a human credential into fleet tooling leads."""
+        provider = _Provider('access token name has been used already')
+        with pytest.raises(swarmctl.Fail) as caught:
+            provider.issue_token('admin', 'swarmctl-admin@BOX', ['write:admin'])
+        text = str(caught.value)
+        assert '--admin-token-name' in text, 'the passwordless route is not offered'
+        assert text.index('--admin-token-name') < text.index('revoke --token-name'), (
+            'the password route is offered first; an operator takes the first remedy they read'
+        )
+        assert 'PASSWORD' in text, 'it does not warn which route costs a human credential'
