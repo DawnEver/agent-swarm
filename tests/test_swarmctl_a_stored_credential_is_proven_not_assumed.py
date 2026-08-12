@@ -50,8 +50,6 @@ import pytest
 from agent_swarm import credentials
 from agent_swarm import swarmctl as _swarmctl
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture(scope='module')
 def swarmctl():

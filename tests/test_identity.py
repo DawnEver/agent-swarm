@@ -22,8 +22,6 @@ import pytest
 from agent_swarm import identity
 from agent_swarm.identity import SALT_LENGTH, machine_uuid, runner_id, runner_salt
 
-pytestmark = pytest.mark.unit
-
 
 # --------------------------------------------------------------------------- stable, never random
 

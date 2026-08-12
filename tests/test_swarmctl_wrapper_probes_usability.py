@@ -32,7 +32,7 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _WRAPPER = _REPO / 'swarmctl.cmd'
 
-pytestmark = [pytest.mark.unit, pytest.mark.skipif(os.name != 'nt', reason='cmd.exe is absent off Windows')]
+pytestmark = [pytest.mark.skipif(os.name != 'nt', reason='cmd.exe is absent off Windows')]
 
 
 @pytest.fixture

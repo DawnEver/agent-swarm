@@ -10,7 +10,6 @@ written before a segment was added.
 
 from __future__ import annotations
 
-import pytest
 
 from agent_swarm.refs import (
     ATTEMPTS_ROOT,
@@ -37,8 +36,6 @@ from agent_swarm.refs import (
     verdict_glob,
     verdict_ref,
 )
-
-pytestmark = pytest.mark.unit
 
 
 # --------------------------------------------------------------------- the answer namespace

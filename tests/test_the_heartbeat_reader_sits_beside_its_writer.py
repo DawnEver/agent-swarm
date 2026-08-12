@@ -23,8 +23,6 @@ import pytest
 
 from agent_swarm import clock
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture
 def beat(tmp_path: Path) -> Path:

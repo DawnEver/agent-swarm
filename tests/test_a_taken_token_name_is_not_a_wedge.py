@@ -20,8 +20,6 @@ import pytest
 
 from agent_swarm import swarmctl
 
-pytestmark = pytest.mark.unit
-
 
 class _Provider(swarmctl.GiteaProvider):
     def __init__(self, stderr: str) -> None:

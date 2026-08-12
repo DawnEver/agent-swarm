@@ -27,7 +27,6 @@ import pytest
 from agent_swarm import credentials, forge, roles, swarmctl, workbench_cli
 from agent_swarm.job import TEST_RUN
 
-pytestmark = pytest.mark.unit
 
 _PACKAGE = Path(roles.__file__).parent
 

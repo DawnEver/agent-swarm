@@ -11,8 +11,6 @@ import pytest
 
 from agent_swarm.shards import compose, next_unfinished
 
-pytestmark = pytest.mark.unit
-
 
 # --------------------------------------------------------------------------- precedence
 

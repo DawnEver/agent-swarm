@@ -26,7 +26,6 @@ import pytest
 
 from agent_swarm import admission, allocator, clock, loop, tick
 
-pytestmark = pytest.mark.unit
 
 #: module -> the neighbours its docstring must name. Not "all five in all five": a chain, so each
 #: link points at the ones it actually touches. `loop` names both its caller and its inputs because

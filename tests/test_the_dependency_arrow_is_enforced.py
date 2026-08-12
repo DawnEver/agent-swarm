@@ -19,7 +19,6 @@ import pytest
 
 from agent_swarm import layers
 
-pytestmark = pytest.mark.unit
 
 _SRC = Path(layers.__file__).parent
 _MODULES = {p.stem for p in _SRC.glob('*.py') if p.stem != '__init__'}

@@ -47,16 +47,25 @@ class JobKind(enum.Enum):
     round of a search" as a job would force this layer to understand populations, barriers and
     stragglers, which is the second scheduler the docstring above refuses. That property is pinned
     by `TestTheSubstrateKnowsNothingAboutBARRIERS` in `tests/test_job.py`, not by this paragraph.
+
+    `INTEGRATION` is ONE PASS of the integration plane over one trunk -- merge the open batch, judge
+    that tree, advance by compare-and-swap. It is a MEMBER here and not a dedicated host anywhere,
+    which is the whole decision: the integrator runs on whatever box is idle and capable, allocated
+    by `allocator.rank` like everything else. A dedicated integration machine would be a second
+    scheduler with one node in it, and it would idle exactly when the fleet is busiest. What the id
+    of such a job is -- and why it is not simply the trunk name -- is `integration.batch_key`'s.
     """
 
     AGENT_TASK = 'agent-task'
     TEST_RUN = 'test-run'
     COMPUTE = 'compute'
+    INTEGRATION = 'integration'
 
 
 AGENT_TASK = JobKind.AGENT_TASK
 TEST_RUN = JobKind.TEST_RUN
 COMPUTE = JobKind.COMPUTE
+INTEGRATION = JobKind.INTEGRATION
 
 
 @dataclass(frozen=True, slots=True)

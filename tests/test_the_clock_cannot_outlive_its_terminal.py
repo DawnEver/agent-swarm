@@ -25,8 +25,6 @@ import pytest
 
 from agent_swarm import clock, lifetime
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture
 def a_clock(tmp_path: Path) -> clock.Clock:

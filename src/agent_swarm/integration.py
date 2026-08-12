@@ -35,17 +35,26 @@ for every participant combined.
 THIS MODULE DOES NOT KNOW WHAT A GATE IS. The verdict function is injected -- it takes a tree sha
 and returns one of the three words. A package that reached for a test command would have picked one
 consumer's, which is the coupling the rest of this package has already had removed once.
+
+AND IT HAS A RUNNER, WHICH IS THE HALF A MECHANISM IS USELESS WITHOUT. :class:`Integrator` satisfies
+`loop.Executor`, so one pass is an ordinary :class:`~agent_swarm.job.Job` of kind `INTEGRATION`,
+ranked by `allocator.rank` and claimed by `store.try_claim` like every other job. It runs on ANY
+IDLE CAPABLE BOX -- there is no integration host, because a dedicated host is a second scheduler
+with one node in it that idles precisely when the fleet is busiest. Nothing new schedules it: the
+kind cost this package one enum member and this section, which is `JobKind`'s own stated bar.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent_swarm import refs
+from agent_swarm.job import INTEGRATION, Job
 from agent_swarm.refstore import GitRefStore, RefUnreachable
 from agent_swarm.shards import FAIL, INCONCLUSIVE, PASS
 from agent_swarm.submission import Submission, read
@@ -464,3 +473,206 @@ def integrate(
         requeued=(),
         conflicts=merge.conflicts,
     )
+
+
+# --------------------------------------------------------------------------- the runner
+
+
+#: What a box must DECLARE to be offered integration work. An opaque token, compared for equality
+#: exactly as `pull.Workbench`'s capabilities are -- this package does not know what it means. What
+#: the consumer must ensure it means is: a checkout of the trunk, and the right to push it.
+INTEGRATOR_CAPABILITY = 'integrator'
+
+
+class NotAnIntegrator(RuntimeError):
+    """This box was asked to be an integrator and does not declare that it can be one.
+
+    RAISED AT CONSTRUCTION, BEFORE ANY CLAIM, and that placement is the whole point. Refusing later
+    -- inside `execute` -- would be caught by `loop._run`'s executor handler and recorded as
+    INCONCLUSIVE, so a permanently incapable box would take the job, say nothing a reader could act
+    on, and take it again next tick. A box that cannot serve this kind must SAY SO rather than
+    silently take nothing, which is `pull.MissingCapability`'s reason with the same shape.
+    """
+
+
+def integrator_blockers(capabilities: Collection[str]) -> list[str]:
+    """Every reason this box may not integrate. Empty means it may.
+
+    A LIST FOR `Box.blockers`' REASON -- a refusal naming one of several sends the reader to fix the
+    wrong thing -- and it is a plain function so a scheduler can ask BEFORE it constructs anything.
+    """
+    if INTEGRATOR_CAPABILITY in set(capabilities):
+        return []
+    return [
+        f'this box does not declare {INTEGRATOR_CAPABILITY!r}, so it has no checkout of the trunk '
+        f'to merge in and no right to push it; declared: {sorted(capabilities) or "(nothing)"}'
+    ]
+
+
+def batch_key(trunk: str, ordinals: Iterable[int]) -> str:
+    """The job id for one pass: the trunk, plus a digest of EXACTLY the submissions it would merge.
+
+    WHY NOT SIMPLY THE TRUNK NAME, which is the obvious spelling and is wrong in a way that stalls
+    silently. `loop.run_one` will not re-run a job that already has a verdict -- that is what makes
+    a job DONE rather than merely unclaimed -- so an id of `main` would be answered by the first
+    pass and never scheduled again. Integration is not one job; it is one job PER BATCH.
+
+    THE THREE OUTCOMES THEN LAND WHERE THEY BELONG, without a retry rule written anywhere:
+
+    * PASS      -- the batch is disposed of, the open set shrinks, the next pass has a NEW id.
+    * FAIL      -- the batch is disposed of REJECTED, the open set shrinks, likewise a new id.
+    * INCONCLUSIVE -- nothing was recorded, so the open set is unchanged and the id is the SAME.
+      The pass is retried exactly as `admission.should_retry` prices it, which is the one case where
+      retrying the identical work is the correct thing to do.
+
+    THE ORDINALS ARE SORTED AND DEDUPLICATED, so two boxes that listed the queue in different orders
+    compute one id and therefore contend for one claim rather than doing the work twice.
+
+    Raises:
+        ValueError: the batch is empty. There is no such pass -- a job that merges nothing would
+            spend a claim and a scheduling slot to re-confirm the trunk, and `integrate` already
+            refuses to spend a VERDICT on it for the same reason.
+    """
+    unique = sorted(set(ordinals))
+    if not unique:
+        msg = f'there is no integration pass for {trunk!r} with no open submission'
+        raise ValueError(msg)
+    digest = hashlib.sha256(','.join(str(o) for o in unique).encode()).hexdigest()[:12]
+    return f'{trunk}@{digest}'
+
+
+def integration_job(
+    trunk: str,
+    ordinals: Iterable[int],
+    *,
+    ram_gib: float | None = None,
+    exclusivity: str | None = None,
+    solo_seconds: float | None = None,
+    ceiling_seconds: float | None = None,
+) -> Job:
+    """One schedulable integration pass. An ORDINARY job; nothing about it is special-cased.
+
+    THE COST IS THE CALLER'S TO STATE, and it is unpriced by default rather than free: a pass runs
+    the consumer's whole gate on the merged tree, so its RAM and duration are the gate's numbers and
+    this package has never measured them. `Job` treats `None` as "nobody measured", which keeps it
+    schedulable; a zero would mean "free" and is the safe-looking answer that is exactly wrong.
+
+    `exclusivity` DEFAULTS TO `Job`'s OWN DEFAULT (the whole box), which is right for a pass that
+    runs a full gate, and is left overridable because how wide the consumer's gate is, is not a fact
+    this module has.
+    """
+    kwargs = {} if exclusivity is None else {'exclusivity': exclusivity}
+    return Job(
+        id=batch_key(trunk, ordinals),
+        kind=INTEGRATION,
+        ram_gib=ram_gib,
+        solo_seconds=solo_seconds,
+        ceiling_seconds=ceiling_seconds,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+@dataclass(frozen=True)
+class Integrator:
+    """A `loop.Executor` that advances ONE trunk. Scheduled, claimed and released like anything else.
+
+    EXCLUSIVITY HERE BUYS VERDICT CAPACITY, NOT CORRECTNESS -- and stating which is the point, because
+    the two call for opposite code. Correctness is already unconditional: `advance` is
+    `git update-ref <ref> <new> <old>`, a compare-and-swap under git's own ref lock, so a second
+    integrator that merged and judged the same batch either finds the trunk where it left it (and
+    advances a tree that really was judged) or raises `TrunkMoved` and lands nothing. **A lost race
+    is harmless.** What a duplicate pass DOES cost is a run of the consumer's gate -- measured
+    2026-08-12 in the first consumer, 704 s occupying a whole machine, so roughly 40 exist per day
+    for the entire fleet -- which is the scarcest thing here.
+
+    SO THERE IS NO LOCK IN THIS FILE. The `claim_key` of an `INTEGRATION` job is
+    `integration/<trunk>@<batch digest>`, and `store.try_claim`'s existing compare-and-swap is what
+    keeps two boxes with the same view of the queue off the same batch. That is best-effort by
+    construction: two boxes whose listings disagree compute different digests and both run. Adding a
+    real lock to close that gap would be the safe-looking mistake -- it would serialise a plane whose
+    concurrency is the reason the fan-out exists, to prevent a duplicate that costs one run and
+    corrupts nothing, and it would be a second, weaker arbitration beside a correct one.
+
+    Attributes:
+        store: the checkout this box will merge in and push from.
+        trunk: the branch this integrator advances. ONE branch per integrator, checked in `execute`.
+        verdict_of: takes the merged TREE sha, returns one of the three verdict words.
+        workdir: where the throwaway merge worktree is built.
+        capabilities: what this box declares. Refused at construction; see :class:`NotAnIntegrator`.
+        timeout_s: ceiling on any one git call.
+    """
+
+    store: GitRefStore
+    trunk: str
+    verdict_of: Callable[[str], str]
+    workdir: Path
+    capabilities: frozenset[str] = field(default_factory=frozenset)
+    timeout_s: float = GIT_TIMEOUT_S
+
+    def __post_init__(self) -> None:
+        blockers = integrator_blockers(self.capabilities)
+        if blockers:
+            raise NotAnIntegrator('; '.join(blockers))
+        object.__setattr__(self, 'capabilities', frozenset(self.capabilities))
+
+    def execute(self, job: Job) -> tuple[str, str]:
+        """Run the pass `job` names, and answer in the verdict vocabulary. Never raises for a race.
+
+        THE BATCH IS RE-READ AND THE ID RE-DERIVED. A job carries no payload, so what it names is a
+        batch by digest; if the queue moved between scheduling and here, this box was asked a
+        question it can no longer answer and the honest word is INCONCLUSIVE -- integrating the NEW
+        batch instead would record a verdict under an id describing different work, which is a
+        declaration that lies with a content address on it.
+
+        THE MAPPING FROM A PASS TO A VERDICT, and each leg is about the TREE and not about the pass:
+
+        * advanced             -> PASS. The judged tree is on the trunk.
+        * anything REJECTED    -> FAIL. The merged tree was judged bad; the batch is disposed of.
+        * requeued, or nothing merged, or the trunk moved, or a head is missing -> INCONCLUSIVE.
+          None of those is a fact about the code, which is exactly what the third word is for.
+
+        `TrunkMoved` AND `HeadNotPresent` ARE CAUGHT BY NAME, not by a broad handler: both are
+        ordinary races with a specific answer, and letting them reach `loop._run`'s catch would
+        record the same INCONCLUSIVE while reading, to anyone looking, as a box that fell over.
+        Everything else propagates.
+
+        Raises:
+            ValueError: `job` is not an INTEGRATION job for this integrator's trunk. A caller and
+                this object disagreeing about which branch is being advanced cannot be resolved by
+                guessing, and guessing would push a judged tree onto the wrong trunk.
+        """
+        if job.kind is not INTEGRATION:
+            msg = f'{job.claim_key()} is not an {INTEGRATION.value} job'
+            raise ValueError(msg)
+        if not job.id.startswith(f'{self.trunk}@'):
+            msg = f'{job.id!r} does not name a pass over {self.trunk!r}; this integrator advances one trunk'
+            raise ValueError(msg)
+
+        submissions = open_submissions(self.store)
+        if not submissions:
+            return INCONCLUSIVE, f'nothing is open on {self.trunk} any more; the batch was taken by another pass'
+        now = batch_key(self.trunk, (s.ordinal for s in submissions))
+        if now != job.id:
+            return INCONCLUSIVE, f'the queue moved: this box was scheduled for {job.id}, the open batch is now {now}'
+
+        try:
+            done = integrate(
+                self.store,
+                trunk=self.trunk,
+                submissions=submissions,
+                verdict_of=self.verdict_of,
+                workdir=self.workdir,
+                timeout_s=self.timeout_s,
+            )
+        except TrunkMoved as exc:
+            return INCONCLUSIVE, f'another integrator advanced {self.trunk} first, so nothing was landed: {exc}'
+        except HeadNotPresent as exc:
+            return INCONCLUSIVE, f'this checkout is missing a submitted head, so no tree was built: {exc}'
+
+        landed = ', '.join(str(s.ordinal) for s in done.integrated) or '(none)'
+        if done.advanced:
+            return PASS, f'{self.trunk} advanced to {done.merge.commit[:12]} carrying submission(s) {landed}'
+        if done.rejected:
+            spurned = ', '.join(str(s.ordinal) for s in done.rejected)
+            return FAIL, f'the merged tree {done.merge.tree[:12]} was judged {done.verdict}; rejected {spurned}'
+        return INCONCLUSIVE, f'nothing landed: verdict {done.verdict} on {done.merge.tree[:12]}'

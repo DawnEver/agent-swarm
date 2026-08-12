@@ -27,8 +27,6 @@ import pytest
 from agent_swarm import refstore
 from agent_swarm.refstore import GitRefStore
 
-pytestmark = pytest.mark.unit
-
 
 def _git(cwd: Path, *args: str) -> str:
     out = subprocess.run(['git', '-C', str(cwd), *args], capture_output=True, text=True, check=True)

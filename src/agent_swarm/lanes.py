@@ -327,17 +327,12 @@ def related_notes(
 # --------------------------------------------------------------------------- pruning
 
 
-def worktrees(repo_root: Path) -> list[tuple[Path, str]]:
-    """``[(path, branch-or-'detached')]`` for every LINKED worktree; the main one is excluded.
+def all_worktrees(repo_root: Path) -> list[tuple[Path, str]]:
+    """``[(path, branch-or-'detached')]`` for EVERY worktree, the main checkout first.
 
     The main worktree is the FIRST entry of `git worktree list --porcelain` -- git's own definition,
-    independent of where the caller stands.
-
-    This was `rev-parse --show-toplevel` until 2026-07-28, and that is wrong in exactly the situation
-    this function is for: inside a linked worktree it returns THAT worktree, so the lane you are
-    standing in was excluded and **the repository itself was offered as a prune candidate**. Only the
-    live-process and idle checks stood between that and removing the main checkout -- and the idle
-    check has a documented off switch.
+    independent of where the caller stands. `worktrees` drops it; `fanout_conflicts` must not, since
+    the whole defect it detects is lanes sharing the MAIN checkout.
     """
     out: list[tuple[Path, str]] = []
     path: Path | None = None
@@ -350,7 +345,91 @@ def worktrees(repo_root: Path) -> list[tuple[Path, str]]:
         elif line.startswith('detached') and path is not None:
             out.append((path, 'detached'))
             path = None
-    return out[1:]
+    return out
+
+
+def worktrees(repo_root: Path) -> list[tuple[Path, str]]:
+    """``[(path, branch-or-'detached')]`` for every LINKED worktree; the main one is excluded.
+
+    This was `rev-parse --show-toplevel` until 2026-07-28, and that is wrong in exactly the situation
+    this function is for: inside a linked worktree it returns THAT worktree, so the lane you are
+    standing in was excluded and **the repository itself was offered as a prune candidate**. Only the
+    live-process and idle checks stood between that and removing the main checkout -- and the idle
+    check has a documented off switch.
+    """
+    return all_worktrees(repo_root)[1:]
+
+
+# --------------------------------------------------------------------------- the fan-out guard
+
+
+def fanout_conflicts(repo_root: Path, branches: Sequence[str]) -> list[str]:
+    """Every reason ``branches`` are NOT a well-formed fan-out. Empty means they are.
+
+    MEASURED 2026-08-12, in this package's own repository: two lanes ran `git checkout -b` in the
+    shared checkout **21 seconds apart**, shared one working tree, and one lane's files were
+    committed under the other's HEAD. Nothing was lost only because it was noticed early. The lane
+    mechanism that prevents it -- `create_lane` -- already existed and was simply not used, so a
+    convention is demonstrably not the fix.
+
+    WHAT IS ACTUALLY DETECTABLE, and this is the whole design of the check. "Someone ran
+    `git checkout -b`" is not a state: the command leaves no trace distinguishable afterwards from a
+    branch created any other way. **"Two branches of this fan-out resolve to one working tree" IS a
+    state**, readable from `git worktree list` at any moment, and it is the property that matters --
+    the collision was not caused by the verb, it was caused by two lanes editing one set of files.
+    So this asserts the property and not the ceremony, and it fires whether the shared tree came
+    from `checkout -b`, a manual `git switch`, or a worktree somebody deleted by hand.
+
+    TWO SHAPES, and the second is the measured one:
+
+    * a branch checked out in NO worktree at all -- it has no files of its own, so whoever is working
+      on it is working somewhere else's. This is what `git checkout -b <a>` followed by
+      `git checkout -b <b>` leaves behind: `<a>` still exists, and nothing is checked out on it.
+    * two branches resolving to the SAME path -- git refuses this for two worktrees, which is exactly
+      why the real collision took the form above rather than this one. It is checked anyway because
+      the ways a checkout can be shared are not this function's to enumerate exhaustively, and the
+      cost of the extra clause is three lines.
+
+    A BRANCH THAT DOES NOT EXIST IS NOT REPORTED HERE. This answers "do these lanes have disjoint
+    working trees"; whether a name was spelled right is a different question with a different remedy,
+    and folding the two would make the refusal ambiguous at the moment someone has to act on it.
+    """
+    homes = {branch: path for path, branch in all_worktrees(repo_root) if branch != 'detached'}
+    reasons: list[str] = []
+    for branch in branches:
+        if branch not in homes:
+            reasons.append(
+                f'{branch!r} is checked out in no worktree, so it has no working tree of its own -- '
+                f"whoever is working on it is editing another lane's files. Use create_lane()."
+            )
+    seen: dict[Path, str] = {}
+    for branch in branches:
+        home = homes.get(branch)
+        if home is None:
+            continue
+        resolved = home.resolve()
+        if resolved in seen:
+            reasons.append(f'{seen[resolved]!r} and {branch!r} both resolve to one working tree: {resolved}')
+        else:
+            seen[resolved] = branch
+    return reasons
+
+
+def require_disjoint_worktrees(repo_root: Path, branches: Sequence[str]) -> None:
+    """RAISE unless every branch in this fan-out has a working tree of its own.
+
+    A GUARD RATHER THAN A REPORT, because :func:`fanout_conflicts`' return value can be ignored by
+    one caller and this cannot -- the same reason every seeding failure in this module raises. It
+    names EVERY conflict at once: one at a time teaches the requirement by attrition, and a caller
+    that has to iterate starts guessing.
+
+    Raises:
+        LaneError: at least one branch shares or lacks a working tree.
+    """
+    conflicts = fanout_conflicts(repo_root, branches)
+    if conflicts:
+        msg = 'REFUSING: these branches are not a fan-out of disjoint worktrees:\n  ' + '\n  '.join(conflicts)
+        raise LaneError(msg)
 
 
 def unmerged_commits(path: Path, *, upstream: str) -> list[str]:

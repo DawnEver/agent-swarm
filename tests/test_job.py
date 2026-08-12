@@ -36,7 +36,7 @@ import pytest
 from agent_swarm import CHEAP, WHOLE_BOX, is_known_class
 from agent_swarm.admission import claim_key, shard_suffix
 from agent_swarm.forge_store import decode_claim_key
-from agent_swarm.job import AGENT_TASK, COMPUTE, TEST_RUN, Job, JobKind
+from agent_swarm.job import AGENT_TASK, COMPUTE, INTEGRATION, TEST_RUN, Job, JobKind
 
 
 class TestTheKinds:
@@ -44,7 +44,7 @@ class TestTheKinds:
         """EXHAUSTIVE in both directions: a kind added without a name here reds, and a name that
         no longer names a member reds. `set(JobKind)` on its own would pass for any enum.
         """
-        assert {AGENT_TASK, TEST_RUN, COMPUTE} == set(JobKind)
+        assert {AGENT_TASK, TEST_RUN, COMPUTE, INTEGRATION} == set(JobKind)
         assert len({k.value for k in JobKind}) == len(list(JobKind))
 
     @pytest.mark.parametrize('kind', list(JobKind), ids=lambda k: k.name)

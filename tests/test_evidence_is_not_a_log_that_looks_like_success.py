@@ -11,7 +11,6 @@ import pytest
 
 from agent_swarm import evidence
 
-pytestmark = pytest.mark.unit
 
 _DIGEST = 'a' * 40
 _ENVKEY = '0123456789abcdef'

@@ -45,7 +45,6 @@ from agent_swarm.refstore import GitRefStore
 from agent_swarm.shards import FAIL, INCONCLUSIVE, PASS
 from agent_swarm.submission import Submission, publish
 
-pytestmark = pytest.mark.unit
 
 TRUNK = 'trunk'
 

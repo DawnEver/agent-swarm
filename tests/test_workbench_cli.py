@@ -407,8 +407,19 @@ class TestTheCLIReachesTheSurfaceAndNotPastIt:
     def test_every_verb_is_reachable_from_the_parser(self):
         """A verb that exists in the dispatch table and not in the parser is unreachable, and a verb
         in the parser with no handler is a KeyError in front of a person.
+
+        THREE CONSUMING VERBS AND ONE PRODUCING ONE. `submit` arrived 2026-08-12 and is the only way
+        anything crosses INTO the trunk; without it the integration plane was a queue with no
+        producers. It is dispatched BEFORE the workbench is built rather than out of the `handlers`
+        table, because it needs a checkout and not forge credentials -- so the second assertion
+        derives reachability from the handler FUNCTIONS, which covers both dispatch paths.
         """
+        import agent_swarm.workbench_cli as cli
+
         parser = build_parser()
         actions = [a for a in parser._actions if a.dest == 'verb']
         assert actions, 'no subcommand action'
-        assert set(actions[0].choices) == {'list', 'take', 'report'}
+        verbs = set(actions[0].choices)
+        assert verbs == {'list', 'take', 'report', 'submit'}
+        unhandled = sorted(verb for verb in verbs if not callable(getattr(cli, f'cmd_{verb}', None)))
+        assert not unhandled, f'the parser offers verbs with no handler: {unhandled}'

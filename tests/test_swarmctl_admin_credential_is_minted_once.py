@@ -42,8 +42,6 @@ from agent_swarm import swarmctl as _swarmctl
 #: This module's own source, read by the two assertions below that are about what the code SAYS.
 _SOURCE = Path(_swarmctl.__file__)
 
-pytestmark = pytest.mark.unit
-
 
 @pytest.fixture(scope='module')
 def swarmctl():

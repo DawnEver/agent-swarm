@@ -34,7 +34,6 @@ from agent_swarm.environment import (
     split_manifest,
 )
 
-pytestmark = pytest.mark.unit
 
 #: A manifest is `interpreter`, then `name==version` rows, then `path=digest` rows.
 BASE = [

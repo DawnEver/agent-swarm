@@ -21,8 +21,6 @@ import pytest
 
 from agent_swarm import clock
 
-pytestmark = pytest.mark.unit
-
 
 class _RecordingClock:
     """Stands in for a built `Clock`, recording the kwargs `run_cli` hands to `run`."""

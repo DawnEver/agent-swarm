@@ -14,7 +14,6 @@ import pytest
 
 from agent_swarm import throughput
 
-pytestmark = pytest.mark.unit
 
 _DAY = date(2026, 8, 12)
 

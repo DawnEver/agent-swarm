@@ -57,6 +57,13 @@ name was reaching for is real and is preserved here, it just was not a type.
     python -m agent_swarm.workbench_cli list
     python -m agent_swarm.workbench_cli take test-run/abc -- pytest -q
     python -m agent_swarm.workbench_cli report test-run/abc --verdict PASS --detail 'ran by hand'
+    python -m agent_swarm.workbench_cli submit --base main --head my-lane --intent 'close the gap'
+
+THREE CONSUMING VERBS AND ONE PRODUCING ONE. `list` / `take` / `report` pull work off the queue;
+`submit` is the only way anything crosses INTO the trunk, and without it the integration plane is a
+queue, a merge and a compare-and-swap that nothing feeds. All four are the same surface for all
+three participant kinds -- a person, a human-controlled agent, a controller's subagent -- because an
+executor is a KIND and not a LAYER, and a second "human API" would be a second protocol to drift.
 
 NO LAUNCHER SCRIPTS, unlike `swarmctl`. Those exist because swarmctl runs on the Gitea host, which
 has no venv and nothing installed, so finding a usable Python is its problem. A pull executor is a
@@ -78,6 +85,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from agent_swarm import roles
 from agent_swarm.claim import Beater, LeaseLost
@@ -85,7 +93,9 @@ from agent_swarm.forge import DEFAULT_GITEA_BASE_URL, ForgeError, GiteaForge
 from agent_swarm.forge_store import ForgeStore, Role, decode_claim_key
 from agent_swarm.job import TEST_RUN, JobKind
 from agent_swarm.pull import MissingCapability, Ticket, Workbench
+from agent_swarm.refstore import GitRefStore, RefUnreachable, withholding_writes
 from agent_swarm.store import VERDICTS
+from agent_swarm.submission import OrdinalTaken, create, effects_of
 
 #: How long a claim survives without a beat, FOR AN INTERACTIVE EXECUTOR. Five minutes, against the
 #: store's three-hour default, and the difference is the whole point of hosting a beater: the long
@@ -124,6 +134,11 @@ class Exit(enum.IntEnum):
     MISSING_CAPABILITY = 5
     LEASE_LOST = 6
     INCONCLUSIVE = 7
+    #: `submit` did not land. ONE code for a refused ordinal and an unreachable git remote, because
+    #: the caller's response to both is identical -- the submission does not exist, so send it again
+    #: -- and a distinction nobody can act on is a distinction that goes stale. It is NOT
+    #: `FORGE_UNREACHABLE`: that one is about the Gitea API this verb never touches.
+    NOT_SUBMITTED = 8
 
 
 def visible_rows() -> int:
@@ -359,6 +374,92 @@ def cmd_report(bench: Workbench, args: argparse.Namespace) -> int:
     return Exit.OK
 
 
+def cmd_submit(args: argparse.Namespace) -> int:
+    """Hand finished work across the boundary into the trunk. **The producer verb.**
+
+    THE WORKBENCH HAS `list` / `take` / `report` AND HAD NO WAY TO GIVE ANYTHING BACK, so the
+    integration plane had a queue, a merge and a compare-and-swap with no producers -- a mechanism
+    with no runner, which is the hazard this package names first.
+
+    IDENTICAL FOR ALL THREE PARTICIPANT KINDS, and that is a design commitment rather than a
+    convenience. A person at a terminal, a human-controlled agent and a controller's subagent all
+    run this exact verb: an executor is a KIND, not a LAYER, and a separate "human API" would be a
+    second protocol to keep in step with this one. Nothing here reads who is calling.
+
+    IT TAKES NO WORKBENCH AND NO `--repo`. A submission is a git ref pushed to a git remote; it does
+    not touch the forge's API, so requiring the settings that build a `Workbench` would make this
+    verb unusable exactly where it is most useful -- a lane with a checkout and no forge credentials.
+
+    THE DEVIATION IS REPORTED AND THE SUBMISSION IS ACCEPTED ANYWAY. `submission.effects_of` holds
+    the declared paths against what the commits really change, and both directions are printed --
+    undeclared work AND declared work that never happened, the second being the likelier sign a step
+    was skipped. Refusing on a mismatch would build the path lock the model argues against; scope
+    here is intent and routing, and git detects real collisions exactly, at merge time.
+    """
+    store = GitRefStore(Path(args.git_root), args.git_remote, withhold_writes=withholding_writes)
+    resolved = {}
+    for name, revision in (('base', args.base), ('head', args.head)):
+        # `rev-parse --verify <rev>^{commit}` and NOT plain `rev-parse`: the plain form echoes an
+        # unknown argument back unchanged and exits 0, so a typo'd branch would be published as a
+        # 40-character-looking sha that resolves to nothing, and the failure would surface days
+        # later inside a merge as HeadNotPresent.
+        out = store.run('rev-parse', '--verify', '--quiet', f'{revision}^{{commit}}')
+        if out.returncode != 0 or not out.stdout.strip():
+            print(f'--{name} {revision!r} is not a commit in {store.root}', file=sys.stderr)
+            return Exit.NOT_SUBMITTED
+        resolved[name] = out.stdout.strip()
+    base, head = resolved['base'], resolved['head']
+
+    declared = tuple(args.path or ())
+    try:
+        submission = create(
+            store,
+            participant=args.owner,
+            base=base,
+            head=head,
+            intent=args.intent,
+            declared_paths=declared,
+        )
+        effects = effects_of(store, submission)
+    except (OrdinalTaken, RefUnreachable) as exc:
+        print(f'{exc}', file=sys.stderr)
+        return Exit.NOT_SUBMITTED
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    'ordinal': submission.ordinal,
+                    'ref': submission.ref(),
+                    'participant': submission.participant,
+                    'base': submission.base,
+                    'head': submission.head,
+                    'intent': submission.intent,
+                    'declared': list(effects.declared),
+                    'observed': list(effects.observed),
+                    'undeclared': list(effects.undeclared),
+                    'unrealised': list(effects.unrealised),
+                    'deviates': effects.deviates,
+                }
+            )
+        )
+        return Exit.OK
+
+    print(f'submission {submission.ordinal} published at {submission.ref()} as {submission.participant}')
+    print(f'  {base[:12]}..{head[:12]}  {submission.intent}')
+    print(f'  observed {len(effects.observed)} path(s) changed; {len(effects.declared)} declared.')
+    if effects.undeclared:
+        print(f'  ACCEPTED, and recorded: {len(effects.undeclared)} path(s) beyond what was declared:')
+        for path in effects.undeclared:
+            print(f'    + {path}')
+    if effects.unrealised:
+        print(f'  declared and NOT changed -- the likelier sign a step was skipped ({len(effects.unrealised)}):')
+        for path in effects.unrealised:
+            print(f'    - {path}')
+    print('  The queue merges this with whatever else is open and judges the COMBINED tree.')
+    return Exit.OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='python -m agent_swarm.workbench_cli',
@@ -396,6 +497,23 @@ def build_parser() -> argparse.ArgumentParser:
     reporter.add_argument('key')
     reporter.add_argument('--verdict', required=True, choices=sorted(VERDICTS))
     reporter.add_argument('--detail', default='')
+
+    # THE PRODUCER VERB. Its options are git's, not the forge's -- see `cmd_submit` for why it needs
+    # neither `--repo` nor `--namespace`.
+    submitter = verbs.add_parser('submit', help='hand finished work to the integration queue')
+    submitter.add_argument('--base', required=True, help='what this was built on -- a branch, tag or sha')
+    submitter.add_argument('--head', required=True, help='the work itself -- a branch, tag or sha')
+    submitter.add_argument('--intent', required=True, help='what this is FOR, in one line')
+    submitter.add_argument(
+        '--path',
+        action='append',
+        default=None,
+        help='a path this intends to touch; repeatable. A DECLARATION, never a lock: exceeding it '
+        'is accepted and the deviation is reported.',
+    )
+    submitter.add_argument('--git-root', default='.', help='the checkout to publish from')
+    submitter.add_argument('--git-remote', default='origin', help='the remote the queue reads')
+    submitter.add_argument('--json', action='store_true', help='the same facts as data')
     return parser
 
 
@@ -431,6 +549,11 @@ def main(argv: Sequence[str] | None = None, *, workbench: Workbench | None = Non
     """
     args = build_parser().parse_args(argv)
     args.kind = JobKind(args.kind)
+    if args.verb == 'submit':
+        # BEFORE THE WORKBENCH IS BUILT, and not merely before it is USED: `settings_from` exits on a
+        # missing `--repo`/`--namespace`, so building one first would make the producer verb refuse
+        # to run in a checkout that has no forge credentials -- which is most lanes.
+        return cmd_submit(args)
     if workbench is None:
         workbench = build_workbench(settings_from(args))
     if args.verb == 'take':

@@ -29,7 +29,6 @@ from agent_swarm.liveness import (
 from agent_swarm.refstore import RefUnreachable
 from agent_swarm.testing import InMemoryRefStore
 
-pytestmark = pytest.mark.unit
 
 NOW = 1_755_000_000
 

@@ -31,9 +31,6 @@ def _never() -> bool:
     return False
 
 
-pytestmark = pytest.mark.unit
-
-
 def _git(root: Path, *args: str) -> str:
     out = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True, check=True)
     return out.stdout.strip()

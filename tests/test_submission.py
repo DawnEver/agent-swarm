@@ -28,8 +28,6 @@ from agent_swarm import refs
 from agent_swarm.refstore import GitRefStore
 from agent_swarm.submission import OrdinalTaken, Submission, create, publish, read, submitted_ordinals
 
-pytestmark = pytest.mark.unit
-
 
 def _never() -> bool:
     """The rehearsal predicate: these tests exercise the REAL writes against a scratch remote."""

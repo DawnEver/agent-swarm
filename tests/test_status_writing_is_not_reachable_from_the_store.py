@@ -29,11 +29,9 @@ import ast
 import inspect
 from pathlib import Path
 
-import pytest
 
 from agent_swarm import forge_store
 
-pytestmark = pytest.mark.unit
 
 _SOURCE = Path(inspect.getfile(forge_store))
 

@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_swarm import refs
+from agent_swarm.evidence import Effects
 from agent_swarm.refstore import GitRefStore, RefUnreachable
 
 #: The name inside the submission's tree. HALF OF A CONTRACT between :func:`publish` and
@@ -176,6 +177,46 @@ def submitted_ordinals(store: GitRefStore) -> tuple[int, ...]:
     """
     found = store.list(refs.submission_glob())
     return tuple(sorted(o for ref in found if (o := refs.submission_ordinal(ref)) is not None))
+
+
+def observed_paths(store: GitRefStore, base: str, head: str, *, timeout_s: float = GIT_TIMEOUT_S) -> tuple[str, ...]:
+    """What this submission ACTUALLY touches: the paths differing between `base` and `head`.
+
+    THREE DOTS, NOT TWO. `base...head` diffs against the MERGE BASE, so a trunk that moved on while
+    the participant worked does not arrive here as that participant's effects. Two dots would grow
+    the observed set with everybody else's commits, and the deviation this feeds would then be loud
+    about work the submitter never did -- a report that cries wolf is a report nobody reads.
+
+    Raises:
+        RefUnreachable: either end is missing from this checkout, so nothing can be compared. NOT an
+            empty tuple: "the diff is empty" and "I could not take the diff" are opposite facts and
+            the second must never render as the first.
+    """
+    out = store.run('diff', '--name-only', f'{base}...{head}', timeout=timeout_s)
+    if out.returncode != 0:
+        msg = f'cannot diff {base[:12]}...{head[:12]} in {store.root}: {out.stderr.strip() or "(nothing on stderr)"}'
+        raise RefUnreachable(msg)
+    return tuple(sorted({line.strip() for line in out.stdout.splitlines() if line.strip()}))
+
+
+def effects_of(store: GitRefStore, submission: Submission, *, timeout_s: float = GIT_TIMEOUT_S) -> Effects:
+    """This submission's DECLARED intent held against what its commits observably change.
+
+    THE DEVIATION IS RECORDED AND NEVER REFUSED. `Effects.undeclared` is the input a reviewer and an
+    integration order want; a guard that rejected it would be the path lock this whole plane exists
+    to avoid, since git already detects real collisions exactly, at merge time. This module's
+    docstring says the same thing about `declared_paths`, and this function is where the comparison
+    is finally COMPUTED rather than asserted -- `evidence.Effects` is reused rather than a second
+    declared-versus-observed record being invented beside it.
+
+    IT IS DERIVED, NOT STORED, AND THAT IS STRONGER. The published submission carries `base`, `head`
+    and `declared_paths`, so any later reader can recompute this exactly. A snapshot written at
+    submit time would be a number that can go stale against the commits it describes.
+    """
+    return Effects(
+        declared=submission.declared_paths,
+        observed=observed_paths(store, submission.base, submission.head, timeout_s=timeout_s),
+    )
 
 
 def create(

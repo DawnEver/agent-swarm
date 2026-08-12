@@ -34,7 +34,6 @@ from agent_swarm.scaling import (
 )
 from agent_swarm.store import InMemoryStore
 
-pytestmark = pytest.mark.unit
 
 CHEAP_JOB = Job(id='j1', kind=TEST_RUN, exclusivity='cheap', ram_gib=0.1)
 

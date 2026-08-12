@@ -12,7 +12,6 @@ import pytest
 
 from agent_swarm import environment, manifest
 
-pytestmark = pytest.mark.unit
 
 _LINES = (
     'cpython-3.12.4-win32',
