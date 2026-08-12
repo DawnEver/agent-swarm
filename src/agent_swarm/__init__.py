@@ -2,8 +2,9 @@
 
 The founding observation, from motronics' `design-final-architecture-collaboration-and-test-system-unified.md`:
 those two are the SAME job loop -- store -> atomic claim -> a machine with capacity executes ->
-verdict -> written back -- differing only in a job's `kind` (`agent-task` | `test-run`). There is
-one scheduler, not two.
+verdict -> written back -- differing only in a job's `kind`. There is one scheduler, not two, and
+a kind added since (`compute`, one evaluation leg of a numerical study) added no second one either:
+the bar for a member of `JobKind` is that it changes nothing but the enum.
 
     L2 project   gate.py, testkey, acceptance bars, the case library
     L1 swarm     store adapters, job model, atomic claim, ADMISSION, lifecycles, verdict routing
@@ -73,13 +74,14 @@ from agent_swarm.exclusive import (
     lock_path_for_class,
     read_owner,
 )
-from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
+from agent_swarm.job import AGENT_TASK, COMPUTE, TEST_RUN, Job, JobKind
 from agent_swarm.loop import Box, Executor, Outcome, run_one
 from agent_swarm.store import VERDICTS, InMemoryStore, Store
 
 __all__ = [
     'AGENT_TASK',
     'CHEAP',
+    'COMPUTE',
     'SHARED_SLOWDOWN',
     'TEST_RUN',
     'VENDOR_PREFIX',

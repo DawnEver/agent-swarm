@@ -1,12 +1,12 @@
-"""The job model. ONE shape for both instances of the loop; the `kind` is the only difference.
+"""The job model. ONE shape for every instance of the loop; the `kind` is the only difference.
 
     work item -> atomic claim -> execute on a box with capacity -> verdict -> record to store
 
-|            | collaboration            | test system                        |
-| work item  | issue (dev task)         | candidate (tier awaiting a run)    |
-| executor   | worker session (LLM)     | runner (deterministic, ci_loop)    |
-| capacity   | RAM, session count       | RAM, vendor class, time budget     |
-| verdict    | gate green + lead        | PASS / FAIL / INCONCLUSIVE         |
+|            | collaboration            | test system                        | computation           |
+| work item  | issue (dev task)         | candidate (tier awaiting a run)    | one evaluation leg    |
+| executor   | worker session (LLM)     | runner (deterministic, ci_loop)    | a solve on one box    |
+| capacity   | RAM, session count       | RAM, vendor class, time budget     | RAM, licensed tool    |
+| verdict    | gate green + lead        | PASS / FAIL / INCONCLUSIVE         | PASS / FAIL           |
 
 Building those as two systems would build two schedulers, two queues and two verdict vocabularies
 for one problem. Conversational versus deterministic is an attribute of the EXECUTOR, not a system
@@ -31,18 +31,32 @@ from agent_swarm.admission import WHOLE_BOX, shard_suffix
 
 
 class JobKind(enum.Enum):
-    """The one property that distinguishes the two instances of the loop.
+    """The one property that distinguishes the instances of the loop.
 
-    An ENUM rather than a string: a typo in free text creates a third kind that nothing schedules
-    and nothing reports, and it would surface as work that silently never runs.
+    An ENUM rather than a string: a typo in free text creates a kind that nothing schedules and
+    nothing reports, and it would surface as work that silently never runs.
+
+    ADDING A MEMBER IS ADDING AN INSTANCE OF THE ONE LOOP, NEVER A SECOND SCHEDULER. The test that
+    a kind costs this package nothing but a member is `loop.py`'s: nothing there reads `job.kind`.
+    So the bar for a new kind is that it fits `work item -> claim -> execute -> verdict` unchanged.
+
+    `COMPUTE` is ONE EVALUATION LEG of a numerical study -- one point, one parameter set -- and its
+    id is a CONTENT ADDRESS its consumer computes. A study of N points is N of these, independently
+    claimable, with no relationship between them that this package can see. A search that submits
+    one fan-out, waits for it, and submits the next is a CLIENT holding that wait: modelling "one
+    round of a search" as a job would force this layer to understand populations, barriers and
+    stragglers, which is the second scheduler the docstring above refuses. That property is pinned
+    by `TestTheSubstrateKnowsNothingAboutBARRIERS` in `tests/test_job.py`, not by this paragraph.
     """
 
     AGENT_TASK = 'agent-task'
     TEST_RUN = 'test-run'
+    COMPUTE = 'compute'
 
 
 AGENT_TASK = JobKind.AGENT_TASK
 TEST_RUN = JobKind.TEST_RUN
+COMPUTE = JobKind.COMPUTE
 
 
 @dataclass(frozen=True, slots=True)

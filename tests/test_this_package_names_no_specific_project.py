@@ -64,13 +64,18 @@ PACKAGE = Path(forge.__file__).parent
 FORBIDDEN = ('motronics', 'tianjie-zou', 'femm', 'jmag')
 
 
-def _offending(source: str, *, where: str) -> list[str]:
-    """Every place in `source` a forbidden token appears as a NAME or a usable VALUE.
+def _offending(source: str, *, where: str, tokens: tuple[str, ...] = FORBIDDEN) -> list[str]:
+    """Every place in `source` one of `tokens` appears as a NAME or a usable VALUE.
 
     A FUNCTION RATHER THAN AN INLINE LOOP, so the detector itself can be tested against a module
     that DOES offend. A scanner that silently matched nothing -- a typo in a token, a walk that
     misses `ast.Constant` inside an f-string -- would report this package clean forever, which is
     the same green-because-the-instrument-is-broken shape the double-model version exists for.
+
+    `tokens` IS A PARAMETER because a second source-level vocabulary ban exists --
+    `test_job.py`'s barrier scan -- and the rule it needs is identical down to the docstring
+    exemption. A second copy of this walk is the duplicated-scheme defect, and the copies would
+    diverge exactly where this one has already been corrected once (attribute docstrings).
     """
     tree = ast.parse(source)
     # A DISCARDED STRING STATEMENT IS THE DEFINITION, not "the first statement of a module/def".
@@ -90,10 +95,25 @@ def _offending(source: str, *, where: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and node not in docstrings:
             lowered = node.value.lower()
-            hits.extend(f'{where}:{node.lineno} value {node.value!r}' for t in FORBIDDEN if t in lowered)
-        elif isinstance(node, ast.Name | ast.Attribute | ast.arg):
-            name = getattr(node, 'id', None) or getattr(node, 'attr', None) or getattr(node, 'arg', '')
-            hits.extend(f'{where}:{node.lineno} name {name!r}' for t in FORBIDDEN if t in name.lower())
+            hits.extend(f'{where}:{node.lineno} value {node.value!r}' for t in tokens if t in lowered)
+        # MEASURED 2026-08-12: this tuple used to stop at `ast.Name | ast.Attribute | ast.arg`, so a
+        # `def` or `class` NAME was never scanned -- `def motronics_gate(): ...` passed. A function
+        # definition's name is a plain `str` field of `FunctionDef`, not a `Name` node, and nothing
+        # said so; the guard's SCOPE was narrower than the sentence "appears in a NAME", which is
+        # the variant that makes a reader route around a working check. `keyword` is here for the
+        # same reason: `f(motronics_repo=1)` names it at the CALL, where nothing else looks.
+        elif isinstance(
+            node,
+            ast.Name | ast.Attribute | ast.arg | ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.keyword,
+        ):
+            name = (
+                getattr(node, 'id', None)
+                or getattr(node, 'attr', None)
+                or getattr(node, 'arg', None)
+                or getattr(node, 'name', None)
+                or ''
+            )
+            hits.extend(f'{where}:{node.lineno} name {name!r}' for t in tokens if t in name.lower())
     return hits
 
 
@@ -152,6 +172,20 @@ def test_the_scanner_catches_an_enumerated_vendor_class():
     those two strings too, so it is pinned at the source.
     """
     assert _offending("KNOWN_CLASSES = frozenset({'expensive', 'cheap', 'vendor:femm', 'vendor:jmag'})\n", where='x')
+
+
+def test_the_scanner_catches_it_in_a_DEF_or_CLASS_name():
+    """MEASURED 2026-08-12, and it was a real miss: a function or class name is a `str` field of
+    the definition node, not a `Name`, so the walk never saw it. Found by a second caller of this
+    scanner planting `def next_generation(...)` and getting a clean bill.
+    """
+    assert _offending('def motronics_gate(): ...\n', where='x')
+    assert _offending('class FemmPool: ...\n', where='x')
+
+
+def test_the_scanner_catches_it_as_a_KEYWORD_at_the_call_site():
+    """`f(motronics_repo=1)` names the coupling where no other node type looks."""
+    assert _offending('f(motronics_repo=1)\n', where='x')
 
 
 def test_the_scanner_ignores_a_docstring():

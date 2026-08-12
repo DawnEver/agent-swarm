@@ -33,25 +33,32 @@ from dataclasses import fields
 
 import pytest
 
-from agent_swarm import WHOLE_BOX, is_known_class
+from agent_swarm import CHEAP, WHOLE_BOX, is_known_class
 from agent_swarm.admission import claim_key, shard_suffix
 from agent_swarm.forge_store import decode_claim_key
-from agent_swarm.job import AGENT_TASK, TEST_RUN, Job, JobKind
+from agent_swarm.job import AGENT_TASK, COMPUTE, TEST_RUN, Job, JobKind
 
 
-class TestTheTwoKinds:
-    def test_both_kinds_exist_and_are_distinct(self):
-        assert AGENT_TASK != TEST_RUN
-        assert {AGENT_TASK, TEST_RUN} == set(JobKind)
+class TestTheKinds:
+    def test_every_kind_exists_and_is_distinct(self):
+        """EXHAUSTIVE in both directions: a kind added without a name here reds, and a name that
+        no longer names a member reds. `set(JobKind)` on its own would pass for any enum.
+        """
+        assert {AGENT_TASK, TEST_RUN, COMPUTE} == set(JobKind)
+        assert len({k.value for k in JobKind}) == len(list(JobKind))
 
-    def test_a_kind_is_the_ONLY_structural_difference(self):
+    @pytest.mark.parametrize('kind', list(JobKind), ids=lambda k: k.name)
+    def test_a_kind_is_the_ONLY_structural_difference(self, kind):
         """DISCRIMINATING. Two jobs identical but for their kind must differ in NOTHING else --
         no extra field, no missing one. The moment one kind needs a field the other cannot have,
         the single loop has quietly become two.
+
+        PARAMETRIZED OVER `JobKind` ITSELF rather than a written-out pair, so a kind added later
+        is covered the moment it is added instead of the day somebody remembers this file.
         """
         common = {'id': 'x', 'ram_gib': 1.0, 'exclusivity': WHOLE_BOX}
         a = Job(kind=AGENT_TASK, **common)
-        b = Job(kind=TEST_RUN, **common)
+        b = Job(kind=kind, **common)
         # `dataclasses.fields`, not `vars()`: the model is slotted (no instance __dict__), and the
         # declared fields are the stricter probe anyway -- they are the SHAPE, while a __dict__
         # only shows what happens to be set.
@@ -75,6 +82,20 @@ class TestItStatesItsOwnCost:
     def test_a_test_run_prices_itself(self):
         job = Job(id='x', kind=TEST_RUN, ram_gib=12.5, solo_seconds=356.0, ceiling_seconds=600.0)
         assert job.solo_seconds == pytest.approx(356.0)
+
+    def test_a_compute_job_prices_itself_and_the_BOX_sees_that_price(self):
+        """DISCRIMINATING, and the reason this is not just `assert job.ram_gib == 6.0`: a declared
+        cost that admission never reads is a declaration that lies. So the number is asserted
+        THROUGH `Box.blockers`, which is what actually decides -- a box with 4 GiB free must refuse
+        a 6 GiB leg, and the same box must accept a 0.5 GiB one.
+        """
+        from agent_swarm.loop import Box
+
+        heavy = Job(id='leg-a', kind=COMPUTE, exclusivity=CHEAP, ram_gib=6.0)
+        light = Job(id='leg-b', kind=COMPUTE, exclusivity=CHEAP, ram_gib=0.5)
+        box = Box(available_gib=4.0)
+        assert box.blockers(heavy), 'a box without room admitted a leg that declared it needs more'
+        assert not box.blockers(light)
 
     def test_an_unpriced_job_is_LEGAL(self):
         """Refusing unpriced work would stop the fleet ever taking anything new -- and running it
@@ -105,9 +126,12 @@ class TestTheClaimIdentity:
 
     def test_two_KINDS_of_the_same_id_are_DIFFERENT_work(self):
         """An issue and the test run for that issue share an id and are not the same job; claiming
-        one must not block the other.
+        one must not block the other. Asserted over EVERY kind rather than one pair: a kind whose
+        value collided with another's would silently share a claim namespace with it, which reads
+        as work that is mysteriously already claimed.
         """
-        assert Job(id='abc', kind=AGENT_TASK).claim_key() != Job(id='abc', kind=TEST_RUN).claim_key()
+        keys = {kind: Job(id='abc', kind=kind).claim_key() for kind in JobKind}
+        assert len(set(keys.values())) == len(keys), keys
 
     def test_shards_of_one_job_claim_SEPARATELY(self):
         """Otherwise shard 2 is refused while shard 1 is held and sharding degrades to serial
@@ -128,6 +152,66 @@ class TestTheClaimIdentity:
         claim already in the store.
         """
         assert '/' not in Job(id='j', kind=TEST_RUN).claim_key().removeprefix('test-run/')
+
+
+class TestTheSubstrateKnowsNothingAboutBARRIERS:
+    """The property that makes a third kind cost this package one enum member and nothing else.
+
+    A COMPUTE job is ONE EVALUATION LEG. A parameter sweep is N independent legs; an optimisation is
+    a SEQUENCE of such fan-outs, each waiting for the whole previous one. That wait is a BARRIER, and
+    the temptation is to model "a generation" as a job -- at which point this package must understand
+    populations, stragglers and partial results, and `loop.py`'s "second scheduler" is exactly what
+    has been built. The barrier belongs to the CLIENT: an ask/tell loop submits a fan-out, waits for
+    its own verdicts, and submits the next one. Nothing here ever learns that the second fan-out
+    depended on the first.
+
+    So the assertion is a source scan, because there is no behaviour to observe: a package that has
+    never heard of a generation behaves identically to one that has, right up until it does not.
+    """
+
+    #: Vocabulary that only a barrier-aware scheduler needs. `generation` and `population` are the
+    #: search's; `barrier`, `quorum` and `straggler` are the wait itself. Deliberately NOT `wait` or
+    #: `all`, which are ordinary English and would make this a nuisance rather than a signal.
+    BARRIER_WORDS = ('generation', 'population', 'barrier', 'quorum', 'straggler')
+
+    def test_no_module_names_a_generation_or_a_barrier(self):
+        """SEARCH SCOPE, stated so the reader does not supply "everything": every `*.py` directly
+        under `src/agent_swarm/`, and within each, NAMES and strings the code can USE AS A VALUE --
+        never a docstring or a comment.
+
+        THE PROSE EXEMPTION IS THE POINT, not a weakening. The first version of this scan read raw
+        text and reported five hits, every one of them prose: `shards.py` correctly telling its
+        reader that a slow shard is a straggler, and `job.py`'s own paragraph PROMISING that
+        barriers live in the client. A scan that reds on the sentence explaining the property gets
+        "fixed" by deleting the explanation. What is being refused is a MECHANISM, and a mechanism
+        is code -- which is why this reuses `_offending`, the same AST walk and the same
+        discarded-string-statement rule the project-noun ban already uses, instead of a second one.
+        """
+        from pathlib import Path as _Path
+
+        import agent_swarm as _pkg
+        from test_this_package_names_no_specific_project import _offending
+
+        offenders: list[str] = []
+        for module in sorted(_Path(_pkg.__file__).parent.glob('*.py')):
+            source = module.read_text(encoding='utf-8')
+            offenders.extend(_offending(source, where=module.name, tokens=self.BARRIER_WORDS))
+        assert not offenders, (
+            'this package has learned a barrier vocabulary -- a fan-out that WAITS for its whole '
+            "previous fan-out is the client's loop, not the scheduler's:\n  " + '\n  '.join(offenders)
+        )
+
+    def test_the_scanner_would_actually_catch_one(self):
+        """The vacuity control, and it is not optional here: this scan passed on its FIRST run
+        against the real package, so nothing about a green distinguishes "no barrier" from "no
+        scan". Both shapes a barrier would arrive in are planted -- a function that advances a
+        generation, and a dict key naming one.
+        """
+        from test_this_package_names_no_specific_project import _offending
+
+        assert _offending('def next_generation(pop): ...\n', where='x', tokens=self.BARRIER_WORDS)
+        assert _offending("state = {'population': []}\n", where='x', tokens=self.BARRIER_WORDS)
+        assert not _offending('"""a slow shard is a straggler."""\n', where='x', tokens=self.BARRIER_WORDS)
 
 
 class TestItIsHashableAndComparable:
