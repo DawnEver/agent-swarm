@@ -57,6 +57,7 @@ direction, not as an error.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import math
@@ -552,3 +553,31 @@ class Clock:
             return 0
         finally:
             stop_wake_listener(listener)
+
+
+def run_cli(build: Callable[[], Clock], *, description: str, argv: Sequence[str] | None = None) -> int:
+    """The operator's four knobs over :meth:`Clock.run`: interval, once, wake host, wake port.
+
+    WHY THIS IS HERE AND NOT AT EVERY CONSUMER. Each of the four is a parameter of `Clock.run`, so
+    the flag that sets it is this module's vocabulary, not any project's -- and a consumer writing
+    its own parser owns a second spelling of `--wake-port` free to drift from the field it feeds.
+    The FIRST such consumer already carried a worse instance of that: it re-ran
+    `lifetime.bind_children_to_this_process` before calling `run`, which binds too, so the terminal
+    guarantee had two implementations and the docstring of each described the other's.
+
+    `build` IS A CALLABLE, NOT A `Clock`, so a consumer whose bindings are expensive or invalid does
+    not pay for them on `--help`, and a construction refusal (`Clock.__post_init__`) surfaces after
+    argument parsing rather than before it.
+
+    `description` HAS NO DEFAULT. What this loop IS belongs to whoever runs it; a default would put
+    this package's own prose on the `--help` of a program it knows nothing else about.
+    """
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--interval', type=float, default=None, help='seconds between ticks (default: from policy)')
+    parser.add_argument('--once', action='store_true', help='run a single tick and exit')
+    parser.add_argument('--wake-host', default=WAKE_HOST, help=f'wake listener bind address (default {WAKE_HOST})')
+    parser.add_argument(
+        '--wake-port', type=int, default=WAKE_PORT, help=f'wake listener port (default {WAKE_PORT}; 0 = poll only)'
+    )
+    args = parser.parse_args(argv)
+    return build().run(interval=args.interval, once=args.once, wake_host=args.wake_host, wake_port=args.wake_port)
