@@ -81,7 +81,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from agent_swarm import roles
-from agent_swarm.claim import LeaseLost
+from agent_swarm.claim import Beater, LeaseLost
 from agent_swarm.forge import DEFAULT_GITEA_BASE_URL, ForgeError, GiteaForge
 from agent_swarm.forge_store import ForgeStore, Role, decode_claim_key
 from agent_swarm.job import TEST_RUN, JobKind
@@ -187,59 +187,6 @@ def build_workbench(settings: Settings) -> Workbench:
         lease_seconds=settings.lease_seconds,
     )
     return Workbench(store, owner=settings.owner, capabilities=settings.capabilities)
-
-
-class Beater:
-    """Keeps a ticket alive while work runs, and STOPS THE WORK when it cannot.
-
-    A DAEMON THREAD, so it cannot keep this process alive past its work -- the whole promise is that
-    closing the terminal loses the ticket, and a non-daemon beater would be a thread politely
-    holding the claim open while nobody is watching.
-
-    **A LOST LEASE IS NOT LOGGED AND SHRUGGED OFF.** When `renew` raises, another executor may
-    already have taken the job, so continuing to run is doing work whose answer somebody else will
-    publish. `on_lost` is called and the caller kills the child. That is the difference between a
-    heartbeat and a progress bar: this one has consequences.
-
-    **IT BEATS ON THE CADENCE THE CLAIM DEFINES** (`ForgeStore.beat_every` -> `claim.beat_interval`),
-    never on a number chosen here. This class ALREADY GOT THAT WRONG once: it floored its own
-    interval at 1.0 s, so against any lease under four seconds the first beat landed after the lease
-    had already expired -- a heartbeat that cannot fire in time, which reads in a diff exactly like
-    one that can. The floor never bound at the production lease, so only a test with a short lease
-    exposed it. The interval is now supplied by the store and this class derives nothing.
-    """
-
-    def __init__(self, ticket: Ticket, *, on_lost, interval: float) -> None:
-        self.ticket = ticket
-        self.on_lost = on_lost
-        self.interval = interval
-        self.lost: LeaseLost | None = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name='claim-beater', daemon=True)
-
-    def _run(self) -> None:
-        while not self._stop.wait(self.interval):
-            try:
-                self.ticket.beat()
-            except LeaseLost as exc:
-                self.lost = exc
-                self.on_lost(exc)
-                return
-            except ForgeError:
-                # A TRANSIENT FAILURE IS NOT A LOST LEASE, and treating it as one would kill healthy
-                # work every time the forge hiccups. The lease is what bounds this: beats run at a
-                # quarter of it, so three consecutive failures can be absorbed before the claim
-                # genuinely lapses -- and if they keep failing, `renew` will raise LeaseLost on its
-                # own and the branch above fires. Silence here is bounded by that, not by hope.
-                continue
-
-    def __enter__(self) -> Beater:
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self._stop.set()
-        self._thread.join(timeout=self.interval)
 
 
 def _bind_children() -> str:
@@ -364,7 +311,7 @@ def cmd_take(bench: Workbench, args: argparse.Namespace) -> int:
                 child.kill()
 
     try:
-        with Beater(ticket, on_lost=on_lost, interval=bench.store.beat_every):
+        with Beater(ticket.beat, on_lost=on_lost, interval=bench.store.beat_every):
             child = subprocess.Popen(args.command)  # noqa: S603 -- the operator's own command line
             returncode = child.wait()
     except OSError as exc:

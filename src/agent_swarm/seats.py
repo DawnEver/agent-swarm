@@ -34,12 +34,14 @@ the first acquire rather than at the licence audit.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import contextlib
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from agent_swarm.claim import Arbiter, Held, Holders
-from agent_swarm.forge import Forge
+from agent_swarm.admission import VENDOR_PREFIX
+from agent_swarm.claim import Arbiter, ArbitrationUnsound, Beater, Held, Holders, LeaseLost, beat_interval
+from agent_swarm.forge import Forge, ForgeError
 from agent_swarm.forge_store import ITEM_TITLE_ROOT, NOT_VISIBLE, NotVisible, Role
 
 #: How long a seat survives without a beat. MUCH SHORTER than a job claim's three hours, and that
@@ -70,6 +72,10 @@ class SeatCatalog(Protocol):
         """Seats for `tool`. Raises :class:`UnknownTool` if it is not declared."""
         ...
 
+    def is_unlimited(self, tool: str) -> bool:
+        """Whether this tool has no fleet-wide limit. DECLARED, never inferred from silence."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class DeclaredSeats:
@@ -83,7 +89,30 @@ class DeclaredSeats:
 
     counts: Mapping[str, int]
 
+    #: Tools with NO fleet-wide limit, DECLARED rather than inferred from absence.
+    #:
+    #: WHY ABSENCE CANNOT MEAN THIS. Without the list, a tool nobody declared is indistinguishable
+    #: from a tool deliberately exempted, and the two failures are wildly asymmetric: an omission
+    #: read as "unlimited" over-subscribes a floating licence and is discovered at an audit, or in
+    #: the middle of a 25-minute solve, attributed to the solver. So `seats()` still RAISES for
+    #: anything in neither list, and a site states its unbounded tools on purpose.
+    #:
+    #: THIS ARRIVED FROM A CONSUMER, 2026-08-12. motronics wrapped this class to add exactly this,
+    #: because a perpetual local FEMM install has no fleet limit while JMAG is floating. A catalogue
+    #: that can only express a COUNT forces every such site to write that wrapper -- which is the
+    #: shape this package keeps deleting, one repository further out.
+    unlimited: Sequence[str] = ()
+
     def __post_init__(self) -> None:
+        both = sorted(set(self.counts) & set(self.unlimited))
+        if both:
+            msg = (
+                f'{both} are declared BOTH with a seat count and as unlimited. One is wrong and '
+                f'nothing here can tell which, so neither is assumed: read as unlimited when it has '
+                f'a count, the licence is over-subscribed; the reverse serialises a fleet for no '
+                f'reason.'
+            )
+            raise ValueError(msg)
         for tool, count in self.counts.items():
             if not tool:
                 msg = 'a seat count must name its tool; an empty name is not a tool'
@@ -96,14 +125,26 @@ class DeclaredSeats:
                 )
                 raise ValueError(msg)
 
+    def is_unlimited(self, tool: str) -> bool:
+        """Whether this tool was DECLARED to have no fleet-wide limit. Silence is not a declaration."""
+        return tool in self.unlimited
+
     def seats(self, tool: str) -> int:
+        if tool in self.unlimited:
+            msg = (
+                f'{tool!r} is declared unlimited, so it has no seat count. Asking for one means a '
+                f'caller skipped the `is_unlimited` branch, which would ration a tool this site '
+                f'declared unbounded.'
+            )
+            raise UnknownTool(msg)
         try:
             return self.counts[tool]
         except KeyError as exc:
             msg = (
                 f'no seat count is declared for {tool!r}; declared tools are '
-                f'{sorted(self.counts)}. This package cannot guess one -- a default would either '
-                f'serialise a multi-seat licence or invent capacity nobody bought.'
+                f'{sorted(self.counts)} and unlimited tools are {sorted(self.unlimited)}. This '
+                f'package cannot guess one -- a default would either serialise a multi-seat licence '
+                f'or invent capacity nobody bought. Declare a count, or declare it unlimited.'
             )
             raise UnknownTool(msg) from exc
 
@@ -228,3 +269,168 @@ class SeatPool:
             slots=self.catalog.seats(self.tool),
             lease_seconds=self.lease_seconds,
         )
+
+
+# ==================================================================================================
+# HOLDING ONE, FOR THE DURATION OF SOME WORK
+# ==================================================================================================
+#
+# WHY THIS IS HERE AND NOT IN EACH CONSUMER, which is where it was until 2026-08-12. `SeatPool`
+# gives a caller `acquire`, and every caller then had to write the same decisions itself: derive a
+# tool from a job class, skip the whole thing for an unbounded tool, keep the lease alive for work
+# far longer than it, tell "no seat right now" from "this tool is declared nowhere" from "the forge
+# is down", release on the way out even when the work raised, and report which of those happened.
+#
+# motronics wrote all of it -- and MEASURED, the file was 359 lines of which exactly 2 named that
+# project. It was classified as that project's code on the strength of those 2. The classification
+# was the defect and the file was the evidence; what stayed behind is the seat COUNTS, the namespace
+# and the unreachable-forge DECISION, which is genuinely a site's to make.
+
+#: What a seat hold can report. FIVE VALUES rather than a boolean, because a caller acting on this
+#: needs to tell "there was nothing to arbitrate" from "there was, and we could not".
+SEATS_NOT_APPLICABLE = 'n/a'  # the work names no seated tool; no fleet resource is involved
+SEATS_UNLIMITED = 'unlimited'  # a tool DECLARED to have no fleet-wide limit
+SEATS_HELD = 'held'  # arbitrated, and the lease was still ours at the end
+SEATS_UNARBITRATED = 'unarbitrated'  # the forge could not be reached, and the caller chose PROCEED
+SEATS_LOST = 'lost'  # taken, then the lease lapsed mid-work -- the resource was over-committed
+
+#: The two answers to "the forge is unreachable". THE CALLER CHOOSES, and there is no default.
+#:
+#: A DEFAULT HERE WOULD BE THIS PACKAGE DECIDING SOMEBODY'S LICENCE POLICY. `REFUSE` is right for a
+#: site whose licence server audits; `PROCEED` for one that would rather not stop local work during
+#: an outage -- and both are defensible, which is exactly why neither may be assumed.
+REFUSE_WHEN_UNREACHABLE = 'refuse'
+PROCEED_WHEN_UNREACHABLE = 'proceed'
+
+
+class SeatRefused(RuntimeError):
+    """This work may not start: the seats are taken, undeclared, or unreachable-and-refused.
+
+    A REFUSAL, NOT A FAILURE. Nothing about the work has been measured, and a caller that records
+    this as a failure puts an infrastructure state on the work's record.
+    """
+
+
+def tool_of(job_class: str) -> str | None:
+    """The tool a job class names, or None when the class names no seated tool.
+
+    DERIVED FROM `admission.VENDOR_PREFIX` rather than from a second list of tool names. A list here
+    would be another spelling of the vocabulary `admission` already owns, and the drift symptom is a
+    tool that takes a machine lock and no seat -- which looks exactly like correct behaviour.
+    """
+    return job_class[len(VENDOR_PREFIX) :] if job_class.startswith(VENDOR_PREFIX) else None
+
+
+@contextlib.contextmanager
+def hold_for_class(
+    job_class: str,
+    *,
+    owner: str,
+    namespace: str,
+    catalog: SeatCatalog,
+    forge: Forge | Callable[[], Forge],
+    when_unreachable: str,
+    lease_seconds: float = DEFAULT_SEAT_LEASE_SECONDS,
+) -> Generator[Callable[[], str]]:
+    """Hold a fleet seat for the duration of a block. Yields a callable giving the seat STATE.
+
+    THE STATE IS A CALLABLE, not a value, and that is not ceremony: the interesting transition --
+    the lease lapsing -- happens DURING the body, so a value captured at entry would report `held`
+    for work that lost its seat ten minutes in. The caller reads it after the body, which is the
+    only moment at which the answer is complete.
+
+    `forge` may be a FACTORY, so a caller whose forge construction can itself fail -- reading a
+    declared repository, say -- is not forced to build one before finding out whether it needs one.
+    An unbounded tool must not pay a round trip, or a config read, for its exemption.
+
+    Args:
+        job_class: e.g. `vendor:jmag`. Anything naming no seated tool yields `n/a` immediately.
+        when_unreachable: `REFUSE_WHEN_UNREACHABLE` or `PROCEED_WHEN_UNREACHABLE`. NO DEFAULT.
+
+    Raises:
+        SeatRefused: no seat now, the tool is declared nowhere, no pool exists, the arbitration is
+            unsound, or the forge is unreachable and the caller chose to refuse.
+    """
+    if when_unreachable not in (REFUSE_WHEN_UNREACHABLE, PROCEED_WHEN_UNREACHABLE):
+        msg = (
+            f'{when_unreachable!r} is not an unreachable-forge policy; expected '
+            f'{REFUSE_WHEN_UNREACHABLE!r} or {PROCEED_WHEN_UNREACHABLE!r}. There is no default '
+            f'because both are defensible and the choice belongs to whoever owns the licence.'
+        )
+        raise ValueError(msg)
+
+    tool = tool_of(job_class)
+    if tool is None:
+        yield lambda: SEATS_NOT_APPLICABLE
+        return
+
+    if catalog.is_unlimited(tool):
+        # NO FORGE CONTACT AT ALL on this path, and it is the property worth stating: declaring a
+        # tool unlimited must not make local work depend on a remote being up. An exemption that
+        # cost a round trip would be a declaration meant to REMOVE a constraint that added one.
+        yield lambda: SEATS_UNLIMITED
+        return
+
+    try:
+        seats_for_tool = catalog.seats(tool)
+    except UnknownTool as exc:
+        raise SeatRefused(str(exc)) from exc
+
+    def _unreachable(exc: Exception):
+        if when_unreachable == REFUSE_WHEN_UNREACHABLE:
+            msg = f'the forge is unreachable, so {tool!r} seats cannot be arbitrated: {exc}'
+            raise SeatRefused(msg) from exc
+        return lambda: SEATS_UNARBITRATED
+
+    try:
+        resolved = forge() if callable(forge) else forge
+        item = find_seat_item(resolved, namespace=namespace, tool=tool)
+    except (ForgeError, OSError) as exc:
+        yield _unreachable(exc)
+        return
+
+    if item is NOT_VISIBLE:
+        msg = (
+            f'no seat pool exists for {tool!r} in {namespace!r}. A runner may not create one -- '
+            f'concurrent creation is how {seats_for_tool} seats become {seats_for_tool} PER RUNNER '
+            f'-- so the submitter provisions it once, with `provision_seat_item`.'
+        )
+        raise SeatRefused(msg)
+
+    pool = SeatPool(resolved, tool=tool, item_number=item, catalog=catalog, lease_seconds=lease_seconds)
+    try:
+        held = pool.acquire(owner=owner)
+    except ArbitrationUnsound as exc:
+        # NOT AN OUTAGE, AND IT MUST NOT BE FILED AS ONE. This means the backend did not return its
+        # own completed write -- the precondition the whole protocol rests on. A fleet arbitrating
+        # on a store like that grants one seat to several holders, each of them certain. Reported as
+        # an outage, an operator looks at the network and the double-grant goes on.
+        msg = (
+            f'the forge did not return its own write while arbitrating {tool!r} seats: {exc}. This '
+            f'is not an outage -- it is the precondition the protocol requires.'
+        )
+        raise SeatRefused(msg) from exc
+    except (ForgeError, OSError) as exc:
+        yield _unreachable(exc)
+        return
+
+    if held is None:
+        holders = pool.holders()
+        msg = (
+            f'all {seats_for_tool} fleet seat(s) for {tool!r} are held right now '
+            f'({holders.occupied} visible holder(s): {sorted(c.owner for c in holders)}). This is '
+            f'"not now", not "never" -- a seat frees within {lease_seconds:.0f}s of a holder stopping.'
+        )
+        raise SeatRefused(msg)
+
+    # THE CADENCE COMES FROM `beat_interval`, NEVER FROM A NUMBER CHOSEN HERE. The consumer this was
+    # lifted out of derived `lease / 8` of its own, which is the second-spelling defect that
+    # function's docstring exists to forbid -- written by someone who had read it.
+    with Beater(held.renew, interval=beat_interval(lease_seconds)) as beater:
+        try:
+            yield lambda: SEATS_LOST if beater.lost else SEATS_HELD
+        finally:
+            # OWNER-CHECKED AND IDEMPOTENT in the claim layer, and a no-op if the lease was already
+            # lost -- so giving back a seat we no longer hold cannot evict whoever got it next.
+            with contextlib.suppress(LeaseLost, ForgeError, OSError):
+                held.release()

@@ -53,6 +53,13 @@ LAYERS: dict[str, int] = {
     # DRIVER -- the outside world and its stand-ins.
     'credentials': DRIVER,
     'forge': DRIVER,
+    # DRIVER because of `_origin_url`, and the placement is FORCED rather than chosen: `policy`
+    # cross-checks a declared repository against `git remote get-url origin`, which is a subprocess
+    # against the outside world. Everything ELSE in it is a decision -- precedence, and the refusal
+    # when the two disagree -- and that half deliberately takes a MAPPING somebody else parsed, so a
+    # consumer reading TOML, JSON or a database reaches the same code. Reading the FILE is the
+    # consumer's job: this layer decides, it does not reach for a path it was never told.
+    'policy': DRIVER,
     'testing': DRIVER,
     # JOB -- the layer this package exists to be.
     # FORCED, NOT CHOSEN, and the arrow is what forces it: both adapters take a `Job`, so a DRIVER

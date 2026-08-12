@@ -84,10 +84,12 @@ offering three of the four is offering a choice that does not exist.
 
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from agent_swarm.forge import CommentGone, Forge
+from agent_swarm.forge import CommentGone, Forge, ForgeError
 
 #: The first word of a claim comment. Human-readable on purpose: the forge is also the UI, and an
 #: operator scrolling an issue should be able to see who holds it and until when without a tool.
@@ -467,3 +469,82 @@ class Arbiter:
         ]
         live.sort(key=lambda claim: claim.comment_id)
         return live
+
+
+class Beater:
+    """Keeps a lease alive while work runs, and TELLS THE CALLER when it cannot.
+
+    WHY IT LIVES HERE AND NOT IN A CLI, which is where it was until 2026-08-12. It was a nested
+    class inside `workbench_cli`, reachable only by importing a command-line interface, so the
+    second consumer that needed one -- a gate holding a licence seat, in another repository --
+    wrote its own forty lines instead. That copy reproduced the EXACT defect this class's docstring
+    already records below: it derived its own cadence (`lease / 8`) rather than calling
+    `beat_interval`, whose own docstring says "anything needing the cadence calls this; nothing
+    derives it again". A mechanism nobody can find is a mechanism that gets rewritten, and it gets
+    rewritten with the bugs the original already paid for. It belongs beside `beat_interval` and
+    `Held`, which is what it operates on.
+
+    A DAEMON THREAD, so it cannot keep this process alive past its work -- the whole promise is that
+    closing the terminal loses the claim, and a non-daemon beater would be a thread politely holding
+    it open while nobody is watching.
+
+    **A LOST LEASE IS NOT LOGGED AND SHRUGGED OFF.** When the beat raises, another executor may
+    already have taken the work, so continuing to run is doing work whose answer somebody else will
+    publish. `on_lost` is called and the caller acts. That is the difference between a heartbeat and
+    a progress bar: this one has consequences. `lost` is also readable afterwards, for a caller
+    whose consequence is not "kill the child" but "say so in the verdict".
+
+    **IT BEATS ON THE CADENCE THE CLAIM DEFINES**, never on a number chosen here. This class ALREADY
+    GOT THAT WRONG once: it floored its own interval at 1.0 s, so against any lease under four
+    seconds the first beat landed after the lease had already expired -- a heartbeat that cannot
+    fire in time, which reads in a diff exactly like one that can. The floor never bound at the
+    production lease, so only a test with a short lease exposed it.
+
+    Args:
+        beat: what to call to renew. A CALLABLE rather than a ticket or a `Held`, because the two
+            real consumers hold different objects -- `Ticket.beat` and `Held.renew` -- and a
+            parameter typed to one of them is what sent the other away to write a copy.
+        on_lost: called once, on the thread, with the `LeaseLost`. Defaults to doing nothing, for
+            the caller whose response is to READ `lost` afterwards.
+        interval: from `beat_interval(lease_seconds)`, or a store's `beat_every`. Not derived here.
+    """
+
+    def __init__(
+        self,
+        beat: Callable[[], object],
+        *,
+        interval: float,
+        on_lost: Callable[[LeaseLost], object] | None = None,
+    ) -> None:
+        self.beat = beat
+        self.on_lost = on_lost
+        self.interval = interval
+        self.lost: LeaseLost | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name='claim-beater', daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.beat()
+            except LeaseLost as exc:
+                self.lost = exc
+                if self.on_lost is not None:
+                    self.on_lost(exc)
+                return
+            except ForgeError:
+                # A TRANSIENT FAILURE IS NOT A LOST LEASE, and treating it as one would kill healthy
+                # work every time the forge hiccups. The lease is what bounds this: beats run at a
+                # quarter of it, so three consecutive failures can be absorbed before the claim
+                # genuinely lapses -- and if they keep failing, `renew` refuses before its own write
+                # once `is_live()` is false and raises LeaseLost, so the branch above fires. Silence
+                # here is bounded by that, not by hope.
+                continue
+
+    def __enter__(self) -> Beater:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=self.interval)

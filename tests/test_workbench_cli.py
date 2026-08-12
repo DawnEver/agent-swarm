@@ -319,10 +319,15 @@ class TestTheBeaterKeepsTheClaimAndStopsTheWorkWhenItCannot:
         """A non-daemon beater would politely hold a claim open while nobody is watching -- the
         parking defect, reintroduced by the mechanism that exists to prevent it.
         """
-        from agent_swarm.workbench_cli import Beater  # noqa: PLC0415 -- reading an attribute, not binding a process
+        from agent_swarm.claim import Beater  # noqa: PLC0415 -- reading an attribute, not binding a process
 
+        # IMPORTED FROM `claim`, ITS HOME SINCE 2026-08-12. It was a nested class in the CLI, where
+        # the only way to reach it was to import a command-line interface -- so the next consumer
+        # that needed a heartbeat wrote its own, in another repository, deriving its own cadence in
+        # exactly the way `beat_interval` exists to forbid. The assertion is unchanged; only the
+        # address is.
         beater = Beater.__new__(Beater)
-        beater.__init__(ticket=None, on_lost=lambda _e: None, interval=999.0)
+        beater.__init__(lambda: None, on_lost=lambda _e: None, interval=999.0)
         assert beater._thread.daemon is True
 
     def test_the_lease_this_CLI_uses_is_SHORT_enough_that_a_closed_terminal_frees_the_work(self):
