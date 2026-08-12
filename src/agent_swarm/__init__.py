@@ -45,6 +45,7 @@ from agent_swarm import (
     pull,
     refs,
     roadmap,
+    scaling,
     seats,
     shards,
     spool,
@@ -75,7 +76,15 @@ from agent_swarm.exclusive import (
     read_owner,
 )
 from agent_swarm.job import AGENT_TASK, COMPUTE, TEST_RUN, Job, JobKind
-from agent_swarm.loop import Box, Executor, Outcome, run_one
+from agent_swarm.loop import Box, Executor, Outcome, RegulatedExecutor, RegulatedRun, run_one, run_regulated
+from agent_swarm.scaling import (
+    Adjustment,
+    CapacityUnreadable,
+    Regulation,
+    Regulator,
+    WidthNotHonoured,
+    workers_for,
+)
 from agent_swarm.store import VERDICTS, InMemoryStore, Store
 
 __all__ = [
@@ -87,7 +96,9 @@ __all__ = [
     'VENDOR_PREFIX',
     'VERDICTS',
     'WHOLE_BOX',
+    'Adjustment',
     'Box',
+    'CapacityUnreadable',
     'Executor',
     'InMemoryStore',
     'Job',
@@ -95,14 +106,19 @@ __all__ = [
     'LockBusy',
     'LockOwner',
     'Outcome',
+    'RegulatedExecutor',
+    'RegulatedRun',
+    'Regulation',
+    'Regulator',
     'Store',
+    'WidthNotHonoured',
     'adapters',
     'admission',
     'admission_blockers',
     'agent_executor',
     'allocator',
-    'claim',
     'capacity_blocker',
+    'claim',
     'claim_key',
     'classes_conflict',
     'exclusive',
@@ -123,6 +139,8 @@ __all__ = [
     'refs',
     'roadmap',
     'run_one',
+    'run_regulated',
+    'scaling',
     'seats',
     'shards',
     'should_retry',
@@ -131,4 +149,5 @@ __all__ = [
     'status',
     'store',
     'time_blocker',
+    'workers_for',
 ]

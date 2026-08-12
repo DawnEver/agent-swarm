@@ -36,12 +36,21 @@ THE CALLER CAN ALWAYS TELL WHAT HAPPENED. `run_one` returns an :class:`Outcome` 
 one -- a warning on an unchanged success return is the forbidden shape, and a scheduler that cannot
 distinguish "refused, try later" from "someone else has it" from "the box died" cannot make its
 next decision.
+
+ADMISSION IS THE DOOR; `scaling` IS THE ROOM. `Box.blockers` is asked ONCE, before the claim, so the
+fleet's whole answer to "this workstation just got busy" was to decline the NEXT item while the job
+already running kept the machine. `run_regulated` is the same ordering with a capacity RE-READ
+inside it: the width of a run in flight follows the box, and the reduction reaches the caller in
+:class:`RegulatedRun` rather than in a log. It is the SAME loop -- both entry points go through one
+`_run`, because two copies of this ordering would be two copies free to drift about the one thing
+the ordering exists to guarantee.
 """
 
 from __future__ import annotations
 
 import enum
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -52,6 +61,7 @@ from agent_swarm.admission import (
     time_blocker,
 )
 from agent_swarm.job import Job
+from agent_swarm.scaling import Adjustment, Regulator
 from agent_swarm.store import VERDICTS, Store
 
 
@@ -76,6 +86,27 @@ class Executor(Protocol):
 
     def execute(self, job: Job) -> tuple[str, str]:
         """Do the work and return ``(verdict, detail)``. ``verdict`` must be in :data:`VERDICTS`."""
+        ...
+
+
+@runtime_checkable
+class RegulatedExecutor(Protocol):
+    """An executor that can be RESIZED while it runs. A SEPARATE protocol, deliberately.
+
+    Widening `Executor` with an optional regulator argument would make "regulated" the property of a
+    call rather than of an executor, and every existing implementation would silently claim a
+    capability it does not have. Here the type says it: something that cannot narrow itself cannot
+    be passed to `run_regulated`.
+    """
+
+    def execute(self, job: Job, regulator: Regulator) -> tuple[str, str]:
+        """Do the work, polling ``regulator`` at every safe point, and return ``(verdict, detail)``.
+
+        THE POLL IS THE CONTRACT. Each `reading()` re-reads capacity and grants a width; each grant
+        must be answered with `honour(...)`, and a grant of zero means STOP -- the box has been
+        taken by other work and the honest answer is INCONCLUSIVE, not a result produced on a
+        machine that no longer had room for it.
+        """
         ...
 
 
@@ -131,6 +162,102 @@ def run_one(job: Job, *, executor: Executor, store: Store, owner: str, box: Box,
     ``retry`` is the caller's decision and must stay so. INCONCLUSIVE is exactly the verdict worth
     re-running, and `admission.should_retry` already prices how often; deciding that here would put
     the retry policy in two places, which is how the two disagree.
+
+    THE WIDTH OF THIS RUN IS FIXED FOR ITS WHOLE LIFE. That is correct for work that cannot be
+    resized and wrong for work that can -- see `run_regulated`, which is this function with a
+    capacity re-read.
+    """
+    return _run(job, lambda: executor.execute(job), store=store, owner=owner, box=box, retry=retry)
+
+
+@dataclass(frozen=True, slots=True)
+class RegulatedRun:
+    """What one REGULATED turn did, including every width change along the way.
+
+    THE REDUCTION IS IN THE RETURN OR IT DID NOT HAPPEN. A regulator that shrank a run and logged it
+    is the forbidden shape with extra machinery: the caller -- the thing deciding what to start
+    next, and what this box is worth -- must be able to read that this run gave capacity back.
+
+    Attributes:
+        outcome: exactly as `run_one`'s, so a caller can treat both paths alike.
+        adjustments: every reading taken, in order. EMPTY when the job never ran (refused, already
+            answered, claimed by another), which is the honest answer: nothing was regulated.
+        final_workers: the width the executor last said it ADOPTED, or ``None`` if it never ran.
+            NOT the last GRANT, and the difference is the whole handshake: a grant is a ceiling the
+            executor may undercut, so reporting it would be reporting permission as if it were
+            behaviour -- the same distance between a log line and a measurement.
+    """
+
+    outcome: Outcome
+    adjustments: tuple[Adjustment, ...] = ()
+    final_workers: int | None = None
+
+    @property
+    def yielded(self) -> bool:
+        """Did this run give the box back mid-flight? A DIFFERENT EVENT FROM A CRASH.
+
+        An INCONCLUSIVE from a yield says "someone else needed this machine"; one from a crash says
+        "this box fell over". Collapsing them would make a fleet that is politely sharing look
+        exactly like a fleet that is breaking.
+        """
+        return any(a.workers == 0 for a in self.adjustments)
+
+
+def run_regulated(
+    job: Job,
+    *,
+    executor: RegulatedExecutor,
+    store: Store,
+    owner: str,
+    box: Box,
+    regulator: Regulator,
+    retry: bool = False,
+) -> RegulatedRun:
+    """`run_one`, plus a capacity RE-READ for as long as the job runs.
+
+    THE DOOR IS UNCHANGED. Admission still decides whether this job may START here, in the same
+    order, before the claim: regulation is added to the middle and does not reopen the entry
+    decision. A job the door refuses is refused with no reading taken at all.
+
+    WHAT THE REGULATOR CHANGES is everything after the claim. The executor polls at its own safe
+    points; each poll re-reads capacity and returns a width. A width of zero is a YIELD -- the box
+    has been taken by other work -- and the executor is expected to stop and answer INCONCLUSIVE,
+    which is what it has actually established about the code.
+
+    A REDUCTION THAT CANNOT BE HONOURED IS A CRASH, NOT A WARNING. `Regulator.honour` refuses a
+    width above the grant and `close()` refuses an unanswered final grant, both by raising; the
+    raise lands in the same broad handler that catches an executor dying, so the run records
+    INCONCLUSIVE and the caller reads `Outcome.CRASHED`. Nothing is swallowed and nothing continues:
+    a regulator whose grants can be ignored is decoration, and decoration on this path is worse than
+    an entry gate alone, because it reads as a mechanism.
+
+    `close()` RUNS BEFORE THE VERDICT IS ACCEPTED, inside the executor call, so an executor that
+    ignored its last grant cannot deliver a PASS on the way out.
+    """
+
+    def call() -> tuple[str, str]:
+        verdict, detail = executor.execute(job, regulator)
+        regulator.close()
+        return verdict, detail
+
+    outcome = _run(job, call, store=store, owner=owner, box=box, retry=retry)
+    adjustments = regulator.adjustments
+    # `None` rather than the regulator's resting width when nothing ran: a job the door refused was
+    # not regulated at all, and reporting the width it WOULD have had is a number about nothing.
+    return RegulatedRun(
+        outcome=outcome,
+        adjustments=adjustments,
+        final_workers=regulator.workers if adjustments else None,
+    )
+
+
+def _run(job: Job, call: Callable[[], tuple[str, str]], *, store: Store, owner: str, box: Box, retry: bool) -> Outcome:
+    """THE ONE ORDERING, shared by every entry point. See the module docstring for why each step sits
+    where it does; there is nothing here that is not one of those four rules.
+
+    A SINGLE COPY BECAUSE THE ORDERING IS THE CONTRACT. A second entry point re-spelling
+    admit-claim-execute-record-release would be two implementations of the one guarantee this layer
+    was extracted to provide, and they would diverge at the step nobody re-read.
     """
     if box.blockers(job):
         return Outcome.REFUSED
@@ -144,7 +271,7 @@ def run_one(job: Job, *, executor: Executor, store: Store, owner: str, box: Box,
         # worse, would swallow OUR OWN bad-verdict error into an INCONCLUSIVE, which is precisely
         # the fourth-state-laundered-into-a-third the vocabulary exists to prevent.
         try:
-            verdict, detail = executor.execute(job)
+            verdict, detail = call()
         except Exception:  # noqa: BLE001 -- ANY executor failure must still free the claim
             store.record_verdict(job, verdict='INCONCLUSIVE', detail=traceback.format_exc())
             return Outcome.CRASHED

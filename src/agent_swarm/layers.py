@@ -52,6 +52,11 @@ LAYERS: dict[str, int] = {
     # the account scheme had grown FOUR spellings precisely because the fact sat too high for the
     # lowest consumer to reach, so `forge` grew its own literals instead.
     'roles': HOST,
+    # HOST, and the placement is FORCED by the arrow rather than chosen: `loop` (JOB) imports it, so
+    # anything higher would point up. It also earns the placement on the layer's own definition --
+    # it speaks about free memory and worker counts and knows nothing about issues, verdicts or
+    # jobs, and its capacity source ARRIVES as a callable rather than being reached for.
+    'scaling': HOST,
     'provenance': HOST,
     # HOST, and the placement follows the layer's definition rather than the word "verdict" in its
     # docstring: it measures a MACHINE -- this interpreter, this installed set, these files on this
