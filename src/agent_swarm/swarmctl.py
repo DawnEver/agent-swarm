@@ -210,6 +210,19 @@ def _old_name_of(role: str) -> str | None:
 #: kept "in case" is a claim that something still uses it.
 
 
+EXIT_INCOMPLETE = 2
+"""`verify` looked at only part of the deployment. NEITHER a pass NOR a failure.
+
+THE THIRD VALUE EXISTS BECAUSE COLLAPSING IT LIES IN BOTH DIRECTIONS. `0` claims a deployment is
+correct that nobody read; `1` accuses one that nobody read. The same distinction `gate.py` draws
+with INCONCLUSIVE, for the same reason: a run that could not look is evidence about the RUNNER, not
+about the subject.
+
+Measured 2026-08-12 on the Gitea host: `verify` hit the no-admin-credential arm and exited 0 with
+`configuration problems: none`, having read no team, no membership and no branch protection.
+"""
+
+
 class Fail(RuntimeError):
     """Something the operator must fix. NEVER carries a token."""
 
@@ -348,18 +361,52 @@ class GiteaProvider:
     def delete_user(self, username: str) -> None:
         self._cli('admin', 'user', 'delete', '--username', username, '--purge')
 
+    #: Gitea's refusal when a token of that name already exists on the SERVER. Matched as a
+    #: substring of the CLI's stderr, which is the only place it appears.
+    _NAME_TAKEN = 'has been used already'
+
     def issue_token(self, username: str, token_name: str, scopes: list[str]) -> str:
-        out = self._cli(
-            'admin',
-            'user',
-            'generate-access-token',
-            '--username',
-            username,
-            '--token-name',
-            token_name,
-            '--scopes',
-            ','.join(scopes),
-        )
+        """Mint a token, or REFUSE WITH A REMEDY when the name is already taken on the server.
+
+        THE THIRD STATE, MEASURED 2026-08-12 ON THE GITEA HOST. `token()`'s self-heal covers
+        "stored locally, revoked server-side": the 401 erases the local copy and the next run mints
+        afresh. It does NOT cover the mirror image -- **present on the SERVER, absent from the local
+        store** -- which is what a cleared credential store, a re-imaged box, or a mint whose store
+        write was lost all leave behind.
+
+        In that state every run tries the same name, Gitea refuses it, and the box is WEDGED
+        PERMANENTLY. Nothing in the old message said so: the operator saw a raw CLI error naming a
+        token they cannot see, with no way to get from there to a working machine. And the token
+        itself is unrecoverable -- Gitea shows a value once -- so "just find it" is not available.
+
+        The remedy has to be revoke-then-remint, and it must be NAMED HERE, because this is the
+        only place that knows both the token name and the host it belongs to.
+        """
+        try:
+            out = self._cli(
+                'admin',
+                'user',
+                'generate-access-token',
+                '--username',
+                username,
+                '--token-name',
+                token_name,
+                '--scopes',
+                ','.join(scopes),
+            )
+        except Fail as exc:
+            if self._NAME_TAKEN not in str(exc):
+                raise
+            msg = (
+                f'a token named {token_name!r} already exists on the SERVER, but this machine has\n'
+                f'  no copy of it. Gitea shows a token value once, so it cannot be recovered -- and\n'
+                f'  every run will fail here identically until the server-side one is removed.\n'
+                f'  On the Gitea host, revoke it and let the next run mint a fresh one:\n'
+                f'      swarmctl revoke --token-name {token_name}\n'
+                f'  This is NOT a login failure and NOT a scope problem: the credential is fine,\n'
+                f'  there are simply two halves of one pairing and only the server has its half.'
+            )
+            raise Fail(msg) from exc
         for line in out.splitlines():
             if 'successfully created:' in line:
                 return line.rsplit(':', 1)[1].strip()
@@ -1325,11 +1372,28 @@ def cmd_verify(provider: GiteaProvider, args: argparse.Namespace) -> int:
     except Fail as failure:
         # NOT counted as a configuration problem: it is not a fault in the deployment, it is this
         # machine lacking an admin credential -- the NORMAL state everywhere except the host.
+        #
+        # BUT IT IS NOT A PASS EITHER, AND THAT WAS THE BUG. This arm used to print
+        # `configuration problems: none` and return 0 -- so `verify` answered "the fleet is
+        # configured correctly" on a run where it never looked at a single team. The `not checked
+        # from here` line above was already printed, and it changed nothing: A LOG IS NOT A SIGNAL,
+        # and the test is whether the CALLER can tell. A caller reads the exit code.
+        #
+        # MEASURED 2026-08-12 on the Gitea host: exactly this arm fired (the admin mint failed on a
+        # taken token name), and `verify` exited 0 saying `configuration problems: none`. Three
+        # quarters of what it claims to verify -- teams, membership, branch protection -- had not
+        # been read at all.
+        #
+        # THREE-VALUED, because "could not check" is not "checked and fine" and not "checked and
+        # broken". Collapsing it into either one is a lie in a different direction: 0 says the
+        # deployment is good, 1 accuses a deployment nobody looked at.
         say()
         say(f'TEAMS and PROTECTION: not checked from here -- {failure}')
         say()
-        say('configuration problems: ' + (str(len(problems)) if problems else 'none'))
-        return 1 if problems else 0
+        say(f'configuration problems: {len(problems) if problems else "none"} AMONG WHAT WAS CHECKED')
+        say('  INCOMPLETE: teams, membership and branch protection were NOT read. This is not a pass.')
+        say('  Run this on the Gitea host, or get a credential with:  swarmctl admin-emit --machine <this box>')
+        return 1 if problems else EXIT_INCOMPLETE
 
     for role, (units, _scopes) in ROLES.items():
         team_name = TEAMS[role]

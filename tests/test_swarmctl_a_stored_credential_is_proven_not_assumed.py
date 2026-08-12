@@ -361,11 +361,25 @@ def test_a_machine_without_an_admin_credential_still_gets_its_CREDENTIALS_sectio
 def test_the_missing_admin_credential_is_not_counted_as_a_deployment_problem(swarmctl, capsys):
     """It is the NORMAL state everywhere except the host. Counting it would make every fleet
     machine report a problem it cannot fix and should not care about.
+
+    CONTRACT CHANGED 2026-08-12, AND THIS TEST'S INTENT IS PRESERVED RATHER THAN OVERRIDDEN. It
+    asserted `== 0`, which said two things at once: "not a deployment problem" -- true, and the
+    point of this test -- and "this run is a PASS" -- false, because teams, membership and branch
+    protection were never read. Measured on the Gitea host: `verify` exited 0 printing
+    `configuration problems: none` having looked at none of them, and a caller reads the exit code.
+
+    The two meanings are now separate. `!= 1` is this test's original claim, intact: the deployment
+    is not blamed. `EXIT_INCOMPLETE` is the part that stops a script reading "the fleet checks out"
+    off a run that checked a quarter of it.
     """
     provider = _NoAdmin(swarmctl, dict.fromkeys(swarmctl.USERS.values(), True))
     args = argparse.Namespace(repo='Org/repo', branch='main', status_context='someproject/gate')
-    assert swarmctl.cmd_verify(provider, args) == 0
-    assert 'configuration problems: none' in capsys.readouterr().out
+    code = swarmctl.cmd_verify(provider, args)
+    assert code != 1, 'a machine without an admin credential was blamed for the deployment'
+    assert code == swarmctl.EXIT_INCOMPLETE
+    out = capsys.readouterr().out
+    assert 'AMONG WHAT WAS CHECKED' in out, 'the count is presented as if it covered everything'
+    assert 'INCOMPLETE' in out
 
 
 def test_a_REFUSED_credential_still_fails_on_such_a_machine(swarmctl, capsys):
