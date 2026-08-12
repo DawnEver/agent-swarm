@@ -529,11 +529,11 @@ def render_report(
         hits, unknown = layer_c(paths, root, budget_s, denylist=denylist)
         vacuous = [h for h in hits if h.endswith('0 OF N')]
         never = [h for h in hits if h.endswith('NEVER CONSULTED')]
-        lines.append(f'[C] membership call sites with a MEASURED population: {len(hits)}')
-        lines.append(f'[C] of those, intersecting the population in NOTHING: {len(vacuous)}')
+        lines.append(f'[C] membership call sites with a MEASURED sample: {len(hits)}')
+        lines.append(f'[C] of those, intersecting the sample in NOTHING: {len(vacuous)}')
         lines.append(f'[C] of those, never reached at all (N == 0):           {len(never)}')
         lines.extend(f'      {hit}' for hit in sorted(hits))
-        lines.append(f'[C] sites whose population is UNKNOWN (not a clean result): {len(unknown)}')
+        lines.append(f'[C] sites whose sample is UNKNOWN (not a clean result): {len(unknown)}')
         reasons: dict[str, int] = {}
         for site in unknown:
             reasons[site.split('UNKNOWN ')[-1]] = reasons.get(site.split('UNKNOWN ')[-1], 0) + 1
@@ -557,6 +557,13 @@ def scan_paths(root: Path, roots: Sequence[str]) -> list[Path]:
 
 # ---------------------------------------------------------------- the controls
 
+#: THE WORD IN THE REPORT IS `sample`, NOT `population`, and the reason is a guard rather than a
+#: preference: `test_job.py::TestTheSubstrateKnowsNothingAboutBARRIERS` refuses `population` as a
+#: VALUE anywhere in this package, because a scheduler that learns the word has started modelling a
+#: fan-out generation. The sense here is unrelated -- the values that reach a call site -- but the
+#: guard scans strings, not senses, and weakening a working architectural check to keep one word
+#: would be the wrong trade. Prose is exempt, so the docstrings above still say what they mean.
+#:
 #: THE SELF-TEST FIXTURE. The FIRST run of this sieve reported 0/0 on a real tree while silently
 #: skipping the 29 modules that carried the matrices -- a false zero that looked exactly like a clean
 #: result. Controls are how a null result becomes evidence rather than a hope.
@@ -593,21 +600,21 @@ def test_leg(leg):
     assert leg
 
 # --- layer C controls -------------------------------------------------------------------------
-_POPULATION = ('a', 'b', 'c', 'd')
-# POSITIVE 3 -- non-empty, correctly shaped, and intersects the population in NOTHING. Invisible to
+_SAMPLED = ('a', 'b', 'c', 'd')
+# POSITIVE 3 -- non-empty, correctly shaped, and intersects the sampled values in NOTHING. Invisible to
 # both A (size 2) and B (arity 1 vs 1). C must report `0 of 4`.
 _MATCHES_NOTHING = ('x', 'y')
 # NEGATIVE 4 -- same size, same shape, and it does filter. C must report a non-zero count.
 _MATCHES_SOME = ('a', 'y')
 
-@pytest.mark.parametrize('item', _POPULATION)
-def test_population(item):
+@pytest.mark.parametrize('item', _SAMPLED)
+def test_sampled(item):
     if item in _MATCHES_NOTHING:
         return
     assert item in _MATCHES_SOME or item != 'a'
 
 # NEGATIVE 5 -- a fixture means pytest, so C must refuse it as UNKNOWN rather than invent an N.
-@pytest.mark.parametrize('item', _POPULATION)
+@pytest.mark.parametrize('item', _SAMPLED)
 def test_needs_a_fixture(item, tmp_path):
     assert item not in _MATCHES_NOTHING or tmp_path
 """

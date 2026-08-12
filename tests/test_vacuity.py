@@ -126,6 +126,6 @@ def test_the_report_says_UNKNOWN_even_when_the_measured_numbers_are_clean(tmp_pa
         denylist=frozenset(),
     )
     text = '\n'.join(lines)
-    assert 'MEASURED population: 0' in text
+    assert 'MEASURED sample: 0' in text
     assert 'UNKNOWN (not a clean result): 1' in text
     assert 'takes fixture(s)' in text

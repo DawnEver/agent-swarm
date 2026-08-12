@@ -390,7 +390,7 @@ def _table(title: str, items: list[tuple[str, Stats]], top: int) -> list[str]:
 
 
 def _censored_lines(corpus: Corpus, order: Mapping[str, int]) -> list[str]:
-    out = ['CENSORED POPULATION -- killed or timed out; the durations table never sees these']
+    out = ['CENSORED TESTS -- killed or timed out; the durations table never sees these']
     if not corpus.events:
         out.append('none found in the logs read (looked and found none, not "did not look")')
         return out

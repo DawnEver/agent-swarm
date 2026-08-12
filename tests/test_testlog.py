@@ -175,7 +175,7 @@ def test_a_killed_test_is_reported_with_zero_surviving_duration_rows(tmp_path: P
     its surviving-row count is 0 even though other tests' rows exist in the corpus.
     """
     corpus = _load([_write(tmp_path, 'a.log', _LOG_A), _write(tmp_path, 't.log', _LOG_TIMEOUT)])
-    censored = testlog.render(corpus).split('CENSORED POPULATION', 1)[1]
+    censored = testlog.render(corpus).split('CENSORED TESTS', 1)[1]
     assert _KILLED_ID in censored
     line = next(line for line in censored.splitlines() if _KILLED_ID in line)
     assert '0 surviving call row(s)' in line
@@ -187,7 +187,7 @@ def test_the_killed_test_never_enters_the_survivor_tables(tmp_path: Path):
     tables would be a cost figure for a run that never finished.
     """
     corpus = _load([_write(tmp_path, 'a.log', _LOG_A), _write(tmp_path, 't.log', _LOG_TIMEOUT)])
-    survivors = testlog.render(corpus).split('CENSORED POPULATION', 1)[0]
+    survivors = testlog.render(corpus).split('CENSORED TESTS', 1)[0]
     assert _KILLED_ID not in survivors
 
 
@@ -301,7 +301,7 @@ def test_a_node_down_long_after_a_timeout_is_a_second_death():
 def test_the_censored_section_says_so_when_empty(tmp_path: Path):
     """'Looked and found none' must not render identically to 'did not look'."""
     text = testlog.render(_load([_write(tmp_path, 'a.log', _LOG_A)]))
-    assert 'CENSORED POPULATION' in text
+    assert 'CENSORED TESTS' in text
     assert 'none found' in text
 
 
