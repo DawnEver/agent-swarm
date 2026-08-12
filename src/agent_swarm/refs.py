@@ -281,3 +281,62 @@ def group_attempt_key(name: str) -> str:
     because the two are written together and only this one is guaranteed.
     """
     return f'group-{name}'
+
+
+# --------------------------------------------------------------------------- the integration plane
+
+
+#: WHAT WAS PROPOSED. One ref per submission, named by its creation ordinal, written once and never
+#: again -- see :mod:`agent_swarm.submission` for the CAS that makes "never again" a property of the
+#: transport rather than a promise in a docstring.
+SUBMISSIONS_ROOT = 'refs/submissions'
+
+#: WHAT WAS DECIDED about a submission, and it is a SEPARATE namespace for the same reason the
+#: attempt namespace is separate from the verdict one. A submission is immutable, so its disposition
+#: cannot be written into it; and only a TERMINAL disposition is ever written here, which is what
+#: makes "still open" the absence of a ref rather than a state somebody has to remember to set.
+#: An INCONCLUSIVE run writes NOTHING -- see :func:`agent_swarm.integration.disposition_of`.
+OUTCOMES_ROOT = 'refs/integration/outcomes'
+
+
+def submission_ref(ordinal: int) -> str:
+    """Where submission `ordinal` lives. ONE segment: a submission is identified by nothing else.
+
+    Not by participant, deliberately. Keying on who sent it would make the global namespace cost
+    O(participants) and would let one participant's two submissions collide on a re-send, when the
+    only thing integration needs to know is the order they arrived in.
+    """
+    return f'{SUBMISSIONS_ROOT}/{ordinal}'
+
+
+def submission_glob() -> str:
+    return f'{SUBMISSIONS_ROOT}/*'
+
+
+def submission_ordinal(ref: str) -> int | None:
+    """The ordinal in `ref`, or `None` when the last segment is not one.
+
+    AN `int`, for `attempt_number`'s measured reason: a caller that sorted the segment as a string
+    would put 10 before 2, so from the tenth submission onward the "next" ordinal is one that has
+    already been taken -- and since taking a taken ordinal is REFUSED, submission would stop
+    entirely, for a reason visible nowhere in the refusal.
+    """
+    tail = ref.rsplit('/', 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def outcome_ref(ordinal: int) -> str:
+    """Where submission `ordinal`'s TERMINAL disposition lives, if it has one."""
+    return f'{OUTCOMES_ROOT}/{ordinal}'
+
+
+def outcome_glob() -> str:
+    return f'{OUTCOMES_ROOT}/*'
+
+
+def outcome_ordinal(ref: str) -> int | None:
+    """The ordinal a disposition belongs to, or `None`. Parsed like the submission it answers."""
+    if not ref.startswith(OUTCOMES_ROOT + '/'):
+        return None
+    tail = ref.rsplit('/', 1)[-1]
+    return int(tail) if tail.isdigit() else None

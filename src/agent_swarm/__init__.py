@@ -37,6 +37,7 @@ from agent_swarm import (
     exclusive,
     fabric,
     forge_store,
+    integration,
     item_index,
     job,
     layers,
@@ -51,6 +52,7 @@ from agent_swarm import (
     spool,
     status,
     store,
+    submission,
 )
 from agent_swarm.admission import (
     CHEAP,
@@ -126,6 +128,7 @@ __all__ = [
     'fabric',
     'forge_store',
     'is_known_class',
+    'integration',
     'item_index',
     'job',
     'layers',
@@ -148,6 +151,7 @@ __all__ = [
     'staleness_blocker',
     'status',
     'store',
+    'submission',
     'time_blocker',
     'workers_for',
 ]

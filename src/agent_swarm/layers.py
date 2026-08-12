@@ -127,6 +127,14 @@ LAYERS: dict[str, int] = {
     'refs': JOB,
     'roadmap': JOB,
     'seats': JOB,
+    # JOB, and the vocabulary test is what decides it: a base, a head and a declared intent crossing
+    # into the trunk are job words. It imports `refs` (JOB) and `refstore` (DRIVER), at or below it.
+    'submission': JOB,
+    # JOB, and NOT ENTRY even though it is the end of the road: nothing about it is operator-facing.
+    # It takes a store, a trunk name and an injected verdict function, and is meant to be called by
+    # a loop rather than typed. What keeps the placement true is that the verdict ARRIVES as a
+    # callable -- a module that reached for a test command would be speaking one consumer's language.
+    'integration': JOB,
     # JOB because the three words it folds -- PASS, FAIL, INCONCLUSIVE -- are the verdict
     # vocabulary. It imports nothing; the placement is about what it SPEAKS, not what it needs.
     'shards': JOB,
