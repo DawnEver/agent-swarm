@@ -67,6 +67,10 @@ LAYERS: dict[str, int] = {
     # verdict, no runner -- and the two facts that WOULD be a consumer's (the replay denylist, the
     # directories to scan) arrive as arguments rather than being reached for.
     'vacuity': HOST,
+    # HOST: file names, file contents, a declared map and a git diff. It knows nothing about issues
+    # or verdicts, and every fact that would be a consumer's -- where its source and tests live,
+    # which prefixes are scanned, which tests are expensive -- arrives as an argument.
+    'selection': HOST,
     # HOST, and the placement follows the layer's definition rather than the word "verdict" in its
     # docstring: it measures a MACHINE -- this interpreter, this installed set, these files on this
     # disk -- and knows nothing about issues, jobs or who is asking. Its two project facts (which
