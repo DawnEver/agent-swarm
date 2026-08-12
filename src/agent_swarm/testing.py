@@ -32,11 +32,12 @@ VERSIONED, and the version is not decoration -- see :data:`DOUBLE_MODEL_VERSION`
 
 from __future__ import annotations
 
+import fnmatch
+import threading
 from collections.abc import Sequence
 
-import threading
-
 from agent_swarm.forge import ROLE_ACCOUNTS, STATUS_STATES, Comment, CommentGone, ForgeError, WorkItem
+from agent_swarm.refstore import RefUnreachable
 
 #: Bumped whenever this double's MODEL of the forge changes -- a new adverse property, a corrected
 #: identity, a refuted simplification.
@@ -47,7 +48,7 @@ from agent_swarm.forge import ROLE_ACCOUNTS, STATUS_STATES, Comment, CommentGone
 #: older, gentler double while this repo's suite passes against the newer one -- two repos, one
 #: contract, two versions of the instrument. Asserting this constant makes a stale pin RED instead
 #: of quietly agreeable.
-DOUBLE_MODEL_VERSION = 5
+DOUBLE_MODEL_VERSION = 6
 
 
 class RecordingForge:
@@ -303,3 +304,95 @@ class RecordingForge:
             current = self.items[number]
             suffix = '' if current.title.endswith(' (retired)') else ' (retired)'
             self.items[number] = WorkItem(number=number, title=f'{current.title}{suffix}', state='closed')
+
+
+class InMemoryRefStore:
+    """An :class:`agent_swarm.refstore.RefStore` that behaves like git, including where git is
+    inconvenient.
+
+    THE ADVERSARIAL PROPERTY THAT MATTERS MOST IS THE GLOB, AND IT IS NOT THE ONE EVERYONE WRITES
+    DOWN. This double was FIRST WRITTEN with segment-bounded matching -- `*` stops at a `/` -- on
+    the strength of a sentence repeated in two repositories' comments. The audit below
+    (`test_the_double_has_the_SAME_glob_semantics`) ran it against a real bare remote and refuted
+    it. MEASURED 2026-08-12, git 2.x, `ls-remote`:
+
+        pattern                        refs/ci/heartbeat/boxA/17
+        refs/ci/heartbeat/*            MATCHES     -- `*` crosses `/`
+        refs/ci/heartbeat/*/*          matches
+        refs/ci/*                      MATCHES     -- and crosses two
+        boxA/17                        MATCHES     -- a TAIL, at a `/` boundary
+        17                             MATCHES     -- likewise
+        eartbeat/*                     no          -- a tail must start at a boundary
+        refs/ci/heartbeat/boxA         no          -- a prefix is not a tail
+
+    So the rule is: the pattern is fnmatch-ed (with `*` crossing `/`) against the whole refname OR
+    against any tail of it beginning after a `/`. A segment-bounded double is STRICTER than git,
+    which is the dangerous direction here -- it would have let a test assert that a pattern one
+    wildcard short finds nothing, when against the real remote it finds everything.
+
+    THE OTHER THREE, each paid for by being wrong first somewhere in this design:
+
+    * **Listing order is rotated**, not insertion order, so "the first one back" and "the newest
+      one" can never be the same function by accident -- the rule that made a string-sorted maximum
+      look correct until a digit count changed.
+    * **A write can be made to FAIL** (`fail_writes`), because the code path that matters most in
+      liveness is the one after a failed publish: pruning there empties the namespace and a healthy
+      box reads as dead.
+    * **A listing can be made UNREACHABLE** (`unreachable`), because "I could not ask" and "there is
+      nothing there" are different answers and the whole seam exists to keep them apart.
+
+    Deleting an absent ref is NOT an error, matching git: a prune that raced another prune has still
+    achieved what it wanted.
+    """
+
+    def __init__(self, *, head: str = 'a' * 40) -> None:
+        self.refs: dict[str, str] = {}
+        self._head = head
+        #: Set to a string to make every `write` fail with it as the transport's words.
+        self.fail_writes: str | None = None
+        #: Set to make every `list` raise, as an offline box does.
+        self.unreachable = False
+        #: Every write and delete, in order, so a test can assert the ORDER of a publish and its
+        #: prune -- which is the property that matters and is invisible in the final state.
+        self.log: list[str] = []
+
+    def head(self) -> str:
+        return self._head
+
+    @staticmethod
+    def _matches(ref: str, pattern: str) -> bool:
+        """Git's `ls-remote` glob, as MEASURED rather than as remembered -- see the class docstring.
+
+        The whole refname, or any tail of it starting after a `/`, fnmatch-ed against the pattern.
+        `fnmatch` is the right primitive precisely because its `*` crosses `/`, which git's does.
+        """
+        candidates = [ref, *(ref[i + 1 :] for i, ch in enumerate(ref) if ch == '/')]
+        return any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates)
+
+    def list(self, pattern: str) -> dict[str, str]:
+        if self.unreachable:
+            msg = f'cannot list {pattern!r}: the double was told the remote is unreachable'
+            raise RefUnreachable(msg)
+        found = [(ref, sha) for ref, sha in self.refs.items() if self._matches(ref, pattern)]
+        half = len(found) // 2
+        return dict(found[half:] + found[:half])
+
+    def write(self, ref: str, commit: str) -> tuple[bool, str]:
+        if self.fail_writes is not None:
+            self.log.append(f'FAILED write {ref}')
+            return False, self.fail_writes
+        self.refs[ref] = commit
+        self.log.append(f'write {ref}')
+        return True, ''
+
+    def delete(self, ref: str) -> bool:
+        """Reports whether the DELETE SUCCEEDED, which for git is true even when nothing was there.
+
+        MEASURED: `git push --delete` of a non-existent ref warns and exits 0. A double that
+        returned False for an absent ref would be reporting a distinction the real transport does
+        not make, and a caller written against it would branch on a value that is always True in
+        production.
+        """
+        self.log.append(f'delete {ref}')
+        self.refs.pop(ref, None)
+        return True

@@ -68,6 +68,9 @@ LAYERS: dict[str, int] = {
     # consumer reading TOML, JSON or a database reaches the same code. Reading the FILE is the
     # consumer's job: this layer decides, it does not reach for a path it was never told.
     'policy': DRIVER,
+    # DRIVER: it is a git remote behind a subprocess. The four-operation PROTOCOL could sit lower,
+    # but splitting a seam from its only real implementation buys nothing and costs a file.
+    'refstore': DRIVER,
     'testing': DRIVER,
     # JOB -- the layer this package exists to be.
     # FORCED, NOT CHOSEN, and the arrow is what forces it: both adapters take a `Job`, so a DRIVER
@@ -84,6 +87,9 @@ LAYERS: dict[str, int] = {
     'forge_store': JOB,
     'item_index': JOB,
     'job': JOB,
+    # JOB: "who is alive" and "what can the fleet do" are questions ABOUT runners and the work they
+    # take. It reads a RefStore (DRIVER) and the ref grammar, so the arrow points down.
+    'liveness': JOB,
     'loop': JOB,
     'pull': JOB,
     # JOB rather than HOST, and the vocabulary test is what decides it: a verdict, an attempt and a

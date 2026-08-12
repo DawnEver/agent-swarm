@@ -77,9 +77,15 @@ def verdict_ref(testkey: str, kind: str, envkey: str) -> str:
 def verdict_glob(testkey: str) -> str:
     """Every verdict known for a tree, across tiers AND environments.
 
-    TWO WILDCARDS, because git's `*` does not cross a separator. A reader wants the ones from other
-    environments too -- "PASS, but not here" is information, and hiding it would reintroduce the
-    silence the environment segment exists to prevent.
+    A reader wants the ones from other environments too -- "PASS, but not here" is information, and
+    hiding it would reintroduce the silence the environment segment exists to prevent.
+
+    THE SECOND WILDCARD IS DOCUMENTATION, NOT NECESSITY, and the correction is on record because
+    the opposite was believed. `ls-remote`'s `*` DOES cross `/` (measured 2026-08-12; the table is
+    in `InMemoryRefStore`), so one wildcard would match just as much. It is spelled at full depth
+    so the pattern SHOWS the shape of what it collects -- and because nothing about the matching
+    rule protects a reader who assumes the opposite, every consumer must filter what comes back
+    rather than trust the pattern to have narrowed it.
     """
     return f'{VERDICTS_ROOT}/{testkey}/*/*'
 
@@ -137,12 +143,18 @@ def shard_index(ref: str, n_shards: int) -> int | None:
 def aged_globs() -> tuple[str, ...]:
     """Every pattern an age-based sweep must list for the namespace to stay bounded.
 
-    IT INCLUDES A SHALLOWER VERDICT DEPTH THAN `verdict_ref` WRITES, and that is deliberate rather
-    than dead. Git's `*` does not cross a separator, so the day the environment segment was added,
-    a sweep globbing the new depth alone stopped reaching every ref written before it -- MEASURED on
-    a live remote as 10 immortal refs. A migration that silently grandfathers everything predating
-    it is reported by nothing: the only symptom is push/fetch negotiation slowing for everybody,
-    months later.
+    IT INCLUDES A SHALLOWER VERDICT DEPTH THAN `verdict_ref` WRITES. The refs it names are real --
+    MEASURED on a live remote as 10 written before the environment segment existed -- and a
+    migration that silently grandfathers everything predating it is reported by nothing: the only
+    symptom is push/fetch negotiation slowing for everybody, months later.
+
+    THE MECHANISM ORIGINALLY GIVEN FOR THIS ENTRY WAS WRONG, and it is corrected here rather than
+    quietly dropped. The claim was that git's `*` does not cross a separator, so a deeper pattern
+    could not reach a shallower ref. Measured 2026-08-12 against a real remote: it DOES cross, so
+    `refs/verdicts/*/*` already matches a three-segment verdict and the deeper pattern is redundant
+    rather than load-bearing. Both are kept because a sweep visiting one ref twice costs one extra
+    delete of an already-absent ref (which git exits 0 on), while a reader who trims the list on
+    the strength of the corrected mechanism has to re-derive which depths were ever written.
 
     Shards are NOT here, and their absence is a decision. They are collected by LIFECYCLE -- deleted
     with the composed verdict that made them garbage -- which is O(1), exact, and bounds the
@@ -171,9 +183,10 @@ def heartbeat_ref(runner: str, epoch: int) -> str:
 def heartbeat_glob(runner: str | None = None) -> str:
     """One runner's stamps, or -- with no argument -- the whole fleet's.
 
-    THE FLEET-WIDE FORM IS TWO WILDCARDS, because git's `*` does not cross a separator and the
-    stamp is its own segment. One short means the fleet reads as empty, which is indistinguishable
-    from every runner being dead.
+    BOTH FORMS ARE WRITTEN AT FULL DEPTH so the pattern shows what it collects. It is NOT a
+    narrowing: `ls-remote`'s `*` crosses `/`, so the fleet-wide pattern would match the same refs
+    with one wildcard. What actually separates one runner's stamps from the fleet's is the runner
+    SEGMENT, which is why that is the argument.
     """
     return f'{HEARTBEAT_ROOT}/{runner}/*' if runner is not None else f'{HEARTBEAT_ROOT}/*/*'
 

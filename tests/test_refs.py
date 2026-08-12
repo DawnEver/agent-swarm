@@ -54,9 +54,10 @@ def test_two_environments_are_two_refs():
     assert verdict_ref('K', 'fast', 'ENV-A') != verdict_ref('K', 'fast', 'ENV-B')
 
 
-def test_the_verdict_glob_has_a_WILDCARD_PER_SEGMENT():
-    """Git's `*` does not cross a separator, so a glob one wildcard short finds nothing and reads
-    as "no verdicts exist" rather than as a broken query."""
+def test_the_verdict_glob_is_written_at_FULL_DEPTH():
+    """The pattern SHOWS the shape of what it collects. It is not a narrowing -- `ls-remote`'s `*`
+    crosses `/`, measured, so a shorter pattern would match the same refs. Pinned so nobody
+    "simplifies" it and loses the only place the shape is written down."""
     assert verdict_glob('K') == f'{VERDICTS_ROOT}/K/*/*'
 
 
@@ -133,8 +134,8 @@ def test_a_malformed_shard_segment_yields_None():
 
 
 def test_the_sweep_reaches_the_DEEPER_verdict_namespace():
-    """Left at two wildcards, every verdict written after the environment segment landed becomes
-    IMMORTAL, and the only symptom is push negotiation slowing for everyone months later."""
+    """Kept because the shape is worth stating; NOT because two wildcards would miss it. The
+    mechanism once given for this entry was refuted by measurement -- see `aged_globs`."""
     assert f'{VERDICTS_ROOT}/*/*/*' in aged_globs()
 
 
@@ -177,9 +178,9 @@ def test_a_ref_with_no_stamp_yields_None():
     assert heartbeat_stamp('refs/ci/heartbeat/boxA') is None
 
 
-def test_the_FLEET_WIDE_glob_has_a_wildcard_per_segment():
-    """One short and the fleet reads as empty, which is indistinguishable from every runner being
-    dead -- the exact confusion this namespace exists to remove."""
+def test_the_FLEET_WIDE_glob_is_written_at_full_depth():
+    """What separates one runner from the fleet is the runner SEGMENT, not the wildcard count --
+    the depth is documentation. See `InMemoryRefStore` for the measured matching rule."""
     assert heartbeat_glob() == 'refs/ci/heartbeat/*/*'
     assert heartbeat_glob('boxA') == 'refs/ci/heartbeat/boxA/*'
 
