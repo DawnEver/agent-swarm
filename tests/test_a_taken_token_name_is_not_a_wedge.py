@@ -121,3 +121,40 @@ class TestTheUnwedgeDoesNotNeedTheOperatorsPassword:
             'the password route is offered first; an operator takes the first remedy they read'
         )
         assert 'PASSWORD' in text, 'it does not warn which route costs a human credential'
+
+
+class TestTheOverrideIsNotSilentlyIgnored:
+    """MEASURED 2026-08-12: the unwedge flag was passed on the Gitea host and `token()` returned a
+    STORED credential before ever reading it. The remedy no-opped, said nothing, and the run failed
+    identically to how it failed before the flag existed.
+
+    **A remedy that silently does nothing is worse than an absent one** -- an absent remedy sends
+    you looking; a no-op one spends the good idea and returns you to the same error, which reads as
+    "even the documented fix does not work".
+    """
+
+    def test_the_flag_bypasses_a_stored_credential(self, monkeypatch, capsys):
+        provider = swarmctl.GiteaProvider(
+            'http://forge.invalid:9000', 'Org', None, 'admin', admin_token_name='swarmctl-admin@fresh'
+        )
+        provider.exe = 'gitea'  # the mint branch needs a CLI; it is stubbed just below
+        monkeypatch.setattr(swarmctl, 'read_credential', lambda *_a, **_k: 'a-stored-one')
+        monkeypatch.setattr(swarmctl, 'store_credential', lambda *_a, **_k: None)
+        monkeypatch.setattr(provider.__class__, 'issue_token', lambda _s, _u, name, _sc: f'minted:{name}')
+
+        assert provider.token() == 'minted:swarmctl-admin@fresh'
+        assert 'IGNORING the stored credential' in capsys.readouterr().out, 'the bypass is silent'
+
+    def test_WITHOUT_the_flag_the_stored_credential_still_wins(self):
+        """THE CONTROL, and it guards the property the store exists for: read-only verbs must run
+        from any machine without minting. A bypass that fired unconditionally would mint an admin
+        token on every fleet box that ever ran `list`."""
+        provider = swarmctl.GiteaProvider('http://forge.invalid:9000', 'Org', None, 'admin')
+        import agent_swarm.swarmctl as mod
+
+        original = mod.read_credential
+        mod.read_credential = lambda *_a, **_k: 'a-stored-one'
+        try:
+            assert provider.token() == 'a-stored-one'
+        finally:
+            mod.read_credential = original

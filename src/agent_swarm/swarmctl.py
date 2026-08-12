@@ -469,7 +469,26 @@ class GiteaProvider:
         """
         if self._token is not None:
             return self._token
+        # `--admin-token-name` BYPASSES THE STORE, and it must, or it is a flag that lies.
+        #
+        # MEASURED 2026-08-12: the flag was added as the passwordless exit from the wedge, the
+        # operator passed it, and `token()` returned a STORED credential before ever reading it. The
+        # unwedge did nothing and said nothing -- and the stored credential was the READ-ONLY one
+        # from `admin-emit`, so the run 403'd exactly as it had before the flag existed. A remedy
+        # that silently no-ops is worse than an absent one: it spends the operator's one good idea.
+        #
+        # THE FLAG IS ONLY EVER PASSED BY SOMEONE THE STORED PATH HAS ALREADY FAILED. So it means
+        # "mint fresh under this name", and the mint is stored, so the NEXT run needs no flag. It
+        # says so loudly rather than silently, because a bypass nobody sees is how a script left
+        # carrying this flag would mint a token per run with nobody counting.
         stored = read_credential(self.scheme, self.netloc, self.ADMIN_CRED_USER)
+        if stored and self.admin_token_name:
+            say(
+                f'--admin-token-name given: IGNORING the stored credential and minting fresh as\n'
+                f'  {self.admin_token_name!r}. The new one is stored, so drop the flag next run --\n'
+                f'  left in a script it mints a token every time.'
+            )
+            stored = None
         if stored:
             self._token = stored
             self._token_came_from_the_store = True
