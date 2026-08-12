@@ -218,3 +218,31 @@ def test_the_doubles_listing_order_is_NOT_insertion_order():
         fake.write(ref, fake.head())
     assert list(fake.list('refs/ci/heartbeat/*/*')) != written
     assert set(fake.list('refs/ci/heartbeat/*/*')) == set(written)
+
+
+def test_a_DEEPER_pattern_reaches_LESS_not_more(remote_and_store):
+    """THE ROW THAT REVERSES THE INTUITION, pinned against real git with both depths present.
+
+    `*` crosses separators, but every literal `/` in a pattern is REQUIRED -- so each extra segment
+    narrows. A retention sweep must therefore keep its SHALLOW pattern; dropping that one as
+    "redundant" is what would grandfather the older refs forever, which is the exact opposite of
+    what the comment this replaced advised.
+    """
+    _work, store = remote_and_store
+    store.write('refs/verdicts/OLD/fast', store.head())
+    store.write('refs/verdicts/NEW/fast/ENV', store.head())
+    assert set(store.list('refs/verdicts/*')) == {'refs/verdicts/OLD/fast', 'refs/verdicts/NEW/fast/ENV'}
+    assert set(store.list('refs/verdicts/*/*')) == {'refs/verdicts/OLD/fast', 'refs/verdicts/NEW/fast/ENV'}
+    assert set(store.list('refs/verdicts/*/*/*')) == {'refs/verdicts/NEW/fast/ENV'}
+
+
+def test_the_double_agrees_that_a_deeper_pattern_reaches_less(remote_and_store):
+    """The audit for the row above. A double that got only the crossing half right would pass every
+    other test in this file and still mislead a retention sweep."""
+    _work, real = remote_and_store
+    fake = InMemoryRefStore(head=real.head())
+    for ref in ('refs/verdicts/OLD/fast', 'refs/verdicts/NEW/fast/ENV'):
+        real.write(ref, real.head())
+        fake.write(ref, fake.head())
+    for pattern in ('refs/verdicts/*', 'refs/verdicts/*/*', 'refs/verdicts/*/*/*'):
+        assert set(real.list(pattern)) == set(fake.list(pattern)), pattern

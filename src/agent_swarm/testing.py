@@ -324,6 +324,12 @@ class InMemoryRefStore:
         17                             MATCHES     -- likewise
         eartbeat/*                     no          -- a tail must start at a boundary
         refs/ci/heartbeat/boxA         no          -- a prefix is not a tail
+        refs/ci/heartbeat/*/*/*        no          -- see below
+
+    THE LAST ROW IS THE ONE THAT SURPRISES PEOPLE, and it is the opposite of the intuition the
+    original comment encoded: `*` crosses separators freely, but every literal `/` in the pattern
+    is REQUIRED, so adding a segment can only NARROW a listing. A deeper pattern reaches LESS. That
+    is why a retention sweep keeps its SHALLOW entry and could drop its deep one, never the reverse.
 
     So the rule is: the pattern is fnmatch-ed (with `*` crossing `/`) against the whole refname OR
     against any tail of it beginning after a `/`. A segment-bounded double is STRICTER than git,

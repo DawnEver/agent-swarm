@@ -134,14 +134,17 @@ def test_a_malformed_shard_segment_yields_None():
 
 
 def test_the_sweep_reaches_the_DEEPER_verdict_namespace():
-    """Kept because the shape is worth stating; NOT because two wildcards would miss it. The
-    mechanism once given for this entry was refuted by measurement -- see `aged_globs`."""
+    """Kept as a statement of the shape now written, NOT because a shallower pattern would miss it.
+    The mechanism once given for this entry was measured to be backwards -- see `aged_globs`."""
     assert f'{VERDICTS_ROOT}/*/*/*' in aged_globs()
 
 
-def test_the_sweep_still_reaches_the_depth_written_BEFORE_it():
-    """The half a forward-looking test cannot see, and it was a live hole for one commit: sweeping
-    only the new shape grandfathers everything predating the migration, forever, silently."""
+def test_the_sweep_reaches_the_depth_written_BEFORE_it_AND_THAT_IS_THE_LOAD_BEARING_ONE():
+    """THE ENTRY THAT ACTUALLY COLLECTS EVERYTHING. Measured: a deeper pattern reaches LESS, not
+    more, because every literal `/` in a pattern is required. So dropping this row -- the obvious
+    "tidy up the redundant one" edit -- is what would grandfather the shallower refs forever, and
+    it is the deeper row that is dispensable. Named at length because the intuition runs the other
+    way and a shorter name would invite exactly that cleanup."""
     assert f'{VERDICTS_ROOT}/*/*' in aged_globs()
 
 

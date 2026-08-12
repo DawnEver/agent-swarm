@@ -148,13 +148,24 @@ def aged_globs() -> tuple[str, ...]:
     migration that silently grandfathers everything predating it is reported by nothing: the only
     symptom is push/fetch negotiation slowing for everybody, months later.
 
-    THE MECHANISM ORIGINALLY GIVEN FOR THIS ENTRY WAS WRONG, and it is corrected here rather than
-    quietly dropped. The claim was that git's `*` does not cross a separator, so a deeper pattern
-    could not reach a shallower ref. Measured 2026-08-12 against a real remote: it DOES cross, so
-    `refs/verdicts/*/*` already matches a three-segment verdict and the deeper pattern is redundant
-    rather than load-bearing. Both are kept because a sweep visiting one ref twice costs one extra
-    delete of an already-absent ref (which git exits 0 on), while a reader who trims the list on
-    the strength of the corrected mechanism has to re-derive which depths were ever written.
+    THE MECHANISM ORIGINALLY GIVEN FOR THIS ENTRY WAS BACKWARDS, and it is corrected here rather
+    than quietly dropped. The claim was that git's `*` does not cross a separator, so a DEEPER
+    pattern was needed to reach newly-deepened refs. Measured 2026-08-12 against a real remote,
+    with a two-segment and a three-segment verdict present:
+
+        refs/verdicts/*        both
+        refs/verdicts/*/*      both
+        refs/verdicts/*/*/*    the three-segment one ONLY
+
+    `*` crosses separators freely, but every literal `/` in the pattern is REQUIRED -- so adding a
+    segment can only NARROW. The deeper pattern therefore does not reach further, it reaches LESS,
+    and the shallow one alone already collects everything.
+
+    THE BEHAVIOUR WAS NEVER WRONG, which matters more than the comment being wrong: a reader who
+    learns the reason was false will assume the code was too. `refs/verdicts/*/*` reaches every
+    verdict at either depth, so retention is complete and nothing was ever immortal. The deeper
+    entry is kept as a statement of the shape now written; a sweep that visits one ref twice costs
+    one delete of an already-absent ref, which git exits 0 on.
 
     Shards are NOT here, and their absence is a decision. They are collected by LIFECYCLE -- deleted
     with the composed verdict that made them garbage -- which is O(1), exact, and bounds the
