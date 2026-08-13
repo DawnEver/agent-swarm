@@ -135,3 +135,49 @@ def pytest_collection_modifyitems(config, items) -> None:
             f'module that failed to import, would look exactly like this and a default run would '
             f'still be green.'
         )
+
+
+#: The environment variables git EXPORTS TO A HOOK, and through a hook into every child process.
+#:
+#: MEASURED 2026-08-13, and it cost a junk commit on `origin/main`. The hooks this repo declares were
+#: installed for the first time that night. The very next push ran this suite from inside `pre-push`
+#: -- and git had exported `GIT_DIR` pointing at the REAL repository. Every test helper that spawns
+#: `git` passes `cwd=<tmp_path>` and is correct in isolation, but **`GIT_DIR` OVERRIDES `cwd`**. So
+#: `git config core.hooksPath <tmp>`, `git config user.email t@t`, `git add`, `git rm` and
+#: `git commit -m base` all landed on the real checkout: `core.hooksPath` was left pointing at a
+#: deleted pytest directory (which silently disarms every hook), the identity was rewritten, the
+#: index was emptied, and a commit that gutted `.pre-commit-config.yaml` from 148 lines to 6 was
+#: pushed to `main`.
+#:
+#: WHY IT NEVER HAPPENED BEFORE: the hooks were never installed, so the suite had never once run
+#: inside a hook. Installing them exposed an entire CLASS of tests that are safe when run normally
+#: and destructive when run from a hook. That is why the fix is here rather than in the helpers --
+#: it is not one test's bug, and a fix applied per-helper would protect the helpers that exist today.
+#:
+#: NOT A DEFAULT, A DELETION. Setting these to a tmp value would be a second guess about where a
+#: test wants to work; removing them restores the ordinary rule that `cwd` decides.
+_GIT_ENV_A_HOOK_EXPORTS = (
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY',
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_COMMON_DIR',
+    'GIT_PREFIX',
+    'GIT_QUARANTINE_PATH',
+    'GIT_INTERNAL_GETTEXT_TEST_FALLBACKS',
+)
+
+
+@pytest.fixture(autouse=True, scope='session')
+def _no_ambient_git_dir() -> None:
+    """Strip git's hook environment for the whole session, so `cwd` decides which repo a test uses.
+
+    AUTOUSE AND SESSION-SCOPED because the hazard is ambient: it arrives from the parent process, it
+    affects every test that spawns `git`, and a test cannot opt into protection it does not know it
+    needs. The teardown deliberately does NOT restore them -- pytest is the leaf process here, and
+    putting `GIT_DIR` back for the benefit of nothing would only re-arm the hazard for any plugin
+    that runs after the last test.
+    """
+    for name in _GIT_ENV_A_HOOK_EXPORTS:
+        os.environ.pop(name, None)
