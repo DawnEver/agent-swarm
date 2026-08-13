@@ -18,31 +18,79 @@
 # tell the new commit from the old one, and shipping that is worse than a blocked push whose remedy
 # is printed.
 #
-# ATOMIC WITH THE BRANCH, not before it. Publishing the tag on its own would leave a tag pointing at
-# a commit no branch reaches if the branch push were then rejected -- motronics accepts that orphan
-# explicitly. `--push --atomic <branch> <tag>` lands both refs or neither, so there is no state where
-# the tag exists remotely and the code does not. The outer push that triggered this hook then finds
-# its branch already up to date and succeeds as a no-op.
+# THE TAG ONLY, NOT THE BRANCH -- AND WHY THAT REVERSES WHAT THIS HEADER USED TO SAY. It previously
+# pushed `--atomic <branch> <tag>` so both refs landed or neither, and claimed "the outer push then
+# finds its branch already up to date and succeeds as a no-op". MEASURED, that claim is false on
+# every path that mints: git computed the outer update as a compare-and-swap (old -> new) before the
+# hook ran, the atomic push moved the ref underneath it, and the outer push is then rejected with
+#
+#     cannot lock ref 'refs/heads/main': is at <new> but expected <old>
+#     ! [remote rejected] <topic> -> main (failed to update ref)
+#
+# -- refs correctly published, push reported as failed, every single release. It went unnoticed only
+# because the hook had never once published: it was deciding on the local branch, so it declined on
+# every real push. Fixing what it reads exposes this, so the two must land together.
+#
+# The orphan the atomic push existed to prevent -- a tag reaching the remote when the branch does not
+# -- is instead prevented by a PRECONDITION: the remote's current trunk must be an ancestor of the
+# commit being released, checked against the remote itself just before minting. If it is not, the
+# outer push was going to be rejected anyway, so this refuses without minting rather than tagging a
+# commit that will not become the trunk. What remains is a genuine race -- another integrator landing
+# in the moment between the tag push and the outer branch push -- which costs one burned version
+# number and is named here rather than hidden. This is a smaller window than it replaces, since the
+# old shape failed the push EVERY time rather than rarely.
 #
 # `--no-verify` on the inner push: without it this hook re-enters itself.
 #
-# WHAT DECIDES: THE REMOTE REF, NOT THE LOCAL BRANCH. git feeds a pre-push hook one line per ref on
-# stdin -- `<local ref> <local sha> <remote ref> <remote sha>` -- and pre-commit passes that stdin
-# through to `entry`. `refs/heads/<default>` being updated IS the release, whatever the pusher
-# happens to have checked out. Deciding on `git rev-parse --abbrev-ref HEAD` instead asks a
-# DIFFERENT question that agrees only in the common case: it is right for someone sitting on the
-# default branch pushing it, and silently inert for an integrator running
-# `git push origin <topic>:main`, which is exactly the workflow this project prescribes -- every
+# WHAT DECIDES: THE REMOTE REF, NOT THE LOCAL BRANCH. `refs/heads/<default>` being updated IS the
+# release, whatever the pusher happens to have checked out. Deciding on
+# `git rev-parse --abbrev-ref HEAD` instead asks a DIFFERENT question that agrees only in the common
+# case: right for someone sitting on the default branch pushing it, silently inert for an integrator
+# running `git push origin <topic>:main` -- exactly the workflow this project prescribes, where every
 # producer emits a Submission and one integrator advances the trunk. Three such pushes reported
 # "Passed" while the remote gained zero tags.
 #
-# It also fixes WHICH COMMIT is tagged. The version belongs to the commit the trunk is being moved
-# to -- the local sha on that stdin line -- and HEAD need not be it.
+# WHERE THAT FACT COMES FROM, AND WHY NOT STDIN. A raw `.git/hooks/pre-push` is fed one line per ref
+# on stdin -- `<local ref> <local sha> <remote ref> <remote sha>`. This script never sees them:
+# pre-commit's pre-push hook-impl CONSUMES stdin itself to compute the diff range for the hooks it
+# runs, and hands `entry` scripts nothing. Reading stdin here is not merely redundant, it is a branch
+# that cannot execute, and a first attempt at this fix shipped exactly that -- correct logic against
+# an input that is always empty, which reported "no tag minted" on a real `<topic>:main` push.
+#
+# MEASURED against pre-commit 4.6.2 with a real `pre-commit install --hook-type pre-push` and real
+# pushes into a local bare remote (topic->main, two refs at once in both orders, topic->topic,
+# tag-only, delete-main, first-push-of-an-empty-remote):
+#
+#   stdin                      ALWAYS EMPTY.       Never a usable source.
+#   positional args            ALWAYS EMPTY.       pre-commit passes none; the config declares none.
+#   PRE_COMMIT_REMOTE_NAME     always set.         The remote.
+#   PRE_COMMIT_REMOTE_BRANCH   always set.         The remote ref -- the fact that decides.
+#   PRE_COMMIT_LOCAL_BRANCH    always set.         The local ref feeding it.
+#   PRE_COMMIT_TO_REF          set EXCEPT on the first push into a remote with no refs at all.
+#
+# `_TO_REF` being conditional is why the sha falls back to resolving `_LOCAL_BRANCH`: the one case it
+# is missing -- an empty remote -- is precisely the v0.1.0 path, so a script trusting it would fail
+# on the only push that mints the FIRST tag and nowhere else.
+#
+# A DELETION and a TAG-ONLY push never reach here at all: pre-commit does not run pre-push hooks for
+# either (measured). That is the outcome this script wants in both cases, so it is not re-implemented
+# here -- a branch for it would be untestable through the real entry point and unreachable in
+# production, which is the defect above wearing different clothes.
+#
+# `PRE_COMMIT_REMOTE_BRANCH` reports ONE ref pair even when several are pushed. Measured, it picked
+# the release ref with the refs given in either order -- but what it actually prefers is a ref that
+# already exists on the remote over one being created, which merely COINCIDED with the release ref in
+# both trials. So it is "the ref pre-commit chose", not "the ref that matters", and when it names
+# something other than the release ref this script declines rather than claiming to know better.
+#
+# It also fixes WHICH COMMIT is tagged: the version belongs to the commit the trunk is being moved
+# to, and HEAD need not be it.
 set -uo pipefail
 
-# pre-commit exports the push's real remote; the positional is for tests, which drive this script
-# against a local bare repo. Both name the SAME thing, so neither can be silently wrong about it.
-REMOTE="${1:-${PRE_COMMIT_REMOTE_NAME:-origin}}"
+REMOTE="${PRE_COMMIT_REMOTE_NAME:-}"
+REMOTE_BRANCH="${PRE_COMMIT_REMOTE_BRANCH:-}"
+LOCAL_BRANCH="${PRE_COMMIT_LOCAL_BRANCH:-}"
+TO_REF="${PRE_COMMIT_TO_REF:-}"
 
 die() {
   echo "bump-version: REFUSED -- $1" >&2
@@ -62,54 +110,65 @@ decline() {
   exit 0
 }
 
+# "I CANNOT TELL" IS NOT "NO RELEASE", so it BLOCKS rather than declining. Every invocation this
+# script is reachable from sets these; an invocation that does not is a shape nobody has measured,
+# and the failure it would otherwise produce is the silent one this whole script exists to refuse --
+# indistinguishable, from the operator's side, from a release that was correctly skipped. Blocking is
+# recoverable and prints its remedy; silence is what let three pushes ship untagged.
+[ -n "${REMOTE}" ] || die "PRE_COMMIT_REMOTE_NAME is unset, so the push's remote is unknown." \
+  "This script reads pre-commit's environment and nothing else; run it as the pre-push hook." \
+  "Refusing rather than guessing 'origin': guessing wrong publishes a tag to the wrong forge."
+[ -n "${REMOTE_BRANCH}" ] || die "PRE_COMMIT_REMOTE_BRANCH is unset, so WHICH REF this push updates is unknown." \
+  "Whether this is a release cannot be decided, and 'cannot decide' must not read as 'not a release'" \
+  "-- that is the exact failure this hook exists to prevent." \
+  "If pre-commit changed what it exports, re-measure it and fix this script; do not silence it."
+
 # Only the default branch carries releases.
 DEFAULT_BRANCH=$(git symbolic-ref --quiet --short "refs/remotes/${REMOTE}/HEAD" 2>/dev/null | sed "s@^${REMOTE}/@@")
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
 RELEASE_REF="refs/heads/${DEFAULT_BRANCH}"
 
-# THE REF LINES. A push may carry several at once; only the one updating the release ref decides, and
-# the rest are irrelevant rather than disqualifying. A deletion arrives with an all-zero LOCAL sha
-# (and `(delete)` as the local ref): the trunk is being removed, so there is no commit to version.
-# `[ ! -t 0 ]` because git and pre-commit always hand this a pipe; a TTY means the script was invoked
-# by hand with nothing being pushed, and reading would block forever rather than answer.
-TARGET_SHA=''
-TARGET_LOCAL_REF=''
-DELETION_SEEN=''
-SEEN_REFS=''
-if [ ! -t 0 ]; then
-  while read -r local_ref local_sha remote_ref _remote_sha; do
-    [ -n "${remote_ref}" ] || continue
-    SEEN_REFS="${SEEN_REFS}${SEEN_REFS:+, }${remote_ref}"
-    [ "${remote_ref}" = "${RELEASE_REF}" ] || continue
-    case "${local_sha}" in
-      *[!0]*) TARGET_SHA="${local_sha}" ; TARGET_LOCAL_REF="${local_ref}" ;;
-      *) DELETION_SEEN='yes' ;;
-    esac
-  done
-fi
-
-if [ -n "${DELETION_SEEN}" ] && [ -z "${TARGET_SHA}" ]; then
-  decline "this push DELETES '${RELEASE_REF}' on '${REMOTE}'." \
-    "There is no commit to version, so minting a tag here would point a release at nothing."
-fi
-
-if [ -z "${TARGET_SHA}" ]; then
-  decline "this push updates no '${RELEASE_REF}' on '${REMOTE}'." \
-    "It updates: ${SEEN_REFS:-<no refs on stdin>}" \
+if [ "${REMOTE_BRANCH}" != "${RELEASE_REF}" ]; then
+  decline "this push updates '${REMOTE_BRANCH}' on '${REMOTE}', not '${RELEASE_REF}'." \
     "Builds off any other ref spell themselves <next>.dev<N>+g<sha>, which is already unique."
 fi
 
+# THE COMMIT BEING RELEASED. `_TO_REF` is already a sha; the fallback resolves the local ref instead,
+# for the empty-remote case where pre-commit exports no `_TO_REF` -- see the header's measurement.
+TARGET_SHA="${TO_REF}"
+if [ -z "${TARGET_SHA}" ]; then
+  TARGET_SHA=$(git rev-parse --verify --quiet "${LOCAL_BRANCH}" 2>/dev/null)
+fi
+if [ -z "${TARGET_SHA}" ]; then
+  die "'${RELEASE_REF}' is being updated but the commit it moves to could not be resolved." \
+    "PRE_COMMIT_TO_REF was empty and PRE_COMMIT_LOCAL_BRANCH ('${LOCAL_BRANCH}') did not resolve." \
+    "This IS a release push, so it is blocked rather than skipped."
+fi
+TARGET_LOCAL_REF="${LOCAL_BRANCH:-${TARGET_SHA}}"
+
 # Refresh remote tags so the highest-tag computation and the collision scan both see a tag another
-# machine already pushed. A failure here is NOT fatal by itself -- the atomic publish below is what
-# actually decides, and it will refuse a stale or colliding tag on its own.
+# machine already pushed. A failure here is NOT fatal by itself -- the publish below is what actually
+# decides, and it will refuse a stale or colliding tag on its own.
 git fetch --quiet --tags "${REMOTE}" >/dev/null 2>&1 || true
+
+# THE PRECONDITION THAT REPLACES ATOMICITY (see the header). Read the remote's trunk and require it
+# to be an ancestor of the commit being released. An absent trunk is fine -- the outer push creates
+# it. A trunk that is NOT an ancestor means the outer push is about to be rejected as a
+# non-fast-forward, so minting now would publish a tag for a commit that never becomes the trunk.
+REMOTE_TRUNK=$(git ls-remote "${REMOTE}" "${RELEASE_REF}" 2>/dev/null | awk '{print $1; exit}')
+if [ -n "${REMOTE_TRUNK}" ] && ! git merge-base --is-ancestor "${REMOTE_TRUNK}" "${TARGET_SHA}" 2>/dev/null; then
+  die "'${RELEASE_REF}' on '${REMOTE}' is at ${REMOTE_TRUNK}, which ${TARGET_SHA} does not descend from." \
+    "The push that triggered this hook is going to be rejected as a non-fast-forward, so no version" \
+    "is minted for a commit that will not become the trunk." \
+    "Integrate the remote trunk first, then push again."
+fi
 
 publish() {
   # AN OPERATION'S EXIT IS NOT ITS EFFECT: the push is checked, and then the REMOTE is read back.
-  # The branch half mirrors the OUTER push exactly -- the same sha onto the same remote ref -- so
-  # the outer push then finds it already up to date and succeeds as a no-op.
+  # THE TAG ALONE. Pushing the branch here too would move the ref out from under the outer push's
+  # compare-and-swap and get that push rejected -- measured, on every mint. See the header.
   local tag="$1"
-  if ! git push --no-verify --atomic "${REMOTE}" "${TARGET_SHA}:${RELEASE_REF}" "refs/tags/${tag}" >/dev/null 2>&1; then
+  if ! git push --no-verify "${REMOTE}" "refs/tags/${tag}" >/dev/null 2>&1; then
     return 1
   fi
   git ls-remote --tags "${REMOTE}" "refs/tags/${tag}" 2>/dev/null | grep -q "refs/tags/${tag}"
@@ -125,7 +184,7 @@ if [ -n "${EXISTING}" ]; then
   fi
   die "${TARGET_SHA} is tagged ${EXISTING} but that tag is not on '${REMOTE}' and could not be pushed." \
     "The installed version of this commit would be indistinguishable from another commit's." \
-    "Fix the remote, then: git push --atomic ${REMOTE} ${TARGET_SHA}:${RELEASE_REF} refs/tags/${EXISTING}"
+    "Fix the remote, then: git push ${REMOTE} refs/tags/${EXISTING}"
 fi
 
 # Highest plain-semver tag by NUMERIC field order. `git tag --sort=-version:refname` depends on a
