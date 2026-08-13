@@ -176,3 +176,31 @@ def test_every_NETWORK_verb_is_covered(tmp_path, monkeypatch) -> None:
 
         _store(tmp_path, identity=role).run(verb, 'origin')
         assert seen['env'].get('GIT_ASKPASS') == 'role-askpass', f'{verb} reached the forge as nobody'
+
+
+def test_the_HOST_KEY_IS_NORMALISED_because_every_caller_derived_it_itself(tmp_path) -> None:
+    """THE CENTRAL FIX FOR A DEFECT FOUND AT THREE CALL SITES IN ONE DAY.
+
+    A fleet remote is spelled `http://swarm-agent@<forge>/...`, and `urlsplit().netloc` KEEPS the
+    userinfo. Three separate callers built the lookup key from `netloc` and got
+    `swarm-verifier@swarm-agent@<forge>` -- a key no token can match, so every identity-carrying
+    call raised `LookupError`. Measured 2026-08-13: `enroll_machine._role_env_for_origin`,
+    `enroll_machine.step_credentials`, and `ci.git_identity_for`.
+
+    THE DEFECT IS NOT THREE TYPOS, IT IS A DERIVATION EVERY CALLER REPEATS. Fixing the three sites
+    leaves the fourth one reachable, and the next writer has no reason to know. So the function that
+    OWNS the key normalises its own input -- which is also the only place that can state what the
+    key means.
+
+    STRIPPED, NOT REJECTED. Raising on a `netloc` would be a truthful API and a worse outcome: the
+    caller has a URL, `netloc` is what `urlsplit` hands them, and the userinfo it carries is the
+    SAME account this function is being told about. There is nothing to disambiguate.
+    """
+    from agent_swarm import credentials
+
+    supplied = {'SWARM_TOKEN_AGENT': 'the-agent-token'}
+    with credentials.git_env_for('http', 'swarm-agent@forge.example:9000', 'swarm-agent', env=supplied) as one:
+        carrying_userinfo = one['SWARM_ASKPASS_TOKEN']
+    with credentials.git_env_for('http', 'forge.example:9000', 'swarm-agent', env=supplied) as two:
+        clean = two['SWARM_ASKPASS_TOKEN']
+    assert carrying_userinfo == clean == 'the-agent-token', 'the two spellings must resolve to one key'

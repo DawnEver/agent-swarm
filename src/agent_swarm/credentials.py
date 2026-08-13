@@ -198,6 +198,28 @@ def _load(path: Path | None = None) -> dict[str, str]:
     return {str(k): str(v) for k, v in loaded.items()} if isinstance(loaded, dict) else {}
 
 
+def normalise_host(host: str) -> str:
+    """The lookup key for a forge host, with any `user@` prefix removed.
+
+    THE DERIVATION EVERY CALLER WAS REPEATING. A fleet remote is spelled
+    `http://swarm-agent@<forge>/...`, and `urlsplit().netloc` KEEPS the userinfo -- so a caller that
+    passes `netloc` builds `swarm-verifier@swarm-agent@<forge>`, a key no token can ever match, and
+    every identity-carrying call raises `LookupError`. Measured 2026-08-13 at THREE call sites in
+    one day, all written by the same hand within hours of each other.
+
+    THE DEFECT IS NOT THREE TYPOS. It is a key derivation performed by each caller, which is the
+    duplicated-scheme shape: fixing the three leaves the fourth reachable and the next writer has no
+    reason to know. So the function that OWNS the key normalises its own input, because it is also
+    the only place that can say what the key means.
+
+    STRIPPED RATHER THAN REJECTED. Raising on a `netloc` would be a truthful API and a worse
+    outcome: the caller holds a URL, `netloc` is what `urlsplit` hands them, and the userinfo it
+    carries names the SAME account already passed as `username`. There is nothing to disambiguate,
+    so refusing would only make every caller write this line instead.
+    """
+    return host.rsplit('@', 1)[-1]
+
+
 def resolve_token(
     scheme: str,
     host: str,
@@ -213,6 +235,7 @@ def resolve_token(
     interactive dialog, which on Windows is a GUI that hangs an unattended run and invites somebody
     to type a human credential into a fleet process.
     """
+    host = normalise_host(host)
     environ = _DEFAULT_ENV if env is None else env
     from_env = environ.get(env_var_for(username))
     if from_env:
@@ -331,6 +354,9 @@ def git_env_for(
             this module exists to end.
 
     """
+    # NORMALISED HERE TOO, not left to `resolve_token`: this function's own error message
+    # names the host, and a message quoting a doubled key sent a reader chasing the wrong thing.
+    host = normalise_host(host)
     token = resolve_token(scheme, host, username, env=env, path=path)
     if token is None:
         msg = (
