@@ -156,3 +156,59 @@ def test_a_REFUSED_PASSWORD_WRITE_does_not_look_like_a_mint_failure(monkeypatch)
     monkeypatch.setattr(provider, '_call', refuse)
     with pytest.raises(Exception, match='(?i)password|admin'):
         provider.issue_token('swarm-observer', 'swarm-observer@WS9', ['read:repository'])
+
+
+def test_a_NAME_ALREADY_TAKEN_is_revoked_and_reminted(monkeypatch) -> None:
+    """THE STATE A MIGRATION LEAVES EVERYWHERE, met on the first real run: the old forge's tokens
+    came across with the repositories, so every machine's token NAME was already taken and every
+    mint answered `400 access token name has been used already`.
+
+    THE CLI PATH CANNOT DO THIS. Its own remedy message says revoking "needs the operator PASSWORD",
+    because Gitea refuses token auth on that route -- so on the host the answer is a human. Here the
+    ephemeral password for exactly that user is still in frame, so the remote path can revoke and
+    remint by itself. That is a capability the older route does not have, not a workaround for a
+    limitation of this one.
+
+    ONE RETRY, NOT A LOOP. If the delete succeeded and the mint still says the name is taken, the
+    server is telling us something we do not understand, and retrying would turn that into a spin.
+    """
+    provider = _provider(exe=None)
+    seen: list[tuple[str, str]] = []
+    refused_once = {'done': False}
+
+    def call(method, path, body=None, *, allow=(), auth='token', raw_token=None, raw_basic=None):
+        seen.append((method, path))
+        if method == 'POST' and path.endswith('/tokens') and not refused_once['done']:
+            refused_once['done'] = True
+            msg = 'POST -> 400: {"message":"access token name has been used already"}'
+            raise RuntimeError(msg)
+        if method == 'POST' and path.endswith('/tokens'):
+            return {'sha1': 'reminted'}
+        return None
+
+    monkeypatch.setattr(provider, '_call', call)
+    assert provider.issue_token('swarm-observer', 'swarm-observer@G', ['read:repository']) == 'reminted'
+
+    methods = [m for m, _p in seen]
+    assert 'DELETE' in methods, 'the taken name must be revoked before the second attempt'
+    assert methods.count('POST') == 2, 'exactly one retry'
+
+
+def test_a_MINT_that_fails_for_ANOTHER_REASON_is_not_retried(monkeypatch) -> None:
+    """The discriminating half. A 403, a 404 or a network error is not a name collision, and
+    deleting a token in response to one would destroy a working credential to fix nothing.
+    """
+    provider = _provider(exe=None)
+    attempts = {'n': 0}
+
+    def call(method, path, body=None, *, allow=(), auth='token', raw_token=None, raw_basic=None):
+        if method == 'POST' and path.endswith('/tokens'):
+            attempts['n'] += 1
+            msg = 'POST -> 403: {"message":"forbidden"}'
+            raise RuntimeError(msg)
+        return None
+
+    monkeypatch.setattr(provider, '_call', call)
+    with pytest.raises(Exception, match='(?i)refused to mint'):
+        provider.issue_token('swarm-observer', 'swarm-observer@G', ['read:repository'])
+    assert attempts['n'] == 1, 'a non-collision failure must not be retried'

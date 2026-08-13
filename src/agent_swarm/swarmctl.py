@@ -414,17 +414,46 @@ class GiteaProvider:
                 f'refused, which is a different problem from the mint below ({exc})'
             )
             raise Fail(msg) from exc
-        try:
-            got = self._call(
+
+        def mint() -> object:
+            return self._call(
                 'POST',
                 f'/users/{quoted}/tokens',
                 {'name': token_name, 'scopes': scopes},
                 auth='raw-basic',
                 raw_basic=(username, password),
             )
+
+        try:
+            got = mint()
         except Exception as exc:
-            msg = f'the forge refused to mint {token_name!r} for {username!r} ({exc})'
-            raise Fail(msg) from exc
+            if self._NAME_TAKEN not in str(exc):
+                msg = f'the forge refused to mint {token_name!r} for {username!r} ({exc})'
+                raise Fail(msg) from exc
+            # REVOKE AND REMINT, WHICH ONLY THIS ROUTE CAN DO BY ITSELF. The state is the one a
+            # MIGRATION leaves everywhere: the old forge's tokens arrive with the repositories, so
+            # every machine's token NAME is already taken while no machine holds the value -- Gitea
+            # shows a token once. The CLI path's own remedy says revoking "needs the operator
+            # PASSWORD", because Gitea refuses token auth on that route; here the ephemeral password
+            # for exactly this user is still in frame, so the collision needs no human.
+            #
+            # ONE RETRY, NEVER A LOOP: if the delete succeeded and the name is still taken, the
+            # server is telling us something this code does not model, and retrying would spin.
+            self._call(
+                'DELETE',
+                f'/users/{quoted}/tokens/{urllib.parse.quote(token_name)}',
+                auth='raw-basic',
+                raw_basic=(username, password),
+                allow=(404,),
+            )
+            try:
+                got = mint()
+            except Exception as retry:
+                msg = (
+                    f'{token_name!r} was already taken for {username!r}; the old one was revoked and '
+                    f'the remint still failed ({retry})'
+                )
+                raise Fail(msg) from retry
         token = (got or {}).get('sha1') if isinstance(got, dict) else None
         if not token:
             msg = f'the forge accepted the mint for {username!r} but returned no token value'
