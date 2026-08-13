@@ -52,6 +52,19 @@ _GIT = shutil.which('git') or 'git'
 #: not measure.
 FORGE_MUTATING_VERBS = frozenset({'push'})
 
+#: Every verb that TALKS TO THE REMOTE, whether or not it changes it. A STRICT SUPERSET of the
+#: mutating set and a strict subset of "every call", and both boundaries are load-bearing.
+#:
+#: NOT the mutating set: a READ against an authenticated remote needs an identity just as much. A
+#: correctly enrolled fleet box has NO ambient credential by design, so `ls-remote` there
+#: authenticates as nobody -- measured 2026-08-13, `publish_capabilities` died on exactly that.
+#:
+#: NOT every call either: `run` is the seam for LOCAL git too -- `rev-parse`, `hash-object`,
+#: `commit-tree` are how a payload is composed before anything leaves the box -- and resolving a
+#: role for those would make a machine with no token unable to touch its OWN objects, because
+#: `git_env_for` raises when it cannot find one.
+FORGE_REACHING_VERBS = frozenset({'push', 'fetch', 'ls-remote', 'clone', 'pull', 'remote'})
+
 #: How long a single git call may take. A forge write with no bound is a runner that stops ticking
 #: without saying why: `subprocess.run` waits forever, the clock's `proc.poll()` keeps returning
 #: None, and liveness keeps beating for a process that will never return. Generous rather than
@@ -249,6 +262,16 @@ class GitRefStore:
         """
         return bool(args) and args[0] in FORGE_MUTATING_VERBS
 
+    @staticmethod
+    def reaches_the_forge(args: Sequence[str]) -> bool:
+        """Does this git argv TALK to the shared remote, read or write.
+
+        `args[0]`, never `verb in args`, for the reason `mutates_the_forge` gives: a membership test
+        also fires on a ref or branch NAMED `fetch`, and a rule that fires where it was not asked to
+        is how people learn to route around it.
+        """
+        return bool(args) and args[0] in FORGE_REACHING_VERBS
+
     def run(self, *args: str, cwd: Path | None = None, **kwargs) -> subprocess.CompletedProcess:
         """THE SEAM. Every git call a consumer makes goes through here, and so does the refusal.
 
@@ -268,18 +291,23 @@ class GitRefStore:
             return subprocess.CompletedProcess([_GIT, *args], 0, stdout='', stderr='')
         argv = [_GIT, '-C', str(cwd or self.root), *args]
         kwargs.setdefault('timeout', GIT_TIMEOUT_S)
-        if not self.mutates_the_forge(args):
-            # READS KEEP THE AMBIENT ENVIRONMENT -- the COST half of the original reasoning, which
-            # stands: reads are the bulk of the calls and wrapping them would pay an askpass launch
-            # per `ls-remote`. What they no longer keep is the ability to ASK.
-            #
-            # THE SAFETY HALF OF THAT REASONING WAS FALSE, and it is corrected here rather than
-            # quietly dropped. It said reads answer "a question the server answers for any credential
-            # that can clone" -- and ANY presupposes an ambient credential EXISTS. On a fresh fleet
-            # box none does, and the read then does not fail: it PROMPTS. Measured 2026-08-13, `git
-            # fetch` raised a Git Credential Manager window on a human's desktop asking for a service
-            # account's password and hung until a 90 s timeout, which the caller reported as an
-            # unreachable forge. The forge was reachable.
+        # A FORGE-REACHING CALL CARRIES THE ROLE, READS INCLUDED. The read exemption was mine and
+        # it was wrong twice over.
+        #
+        # WRONG ON CORRECTNESS: it said reads keep the ambient environment because the server
+        # answers them "for any credential that can clone". ANY presupposes an ambient credential
+        # EXISTS -- and a correctly enrolled fleet box has NONE by design. Measured 2026-08-13 on
+        # such a box: `publish_capabilities` died because `list` -- a READ -- reached an
+        # authenticated remote with nothing to authenticate as. The rule looked right on the machine
+        # it was written on only because a HUMAN's credential sat in that box's store.
+        #
+        # WRONG ON COST, its own stated justification: it claimed wrapping reads pays "an askpass
+        # launch per ls-remote". Entering `git_env_for` writes one small file into a temp dir; the
+        # askpass script only EXECUTES if git actually needs a credential. Against a network round
+        # trip that is noise, and the claim was never measured.
+        #
+        # LOCAL CALLS ARE STILL EXEMPT and must stay so -- see `FORGE_REACHING_VERBS`.
+        if not self.reaches_the_forge(args):
             return subprocess.run(
                 argv,
                 capture_output=True,
@@ -288,14 +316,10 @@ class GitRefStore:
                 env={**os.environ, **NON_INTERACTIVE},
                 **kwargs,
             )
-        # A WRITE CARRIES A ROLE. `identity()` yields the EXTRA variables, merged over the inherited
-        # environment rather than replacing it: git needs PATH, HOME and the rest to run at all, and
-        # a hand-built environment would be a second declaration of what git requires.
         with self._identity() as extra:
             # NON_INTERACTIVE LAST, so no identity can hand back an environment that re-enables a
-            # prompt. A write already carries a role, which normally puts the helper out of reach --
-            # but a role the server REFUSES falls through to exactly the same helper, and the two
-            # branches must not differ on this or the safer-looking one is the one that asks.
+            # prompt: a role the server REFUSES falls through to exactly the same helper as no role
+            # at all, and the two branches must not differ on this or the safer-looking one asks.
             return subprocess.run(
                 argv,
                 capture_output=True,

@@ -115,3 +115,64 @@ def test_ONE_SPELLING_shared_with_the_installer(tmp_path) -> None:
     from agent_swarm import installer
 
     assert installer.NON_INTERACTIVE is NON_INTERACTIVE
+
+
+def test_a_READ_CARRIES_THE_ROLE_IDENTITY_TOO(tmp_path, monkeypatch) -> None:
+    """THE HALF THAT NON-INTERACTIVE ALONE DOES NOT FIX, measured on a real fleet box.
+
+    Making reads unable to prompt turns a GUI window into a clean failure. On WS2 that is still a
+    FAILURE: `ci_tick --dry-run` died in `publish_capabilities` because `refstore.list` -- a READ --
+    reached an authenticated remote with no credential at all. A correctly-enrolled fleet box has NO
+    ambient credential by design, so "reads inherit the ambient environment" resolves to nothing
+    there. It worked on the box the rule was written on because a HUMAN's credential was sitting in
+    that box's store.
+
+    AND THE COST ARGUMENT FOR EXEMPTING THEM WAS WRONG ON ITS OWN TERMS. I wrote that wrapping reads
+    would pay "an askpass launch per `ls-remote`". Read: entering `git_env_for` writes one small file
+    into a temp dir; the askpass script only EXECUTES if git actually needs a credential. Against a
+    network round trip to a remote forge that is noise. The claim was never measured.
+    """
+    seen = _capture(monkeypatch)
+
+    @contextlib.contextmanager
+    def role():
+        yield {'GIT_ASKPASS': 'role-askpass'}
+
+    _store(tmp_path, identity=role).run('ls-remote', 'origin', 'refs/ci/fleet/*')
+    assert seen['env'].get('GIT_ASKPASS') == 'role-askpass', 'a read on a fleet box has no other credential'
+
+
+def test_a_LOCAL_git_call_does_NOT_take_a_role_identity(tmp_path, monkeypatch) -> None:
+    """THE SCOPE, and getting it wrong the other way would have been worse than the bug.
+
+    `run` is the seam for EVERY git call, local ones included -- `rev-parse`, `hash-object`,
+    `commit-tree`, `update-ref` are how a payload is composed before anything is pushed. Resolving a
+    role for those would make a box with no credential unable to do arithmetic on its own objects:
+    `git_env_for` RAISES when there is no token, so the failure would not even be about the network.
+
+    So the predicate is REACHES the forge, not MUTATES it -- a strict superset of the write set and
+    a strict subset of "every call".
+    """
+    seen = _capture(monkeypatch)
+
+    def forbidden():
+        raise AssertionError('a local git call must not resolve a role identity')
+
+    _store(tmp_path, identity=forbidden).run('rev-parse', 'HEAD')
+    assert 'GIT_ASKPASS' not in seen['env']
+    assert seen['env']['GIT_TERMINAL_PROMPT'] == '0', 'and it is still unable to prompt'
+
+
+def test_every_NETWORK_verb_is_covered(tmp_path, monkeypatch) -> None:
+    """Enumerated, because a verb missing from this set is a silent return of the original bug --
+    it does not raise, it reaches the network as nobody.
+    """
+    for verb in ('push', 'fetch', 'ls-remote', 'clone', 'pull'):
+        seen = _capture(monkeypatch)
+
+        @contextlib.contextmanager
+        def role():
+            yield {'GIT_ASKPASS': 'role-askpass'}
+
+        _store(tmp_path, identity=role).run(verb, 'origin')
+        assert seen['env'].get('GIT_ASKPASS') == 'role-askpass', f'{verb} reached the forge as nobody'
