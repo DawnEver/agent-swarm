@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from agent_swarm.refs import (
     ATTEMPTS_ROOT,
+    DECISIONS_ROOT,
     GROUPS_ROOT,
     SHARDS_ROOT,
     VERDICTS_ROOT,
@@ -23,6 +24,7 @@ from agent_swarm.refs import (
     capability_glob,
     capability_of,
     capability_ref,
+    decision_ref,
     group_attempt_key,
     group_name,
     group_ref,
@@ -149,11 +151,51 @@ def test_the_sweep_reaches_attempts_too():
     assert f'{ATTEMPTS_ROOT}/*/*/*' in aged_globs()
 
 
+def test_the_sweep_reaches_DECISIONS_because_they_are_the_densest_namespace_there_is():
+    """THE ONE ENTRY WHOSE OMISSION WOULD BE INVISIBLE UNTIL IT WAS EXPENSIVE, and the density is the
+    reason: verdicts arrive at ~27 a day, a decision is written per tick, and a tick is 45 seconds --
+    1900 a day if every tick wrote one. Retention is therefore not a tidy-up here, it is the
+    precondition for writing them at all, which is why this test is in the same commit as the
+    namespace rather than in a follow-up nobody schedules.
+
+    Every ref is advertised during push/fetch negotiation, so an unswept namespace taxes every
+    developer's git operations on every machine -- the symptom appears far from the cause, months
+    later, and reads as "git got slow".
+    """
+    assert f'{DECISIONS_ROOT}/*/*' in aged_globs()
+
+
 def test_shards_are_deliberately_NOT_age_swept():
     """Stated as a test so the absence is a decision on record rather than an omission. They are
     collected by lifecycle -- with the composed verdict that made them garbage -- which is exact and
     O(1), where an age sweep can only guess how long a partition may legitimately stay open."""
     assert not any(pattern.startswith(SHARDS_ROOT) for pattern in aged_globs())
+
+
+# --------------------------------------------------------------------------- decisions
+
+
+def test_a_decision_carries_its_STAMP_IN_THE_PATH_for_the_heartbeat_reason():
+    """Same mechanism as the heartbeat, same reason: a server-side ref's update time is not
+    queryable over the ordinary git protocol, so a ref-per-runner pointing at the head commit would
+    encode no time at all -- and a decision log whose entries cannot be ordered is not a log.
+    """
+    assert decision_ref('boxA-1234abcd', 1755000000) == 'refs/ci/decisions/boxA-1234abcd/1755000000'
+
+
+def test_a_decision_ref_reports_WHOSE_it_is():
+    """A decision is only evidence if it names the box that made it. Parsed from the root, never by
+    counting segments from the right -- a runner id contains hyphens, so an index rule is a guess
+    that happens to work on today's names.
+    """
+    assert runner_of('refs/ci/decisions/boxA-1234abcd/1755000000') == 'boxA-1234abcd'
+
+
+def test_a_decision_ref_does_NOT_answer_for_a_foreign_namespace():
+    """The discriminating half. A parser that returned a plausible string for any ref would make
+    every namespace look like a decision, which is the failure `runner_of` is written to avoid.
+    """
+    assert runner_of('refs/verdicts/deadbeef/fast') is None
 
 
 # --------------------------------------------------------------------------- liveness

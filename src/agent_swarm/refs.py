@@ -24,8 +24,11 @@ THE NAMESPACES ARE SEPARATE ON PURPOSE, and the separations are load-bearing:
     heartbeat  WHO IS ALIVE, with the time in the ref NAME rather than in the object.
     fleet      WHAT EACH RUNNER CAN SERVE, one ref per capability rather than one list.
     groups     a SCHEDULED tier's last conclusion, keyed by freshness because it has no tree.
+    decisions  WHAT WAS CHOSEN AND WHY. The only root that is not an outcome: every other one
+               records what happened, and none of them can tell an empty queue from an unservable
+               group from a busy box -- all three leave exactly the same trace, which is none.
 
-THE LAST THREE ARE PATHS ONLY, and the boundary is worth stating so nobody looks for the rest here:
+THE LAST FOUR ARE PATHS ONLY, and the boundary is worth stating so nobody looks for the rest here:
 what WRITES them -- the bounded-retry push, the prune of every stamp but the newest, the refusal to
 prune after a failed push -- stayed with its consumer, because it needs a git transport this layer
 deliberately does not have. What moved is the vocabulary, which is what was duplicated.
@@ -64,6 +67,16 @@ FLEET_ROOT = 'refs/ci/fleet'
 #: A SCHEDULED GROUP's last conclusion, keyed by FRESHNESS rather than by a tree: the question a
 #: group answers is "how long since this last ran", which no testkey can express.
 GROUPS_ROOT = 'refs/ci/groups'
+
+#: WHAT A SCHEDULER DECIDED AND WHY, one payload per tick that changed its mind. The other roots
+#: record what HAPPENED; this one records the choice that led there, which is the half a reader
+#: cannot reconstruct afterwards -- "nothing ran" is identical in the outcome refs whether the queue
+#: was empty, every group was unservable, or the box was busy.
+#:
+#: WRITTEN ONLY ON A CHANGE. A tick is 45 seconds, so an unconditional write is ~1900 refs a day and
+#: the interesting record is the CHANGE anyway. See :func:`aged_globs`: this namespace is age-swept
+#: in the same commit that introduced it, because its density is what makes the omission expensive.
+DECISIONS_ROOT = 'refs/ci/decisions'
 
 _SHARD_SUFFIX = re.compile(r'^(\d+)of(\d+)$')
 
@@ -171,7 +184,12 @@ def aged_globs() -> tuple[str, ...]:
     with the composed verdict that made them garbage -- which is O(1), exact, and bounds the
     namespace by work IN FLIGHT rather than by guessing how long a partition may stay open.
     """
-    return (f'{VERDICTS_ROOT}/*/*', f'{VERDICTS_ROOT}/*/*/*', f'{ATTEMPTS_ROOT}/*/*/*')
+    return (
+        f'{VERDICTS_ROOT}/*/*',
+        f'{VERDICTS_ROOT}/*/*/*',
+        f'{ATTEMPTS_ROOT}/*/*/*',
+        f'{DECISIONS_ROOT}/*/*',
+    )
 
 
 # --------------------------------------------------------------------------- liveness and capability
@@ -213,14 +231,30 @@ def heartbeat_stamp(ref: str) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+def decision_ref(runner: str, epoch: int) -> str:
+    """Where a runner records the choice it made at `epoch`.
+
+    THE TIME IS IN THE NAME for the reason :func:`heartbeat_ref` gives: a server-side ref's update
+    time is not queryable over the ordinary git protocol, so a ref-per-runner would order nothing.
+    A decision log whose entries cannot be ordered answers "what did it decide" but never "what
+    changed", and the change is the whole reason to keep them.
+    """
+    return f'{DECISIONS_ROOT}/{runner}/{epoch}'
+
+
+def decision_glob(runner: str | None = None) -> str:
+    """One runner's decisions, or -- with no argument -- the whole fleet's."""
+    return f'{DECISIONS_ROOT}/{runner or "*"}/*'
+
+
 def runner_of(ref: str) -> str | None:
-    """Which runner a heartbeat or capability ref belongs to, or `None` if it is neither.
+    """Which runner a heartbeat, capability or decision ref belongs to, or `None` if it is none.
 
     PARSED FROM A KNOWN ROOT rather than by counting segments from the right. A runner id contains
     hyphens and a capability name may contain almost anything, so an index-from-the-end rule is a
     guess that happens to work on today's names.
     """
-    for root in (HEARTBEAT_ROOT, FLEET_ROOT):
+    for root in (HEARTBEAT_ROOT, FLEET_ROOT, DECISIONS_ROOT):
         if ref.startswith(root + '/'):
             rest = ref.removeprefix(root + '/')
             return rest.split('/', 1)[0] if '/' in rest else None
