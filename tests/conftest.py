@@ -169,15 +169,40 @@ _GIT_ENV_A_HOOK_EXPORTS = (
 )
 
 
+#: pre-commit's own exports, and they are the SAME LAW as the git block above, found hours later.
+#:
+#: MEASURED 2026-08-13. `test_a_real_pre_commit_push_of_a_topic_branch_onto_main_mints_a_real_tag`
+#: builds a sandbox and performs a REAL pre-commit push inside it. Run on its own: 15 passed. Run
+#: from inside a real `pre-push`, it failed -- because the OUTER push had already exported
+#: `PRE_COMMIT_REMOTE_BRANCH=refs/heads/main`, and the sandbox inherited it, so the test read the
+#: outer push's facts instead of the ones it had just constructed.
+#:
+#: THE GENERAL STATEMENT, which is what makes this worth its own block rather than four more names
+#: in the tuple above: a hook exports its situation into every process it starts, so any test that
+#: RE-ENTERS the thing under test inherits the outer invocation's answers. `GIT_DIR` was the same
+#: law reaching git; this is it reaching pre-commit. Expect a third.
+_PRE_COMMIT_ENV_A_HOOK_EXPORTS = (
+    'PRE_COMMIT_FROM_REF',
+    'PRE_COMMIT_TO_REF',
+    'PRE_COMMIT_REMOTE_NAME',
+    'PRE_COMMIT_REMOTE_URL',
+    'PRE_COMMIT_REMOTE_BRANCH',
+    'PRE_COMMIT_LOCAL_BRANCH',
+    'PRE_COMMIT_ORIGIN',
+    'PRE_COMMIT_SOURCE',
+    'PRE_COMMIT_COMMIT_MSG_FILENAME',
+)
+
+
 @pytest.fixture(autouse=True, scope='session')
 def _no_ambient_git_dir() -> None:
-    """Strip git's hook environment for the whole session, so `cwd` decides which repo a test uses.
+    """Strip the hook environment for the whole session, so `cwd` and the sandbox decide, not the caller.
 
     AUTOUSE AND SESSION-SCOPED because the hazard is ambient: it arrives from the parent process, it
-    affects every test that spawns `git`, and a test cannot opt into protection it does not know it
-    needs. The teardown deliberately does NOT restore them -- pytest is the leaf process here, and
-    putting `GIT_DIR` back for the benefit of nothing would only re-arm the hazard for any plugin
-    that runs after the last test.
+    affects every test that spawns `git` or re-enters `pre-commit`, and a test cannot opt into
+    protection it does not know it needs. The teardown deliberately does NOT restore them -- pytest
+    is the leaf process here, and putting `GIT_DIR` back for the benefit of nothing would only re-arm
+    the hazard for any plugin that runs after the last test.
     """
-    for name in _GIT_ENV_A_HOOK_EXPORTS:
+    for name in (*_GIT_ENV_A_HOOK_EXPORTS, *_PRE_COMMIT_ENV_A_HOOK_EXPORTS):
         os.environ.pop(name, None)
