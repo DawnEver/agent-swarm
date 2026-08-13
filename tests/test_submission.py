@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from agent_swarm import refs
+from agent_swarm import refstore
 from agent_swarm.refstore import GitRefStore
 from agent_swarm.submission import OrdinalTaken, Submission, create, publish, read, submitted_ordinals
 
@@ -51,7 +52,7 @@ def store(tmp_path: Path) -> GitRefStore:
     _git(work, 'add', '-A')
     _git(work, 'commit', '-qm', 'first')
     _git(work, 'remote', 'add', 'upstream', str(bare))
-    return GitRefStore(work, 'upstream', withhold_writes=_never)
+    return GitRefStore(work, 'upstream', withhold_writes=_never, identity=refstore.ambient_identity)
 
 
 @pytest.fixture

@@ -41,7 +41,7 @@ from agent_swarm.integration import (
     record,
     trunk_commit,
 )
-from agent_swarm.refstore import GitRefStore
+from agent_swarm.refstore import GitRefStore, ambient_identity
 from agent_swarm.shards import FAIL, INCONCLUSIVE, PASS
 from agent_swarm.submission import Submission, publish
 
@@ -71,7 +71,7 @@ def store(tmp_path: Path) -> GitRefStore:
     _git(work, 'add', '-A')
     _git(work, 'commit', '-qm', 'trunk base')
     _git(work, 'remote', 'add', 'upstream', str(bare))
-    return GitRefStore(work, 'upstream', withhold_writes=_never)
+    return GitRefStore(work, 'upstream', withhold_writes=_never, identity=ambient_identity)
 
 
 def _branch_with(store: GitRefStore, name: str, files: dict[str, str]) -> str:

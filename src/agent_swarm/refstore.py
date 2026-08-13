@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -48,6 +50,37 @@ _GIT = shutil.which('git') or 'git'
 #: not measure.
 FORGE_MUTATING_VERBS = frozenset({'push'})
 
+#: How long a single git call may take. A forge write with no bound is a runner that stops ticking
+#: without saying why: `subprocess.run` waits forever, the clock's `proc.poll()` keeps returning
+#: None, and liveness keeps beating for a process that will never return. Generous rather than
+#: tight -- this bounds a HANG, not a slow network, and a bound that fired on a slow push would be
+#: an outage of its own.
+GIT_TIMEOUT_S = 300
+
+
+@contextlib.contextmanager
+def ambient_identity() -> Iterator[Mapping[str, str]]:
+    """Authenticate forge writes as whatever credential the BOX holds. A choice, not a default.
+
+    NAMED SO IT MUST BE TYPED. `GitRefStore` could have defaulted to this and every existing
+    consumer would have kept working -- which is precisely the objection. A default that works
+    silently is invisible in the code, invisible in review and invisible in the numbers, and this
+    package already removed one of exactly that shape from `default_forge`.
+
+    WHAT IT COSTS, so a consumer choosing it is choosing this knowingly. The OS credential store is
+    keyed on (scheme, HOST, username), and a URL with no username resolves to whichever entry that
+    host happens to hold. Where four role accounts share one forge, "ambient" therefore means "one
+    of the four, decided by whatever was stored last" -- and on a box a human also uses, that is
+    frequently the human. A write attributed to somebody who did not make it is not a small defect
+    on a protected branch: it is the audit trail saying something false.
+
+    IT IS THE HONEST CHOICE FOR EXACTLY ONE CASE: a single-identity deployment, where there is no
+    role to distinguish and the ambient credential IS the only one. Anything else passes
+    `credentials.git_env_for(...)` for the role that owns the write.
+    """
+    yield {}
+
+
 #: Whether the CURRENT pass may write to the shared remote. Module-scoped rather than per-instance
 #: because the writes it governs sit several frames below whoever armed it, and threading a flag
 #: through every signature in between would put the decision in N places again -- which is the
@@ -59,7 +92,7 @@ _WITHHOLDING: ContextVar[bool] = ContextVar('agent_swarm_refstore_withholding', 
 def withholding_writes() -> bool:
     """The predicate for a consumer that wants THIS module's `withholding()` to govern its store.
 
-    Offered so the ordinary wiring -- `GitRefStore(root, remote, withhold_writes=withholding_writes)`
+    Offered so the ordinary wiring -- `GitRefStore(root, remote, withhold_writes=withholding_writes, identity=...)`
     -- is one obvious spelling rather than a lambda each consumer writes differently. It is still
     PASSED rather than assumed: a consumer whose rehearsal flag lives somewhere else supplies its
     own, and nothing here reaches for a global on its behalf.
@@ -159,7 +192,26 @@ class GitRefStore:
     own, precisely so that all of them could pass through one withholding check. Extracting the
     four and leaving the funnel behind would have moved the decisions and stranded the seam.
 
-    ALL THREE CONSTRUCTOR ARGUMENTS ARE REQUIRED. `root` is the checkout the commands run in,
+    ALL FOUR CONSTRUCTOR ARGUMENTS ARE REQUIRED, and `identity` joined them 2026-08-13 for the same
+    reason the other three have no defaults. MEASURED in motronics: `git_env_for` -- this package's
+    own way to hand git one role's askpass -- had ZERO call sites there, so every forge write this
+    class made went out under whatever credential the box happened to hold. The consumers are
+    `liveness`, `submission`, `workbench_cli` and `integration`, and `integration` is the CAS
+    advance: the one shape that changes `main`. So the plane that lands code authenticated as
+    nobody in particular.
+
+    A DEFAULT WOULD HAVE BEEN THE DEFECT, not the fix. `identity=ambient_identity` as a default
+    keeps every existing consumer working and leaves the behaviour exactly as measured -- invisible
+    in the code and invisible in review. Requiring it makes "use the box's credential" something a
+    consumer TYPES, which is the difference between a decision and an accident. `ambient_identity`
+    exists and is honest for a single-identity deployment; it is not a default.
+
+    THE IDENTITY APPLIES WHERE `mutates_the_forge` IS TRUE and nowhere else -- the same predicate
+    that already gates withholding, rather than a second notion of "a write". Reads keep working on
+    the ambient credential, which is what they already did and what makes this change deployable in
+    one round on the read path.
+
+    ALL THREE OF THE ORIGINAL CONSTRUCTOR ARGUMENTS ARE REQUIRED. `root` is the checkout the commands run in,
     `remote` is the name they push to, and `withhold_writes` says whether a REHEARSAL is in
     progress. Defaults for the first two would be this package deciding a consumer's deployment.
     A default for the third is worse: it would be `lambda: False`, so every consumer that forgot to
@@ -172,10 +224,18 @@ class GitRefStore:
     be the value at import time, forever.
     """
 
-    def __init__(self, root: Path, remote: str, *, withhold_writes: Callable[[], bool]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        remote: str,
+        *,
+        withhold_writes: Callable[[], bool],
+        identity: Callable[[], AbstractContextManager[Mapping[str, str]]],
+    ) -> None:
         self.root = root
         self.remote = remote
         self._withhold_writes = withhold_writes
+        self._identity = identity
 
     @staticmethod
     def mutates_the_forge(args: Sequence[str]) -> bool:
@@ -204,9 +264,20 @@ class GitRefStore:
         if self._withhold_writes() and self.mutates_the_forge(args):
             sys.stdout.write(f'[refstore] WITHHELD -- no forge write in a rehearsal: git {" ".join(args)}\n')
             return subprocess.CompletedProcess([_GIT, *args], 0, stdout='', stderr='')
-        return subprocess.run(
-            [_GIT, '-C', str(cwd or self.root), *args], capture_output=True, text=True, check=False, **kwargs
-        )
+        argv = [_GIT, '-C', str(cwd or self.root), *args]
+        kwargs.setdefault('timeout', GIT_TIMEOUT_S)
+        if not self.mutates_the_forge(args):
+            # READS KEEP THE AMBIENT ENVIRONMENT. They already worked that way, they are the bulk of
+            # the calls, and wrapping them would pay an askpass launch per `ls-remote` to answer a
+            # question the server answers for any credential that can clone.
+            return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
+        # A WRITE CARRIES A ROLE. `identity()` yields the EXTRA variables, merged over the inherited
+        # environment rather than replacing it: git needs PATH, HOME and the rest to run at all, and
+        # a hand-built environment would be a second declaration of what git requires.
+        with self._identity() as extra:
+            return subprocess.run(
+                argv, capture_output=True, text=True, check=False, env={**os.environ, **extra}, **kwargs
+            )
 
     def text(self, *args: str, check: bool = True, cwd: Path | None = None) -> str:
         """Stdout, stripped. `check` RAISES with git's own words rather than returning ''.

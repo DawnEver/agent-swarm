@@ -93,7 +93,7 @@ from agent_swarm.forge import DEFAULT_GITEA_BASE_URL, ForgeError, GiteaForge
 from agent_swarm.forge_store import ForgeStore, Role, decode_claim_key
 from agent_swarm.job import TEST_RUN, JobKind
 from agent_swarm.pull import MissingCapability, Ticket, Workbench
-from agent_swarm.refstore import GitRefStore, RefUnreachable, withholding_writes
+from agent_swarm.refstore import GitRefStore, RefUnreachable, ambient_identity, withholding_writes
 from agent_swarm.store import VERDICTS
 from agent_swarm.submission import OrdinalTaken, create, effects_of
 
@@ -396,7 +396,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
     was skipped. Refusing on a mismatch would build the path lock the model argues against; scope
     here is intent and routing, and git detects real collisions exactly, at merge time.
     """
-    store = GitRefStore(Path(args.git_root), args.git_remote, withhold_writes=withholding_writes)
+    # AMBIENT, NAMED. The workbench CLI is driven by a human at a terminal, so the credential the
+    # box holds IS that human's and attributing the write to them is correct. Typed rather than
+    # defaulted so the next reader can tell this was decided.
+    store = GitRefStore(
+        Path(args.git_root), args.git_remote, withhold_writes=withholding_writes, identity=ambient_identity
+    )
     resolved = {}
     for name, revision in (('base', args.base), ('head', args.head)):
         # `rev-parse --verify <rev>^{commit}` and NOT plain `rev-parse`: the plain form echoes an

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_swarm.refstore import GitRefStore, RefStore, RefUnreachable
+from agent_swarm.refstore import GitRefStore, RefStore, RefUnreachable, ambient_identity
 from agent_swarm.testing import InMemoryRefStore
 
 
@@ -49,14 +49,14 @@ def remote_and_store(tmp_path: Path) -> tuple[Path, GitRefStore]:
     _git(work, 'add', '-A')
     _git(work, 'commit', '-qm', 'first')
     _git(work, 'remote', 'add', 'upstream', str(bare))
-    return work, GitRefStore(work, 'upstream', withhold_writes=_never)
+    return work, GitRefStore(work, 'upstream', withhold_writes=_never, identity=ambient_identity)
 
 
 # --------------------------------------------------------------------------- the real transport
 
 
 def test_it_satisfies_the_protocol():
-    assert isinstance(GitRefStore(Path('.'), 'origin', withhold_writes=_never), RefStore)
+    assert isinstance(GitRefStore(Path('.'), 'origin', withhold_writes=_never, identity=ambient_identity), RefStore)
     assert isinstance(InMemoryRefStore(), RefStore)
 
 
@@ -114,7 +114,7 @@ def test_an_UNREACHABLE_remote_RAISES(tmp_path: Path):
     """And this is the distinction the class exists for: not an empty answer."""
     work = tmp_path / 'work'
     subprocess.run(['git', 'init', '-q', str(work)], check=True)
-    store = GitRefStore(work, 'a-remote-that-does-not-exist', withhold_writes=_never)
+    store = GitRefStore(work, 'a-remote-that-does-not-exist', withhold_writes=_never, identity=ambient_identity)
     with pytest.raises(RefUnreachable):
         store.list('refs/ci/*')
 
@@ -144,7 +144,9 @@ def test_a_write_to_an_UNREACHABLE_remote_reports_the_reason(tmp_path: Path):
     (work / 'a.txt').write_text('x', encoding='utf-8')
     _git(work, 'add', '-A')
     _git(work, 'commit', '-qm', 'first')
-    ok, why = GitRefStore(work, 'nope', withhold_writes=_never).write('refs/ci/x/1', _git(work, 'rev-parse', 'HEAD'))
+    ok, why = GitRefStore(work, 'nope', withhold_writes=_never, identity=ambient_identity).write(
+        'refs/ci/x/1', _git(work, 'rev-parse', 'HEAD')
+    )
     assert not ok
     assert why.strip()
 

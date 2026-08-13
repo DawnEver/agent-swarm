@@ -53,7 +53,9 @@ def work_and_remote(tmp_path: Path) -> tuple[Path, Path]:
 @pytest.fixture
 def store(work_and_remote) -> GitRefStore:
     work, _ = work_and_remote
-    return GitRefStore(work, 'upstream', withhold_writes=refstore.withholding_writes)
+    return GitRefStore(
+        work, 'upstream', withhold_writes=refstore.withholding_writes, identity=refstore.ambient_identity
+    )
 
 
 def _remote_refs(store: GitRefStore) -> dict[str, str]:
@@ -188,7 +190,7 @@ def test_a_consumer_may_supply_its_OWN_predicate(work_and_remote) -> None:
     """
     work, _ = work_and_remote
     mine = {'on': True}
-    store = GitRefStore(work, 'upstream', withhold_writes=lambda: mine['on'])
+    store = GitRefStore(work, 'upstream', withhold_writes=lambda: mine['on'], identity=refstore.ambient_identity)
     head = store.head()
     store.write('refs/probe/own', head)
     assert _remote_refs(store) == {}, "the store ignored the consumer's own predicate"

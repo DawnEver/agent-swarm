@@ -38,6 +38,7 @@ from agent_swarm.integration import (
     trunk_commit,
 )
 from agent_swarm.job import COMPUTE, INTEGRATION, TEST_RUN, Job, JobKind
+from agent_swarm import refstore
 from agent_swarm.refstore import GitRefStore
 from agent_swarm.shards import FAIL, INCONCLUSIVE, PASS
 from agent_swarm.store import InMemoryStore
@@ -68,7 +69,7 @@ def store(tmp_path: Path) -> GitRefStore:
     _git(work, 'add', '-A')
     _git(work, 'commit', '-qm', 'trunk base')
     _git(work, 'remote', 'add', 'upstream', str(bare))
-    return GitRefStore(work, 'upstream', withhold_writes=_never)
+    return GitRefStore(work, 'upstream', withhold_writes=_never, identity=refstore.ambient_identity)
 
 
 def _submit(store: GitRefStore, ordinal: int, name: str, files: dict[str, str]) -> Submission:

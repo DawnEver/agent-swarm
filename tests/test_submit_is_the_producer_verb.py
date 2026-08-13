@@ -260,6 +260,6 @@ class TestTheObservedSetIsTheParticipantsOwnWork:
 
 
 def _store(root: Path):
-    from agent_swarm.refstore import GitRefStore
+    from agent_swarm.refstore import GitRefStore, ambient_identity
 
-    return GitRefStore(root, 'origin', withhold_writes=lambda: False)
+    return GitRefStore(root, 'origin', withhold_writes=lambda: False, identity=ambient_identity)
