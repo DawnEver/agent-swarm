@@ -381,6 +381,56 @@ class GiteaProvider:
     #: substring of the CLI's stderr, which is the only place it appears.
     _NAME_TAKEN = 'has been used already'
 
+    def _issue_token_remotely(self, username: str, token_name: str, scopes: list[str]) -> str:
+        """Mint a token over the API, with no Gitea CLI anywhere. Needs an ADMIN token, no password.
+
+        MEASURED against Gitea 1.27.1 before this was written, because the module's own refusal said
+        "minting tokens has no API path" and that was a claim about the world nobody had re-checked:
+
+            admin token -> POST /users/<other>/tokens               401 auth required
+            admin token -> POST /users/<other>/tokens?sudo=<other>  401 auth required
+            admin token -> PATCH /admin/users/<u> {password}        200
+            basic <u>   -> POST /users/<u>/tokens                   201  minted
+
+        So the token-management surface refuses TOKEN auth outright -- 401 rather than 403, and no
+        scope message -- which is a circularity guard, not a permission. An admin may still SET a
+        password, and that password may then mint.
+
+        THE PASSWORD IS EPHEMERAL AND NEVER LEAVES THIS FRAME. Generated per issue, used in the next
+        call, never returned, stored or logged -- so nobody ends up holding a long-lived password for
+        a service account, and this needs no human secret at all. The account keeps a strong unknown
+        password afterwards; the way back is this same admin route.
+
+        THE TWO FAILURES ARE NAMED SEPARATELY because they are different errands: a refused password
+        write is about the ADMIN credential, a refused mint is about the target account.
+        """
+        password = secrets.token_urlsafe(32)
+        quoted = urllib.parse.quote(username)
+        try:
+            self._call('PATCH', f'/admin/users/{quoted}', {'login_name': username, 'password': password})
+        except Exception as exc:
+            msg = (
+                f'could not set an ephemeral password for {username!r}: the ADMIN credential was '
+                f'refused, which is a different problem from the mint below ({exc})'
+            )
+            raise Fail(msg) from exc
+        try:
+            got = self._call(
+                'POST',
+                f'/users/{quoted}/tokens',
+                {'name': token_name, 'scopes': scopes},
+                auth='raw-basic',
+                raw_basic=(username, password),
+            )
+        except Exception as exc:
+            msg = f'the forge refused to mint {token_name!r} for {username!r} ({exc})'
+            raise Fail(msg) from exc
+        token = (got or {}).get('sha1') if isinstance(got, dict) else None
+        if not token:
+            msg = f'the forge accepted the mint for {username!r} but returned no token value'
+            raise Fail(msg)
+        return token
+
     def issue_token(self, username: str, token_name: str, scopes: list[str]) -> str:
         """Mint a token, or REFUSE WITH A REMEDY when the name is already taken on the server.
 
@@ -398,6 +448,11 @@ class GiteaProvider:
         The remedy has to be revoke-then-remint, and it must be NAMED HERE, because this is the
         only place that knows both the token name and the host it belongs to.
         """
+        if not self.exe:
+            # NO BINARY, SO THE API ROUTE. Not a degraded fallback -- on a host that runs Gitea and
+            # nothing else there is no binary to reach, and the old refusal here told the operator to
+            # "run it there", on a machine that by directive runs no code of ours.
+            return self._issue_token_remotely(username, token_name, scopes)
         try:
             out = self._cli(
                 'admin',
@@ -584,6 +639,7 @@ class GiteaProvider:
         allow: tuple[int, ...] = (),
         auth: str = 'token',
         raw_token: str | None = None,
+        raw_basic: tuple[str, str] | None = None,
     ) -> object:
         """One HTTP round trip against the forge API.
 
@@ -603,6 +659,14 @@ class GiteaProvider:
             # about this one, and answering it with a different credential would always say yes.
             assert raw_token is not None
             authorization = f'token {raw_token}'
+        elif auth == 'raw-basic':
+            # A CALLER-SUPPLIED BASIC IDENTITY, the sibling of `raw`. Gitea grants token CREATION
+            # only to the account that will own the token -- measured 1.27.1: an admin token gets
+            # 401 on that route, not 403, so it is a circularity guard rather than a permission.
+            # `basic` below authenticates as the ADMIN, which is right for revoking and wrong here.
+            assert raw_basic is not None
+            raw = f'{raw_basic[0]}:{raw_basic[1]}'.encode()
+            authorization = f'Basic {base64.b64encode(raw).decode()}'
         elif auth == 'basic':
             raw = f'{self.admin_user}:{self.admin_password()}'.encode()
             authorization = f'Basic {base64.b64encode(raw).decode()}'
