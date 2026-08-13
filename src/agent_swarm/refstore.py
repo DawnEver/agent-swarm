@@ -37,6 +37,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from pathlib import Path
+
+from agent_swarm.credentials import NON_INTERACTIVE
 from typing import Protocol, runtime_checkable
 
 #: Resolved once: a partial executable path is a lint finding worth honouring rather than
@@ -267,16 +269,40 @@ class GitRefStore:
         argv = [_GIT, '-C', str(cwd or self.root), *args]
         kwargs.setdefault('timeout', GIT_TIMEOUT_S)
         if not self.mutates_the_forge(args):
-            # READS KEEP THE AMBIENT ENVIRONMENT. They already worked that way, they are the bulk of
-            # the calls, and wrapping them would pay an askpass launch per `ls-remote` to answer a
-            # question the server answers for any credential that can clone.
-            return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
+            # READS KEEP THE AMBIENT ENVIRONMENT -- the COST half of the original reasoning, which
+            # stands: reads are the bulk of the calls and wrapping them would pay an askpass launch
+            # per `ls-remote`. What they no longer keep is the ability to ASK.
+            #
+            # THE SAFETY HALF OF THAT REASONING WAS FALSE, and it is corrected here rather than
+            # quietly dropped. It said reads answer "a question the server answers for any credential
+            # that can clone" -- and ANY presupposes an ambient credential EXISTS. On a fresh fleet
+            # box none does, and the read then does not fail: it PROMPTS. Measured 2026-08-13, `git
+            # fetch` raised a Git Credential Manager window on a human's desktop asking for a service
+            # account's password and hung until a 90 s timeout, which the caller reported as an
+            # unreachable forge. The forge was reachable.
+            return subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, **NON_INTERACTIVE},
+                **kwargs,
+            )
         # A WRITE CARRIES A ROLE. `identity()` yields the EXTRA variables, merged over the inherited
         # environment rather than replacing it: git needs PATH, HOME and the rest to run at all, and
         # a hand-built environment would be a second declaration of what git requires.
         with self._identity() as extra:
+            # NON_INTERACTIVE LAST, so no identity can hand back an environment that re-enables a
+            # prompt. A write already carries a role, which normally puts the helper out of reach --
+            # but a role the server REFUSES falls through to exactly the same helper, and the two
+            # branches must not differ on this or the safer-looking one is the one that asks.
             return subprocess.run(
-                argv, capture_output=True, text=True, check=False, env={**os.environ, **extra}, **kwargs
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={**os.environ, **extra, **NON_INTERACTIVE},
+                **kwargs,
             )
 
     def text(self, *args: str, check: bool = True, cwd: Path | None = None) -> str:

@@ -17,6 +17,8 @@ import shutil
 import subprocess
 from urllib.parse import urlsplit
 
+from agent_swarm import credentials as _credentials
+
 #: RESOLVED ON PATH, not spelled bare: it consults the same PATH the developer uses, so nothing is
 #: pinned to one install and a machine without the tool fails with a clear name.
 _UV = shutil.which('uv') or 'uv'
@@ -26,15 +28,10 @@ _GIT = shutil.which('git') or 'git'
 #: check that adds a minute to every working install is a second failure mode dressed as a guard.
 PROBE_TIMEOUT_S = 8.0
 
-#: Belt and braces against an INTERACTIVE credential helper. `GIT_TERMINAL_PROMPT=0` suppresses the
-#: terminal prompt and NOT the GUI one -- measured 2026-08-11, a helper raised a window and the
-#: command hung until it was killed. These ask every helper we know of to stay silent; the timeout is
-#: what actually holds, because an unknown helper will not read our variables.
-_NON_INTERACTIVE = {
-    'GIT_TERMINAL_PROMPT': '0',
-    'GCM_INTERACTIVE': 'never',
-    'GCM_PROVIDER': 'generic',
-}
+#: THE SHARED RULE, not a local copy. It was a local copy, and the same defect then reappeared in
+#: the ref transport, which had no copy at all -- a rule that must be remembered at each new site is
+#: one that will be missed at one of them. `credentials.NON_INTERACTIVE` carries the measurements.
+NON_INTERACTIVE = _credentials.NON_INTERACTIVE
 
 
 def uv_install(args: list[str]) -> int:
@@ -97,7 +94,7 @@ def ls_remote(url: str, *, run, timeout: float) -> bool | None:
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, **_NON_INTERACTIVE},
+            env={**os.environ, **NON_INTERACTIVE},
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
@@ -120,7 +117,7 @@ def stored_username(url: str, *, run, timeout: float) -> str | None:
             text=True,
             timeout=timeout,
             input=f'protocol={parts.scheme}\nhost={host_of(url)}\n\n',
-            env={**os.environ, **_NON_INTERACTIVE},
+            env={**os.environ, **NON_INTERACTIVE},
         )
     except (subprocess.TimeoutExpired, OSError):
         return None

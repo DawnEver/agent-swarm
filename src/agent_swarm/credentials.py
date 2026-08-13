@@ -275,6 +275,28 @@ _ASKPASS_WINDOWS = (
 )
 
 
+#: WHAT MAKES A GIT CALL UNABLE TO ASK A HUMAN ANYTHING. THE ONE SPELLING.
+#:
+#: MEASURED TWICE, in two modules, before it was shared. 2026-08-11: an interactive helper raised a
+#: window and the command hung until it was killed. 2026-08-13, on a fresh fleet box: `git fetch`
+#: -- a READ -- raised a Git Credential Manager window on a human's desktop asking for a service
+#: account's password, and the step reported `TimeoutExpired`, which reads as an unreachable forge.
+#:
+#: A PROMPT IS NOT A SLOWER FAILURE, IT IS A WORSE OUTCOME. The OS credential store is keyed on HOST
+#: alone while several role identities may share one forge, so a human who answers displaces their
+#: OWN credential for that host and finds out days later, elsewhere, from a 404 that reads as a
+#: deleted repository.
+#:
+#: `GIT_TERMINAL_PROMPT=0` suppresses the TERMINAL prompt and NOT the GUI one -- which is the whole
+#: reason the other two entries exist. None of them binds an unknown helper: what actually holds is
+#: the caller's timeout, and these ask every helper we know of to stay silent.
+NON_INTERACTIVE = {
+    'GIT_TERMINAL_PROMPT': '0',
+    'GCM_INTERACTIVE': 'never',
+    'GCM_PROVIDER': 'generic',
+}
+
+
 @contextmanager
 def git_env_for(
     scheme: str,
@@ -329,7 +351,7 @@ def git_env_for(
                 'SWARM_ASKPASS_TOKEN': token,
                 # No terminal prompt and no helper UI, for the same reason the token is explicit: an
                 # unattended run must FAIL rather than wait at a console nobody is at.
-                'GIT_TERMINAL_PROMPT': '0',
+                **NON_INTERACTIVE,
                 # THE HELPER LIST, CLEARED. An empty `credential.helper` resets it, so nothing in
                 # this invocation can read or write the operator's store.
                 'GIT_CONFIG_COUNT': '1',
