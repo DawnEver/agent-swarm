@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mint and publish the next version tag on every push of the default branch.
+# Mint and publish the next version tag on every push that ADVANCES the default branch.
 #
 # The version is derived from git (pyproject: [tool.hatch.version] source = "vcs"), so "bumping the
 # version" IS "creating the next tag". There is nowhere else a version could be written.
@@ -25,6 +25,19 @@
 # its branch already up to date and succeeds as a no-op.
 #
 # `--no-verify` on the inner push: without it this hook re-enters itself.
+#
+# WHAT DECIDES: THE REMOTE REF, NOT THE LOCAL BRANCH. git feeds a pre-push hook one line per ref on
+# stdin -- `<local ref> <local sha> <remote ref> <remote sha>` -- and pre-commit passes that stdin
+# through to `entry`. `refs/heads/<default>` being updated IS the release, whatever the pusher
+# happens to have checked out. Deciding on `git rev-parse --abbrev-ref HEAD` instead asks a
+# DIFFERENT question that agrees only in the common case: it is right for someone sitting on the
+# default branch pushing it, and silently inert for an integrator running
+# `git push origin <topic>:main`, which is exactly the workflow this project prescribes -- every
+# producer emits a Submission and one integrator advances the trunk. Three such pushes reported
+# "Passed" while the remote gained zero tags.
+#
+# It also fixes WHICH COMMIT is tagged. The version belongs to the commit the trunk is being moved
+# to -- the local sha on that stdin line -- and HEAD need not be it.
 set -uo pipefail
 
 # pre-commit exports the push's real remote; the positional is for tests, which drive this script
@@ -38,16 +51,52 @@ die() {
   exit 1
 }
 
-# Only the default branch carries releases: a topic-branch push must not mint a release tag. This is
-# a legitimate no-op rather than a failure, and it still says so -- on stderr, which pre-commit shows
-# even for a passing hook, so "skipped" and "ran" are never confused.
+# A no-op is a legitimate outcome, but it must be READABLE. It says what it declined and why, on
+# stderr, and the hook is declared `verbose: true` in .pre-commit-config.yaml so pre-commit prints
+# that output on the PASSING path too -- otherwise "correctly declined" and "did nothing" arrive at
+# the operator as the same blank line, which is the shape this project refuses.
+decline() {
+  echo "bump-version: no tag minted -- $1" >&2
+  shift
+  for line in "$@"; do echo "  ${line}" >&2; done
+  exit 0
+}
+
+# Only the default branch carries releases.
 DEFAULT_BRANCH=$(git symbolic-ref --quiet --short "refs/remotes/${REMOTE}/HEAD" 2>/dev/null | sed "s@^${REMOTE}/@@")
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-if [ "${CURRENT_BRANCH}" != "${DEFAULT_BRANCH}" ]; then
-  echo "bump-version: on '${CURRENT_BRANCH}', not the release branch '${DEFAULT_BRANCH}' -- no tag minted." >&2
-  echo "  Builds off this branch spell themselves <next>.dev<N>+g<sha>, which is already unique." >&2
-  exit 0
+RELEASE_REF="refs/heads/${DEFAULT_BRANCH}"
+
+# THE REF LINES. A push may carry several at once; only the one updating the release ref decides, and
+# the rest are irrelevant rather than disqualifying. A deletion arrives with an all-zero LOCAL sha
+# (and `(delete)` as the local ref): the trunk is being removed, so there is no commit to version.
+# `[ ! -t 0 ]` because git and pre-commit always hand this a pipe; a TTY means the script was invoked
+# by hand with nothing being pushed, and reading would block forever rather than answer.
+TARGET_SHA=''
+TARGET_LOCAL_REF=''
+DELETION_SEEN=''
+SEEN_REFS=''
+if [ ! -t 0 ]; then
+  while read -r local_ref local_sha remote_ref _remote_sha; do
+    [ -n "${remote_ref}" ] || continue
+    SEEN_REFS="${SEEN_REFS}${SEEN_REFS:+, }${remote_ref}"
+    [ "${remote_ref}" = "${RELEASE_REF}" ] || continue
+    case "${local_sha}" in
+      *[!0]*) TARGET_SHA="${local_sha}" ; TARGET_LOCAL_REF="${local_ref}" ;;
+      *) DELETION_SEEN='yes' ;;
+    esac
+  done
+fi
+
+if [ -n "${DELETION_SEEN}" ] && [ -z "${TARGET_SHA}" ]; then
+  decline "this push DELETES '${RELEASE_REF}' on '${REMOTE}'." \
+    "There is no commit to version, so minting a tag here would point a release at nothing."
+fi
+
+if [ -z "${TARGET_SHA}" ]; then
+  decline "this push updates no '${RELEASE_REF}' on '${REMOTE}'." \
+    "It updates: ${SEEN_REFS:-<no refs on stdin>}" \
+    "Builds off any other ref spell themselves <next>.dev<N>+g<sha>, which is already unique."
 fi
 
 # Refresh remote tags so the highest-tag computation and the collision scan both see a tag another
@@ -57,24 +106,26 @@ git fetch --quiet --tags "${REMOTE}" >/dev/null 2>&1 || true
 
 publish() {
   # AN OPERATION'S EXIT IS NOT ITS EFFECT: the push is checked, and then the REMOTE is read back.
+  # The branch half mirrors the OUTER push exactly -- the same sha onto the same remote ref -- so
+  # the outer push then finds it already up to date and succeeds as a no-op.
   local tag="$1"
-  if ! git push --no-verify --atomic "${REMOTE}" "refs/heads/${CURRENT_BRANCH}" "refs/tags/${tag}" >/dev/null 2>&1; then
+  if ! git push --no-verify --atomic "${REMOTE}" "${TARGET_SHA}:${RELEASE_REF}" "refs/tags/${tag}" >/dev/null 2>&1; then
     return 1
   fi
   git ls-remote --tags "${REMOTE}" "refs/tags/${tag}" 2>/dev/null | grep -q "refs/tags/${tag}"
 }
 
-# HEAD already tagged: do not mint a second version for one commit, but do make sure the tag reached
-# the remote -- an unpublished tag is a version that exists only on this machine.
-EXISTING=$(git tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | head -1)
+# The pushed commit is already tagged: do not mint a second version for one commit, but do make sure
+# the tag reached the remote -- an unpublished tag is a version that exists only on this machine.
+EXISTING=$(git tag --points-at "${TARGET_SHA}" --list 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | head -1)
 if [ -n "${EXISTING}" ]; then
   if publish "${EXISTING}"; then
-    echo "bump-version: HEAD already tagged ${EXISTING}; published." >&2
+    echo "bump-version: ${TARGET_LOCAL_REF} -> ${RELEASE_REF} already tagged ${EXISTING}; published." >&2
     exit 0
   fi
-  die "HEAD is tagged ${EXISTING} but that tag is not on '${REMOTE}' and could not be pushed." \
+  die "${TARGET_SHA} is tagged ${EXISTING} but that tag is not on '${REMOTE}' and could not be pushed." \
     "The installed version of this commit would be indistinguishable from another commit's." \
-    "Fix the remote, then: git push --atomic ${REMOTE} ${CURRENT_BRANCH} refs/tags/${EXISTING}"
+    "Fix the remote, then: git push --atomic ${REMOTE} ${TARGET_SHA}:${RELEASE_REF} refs/tags/${EXISTING}"
 fi
 
 # Highest plain-semver tag by NUMERIC field order. `git tag --sort=-version:refname` depends on a
@@ -106,13 +157,13 @@ else
   done
 fi
 
-if ! git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}" >/dev/null 2>&1; then
+if ! git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}" "${TARGET_SHA}" >/dev/null 2>&1; then
   die "could not create the tag ${NEW_TAG} locally." \
     "Without it this push ships a commit whose version string equals the previous commit's."
 fi
 
 if publish "${NEW_TAG}"; then
-  echo "bump-version: tagged and published ${NEW_TAG}" >&2
+  echo "bump-version: tagged ${TARGET_LOCAL_REF} (${TARGET_SHA}) as ${NEW_TAG} and published it with ${RELEASE_REF}" >&2
   exit 0
 fi
 

@@ -120,6 +120,12 @@ repos:
         always_run: true
         pass_filenames: false
         stages: [pre-push]
+        # VERBOSE BECAUSE THE NO-OP IS A VERDICT. pre-commit discards a PASSING hook's output, and
+        # this hook's commonest passing outcome is "this push updates no refs/heads/<default> -- no
+        # tag minted". Without this the operator cannot tell "correctly declined" from "did
+        # nothing", which is how three topic-branch-onto-main pushes read as `Passed` while the
+        # remote gained zero tags. `verbose` prints the hook's output on the passing path too.
+        verbose: true
 
 # DROPPED FROM motronics' CONFIG, with the reason, so that "absent" and "forgotten" are different:
 #
