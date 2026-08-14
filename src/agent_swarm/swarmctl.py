@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_swarm import credentials, roles
+from agent_swarm import seal as _seal
 from agent_swarm.forge import _BACKOFF_S as BACKOFF_S
 from agent_swarm.forge import API_ATTEMPTS, _is_retryable_status
 
@@ -1166,10 +1167,26 @@ def cmd_enroll(provider: GiteaProvider, args: argparse.Namespace) -> int:
     for username, token in issued.items():
         store_credential(provider.scheme, provider.netloc, username, token)
         say(f'  {username:<18} stored  sha256={fingerprint(token)}')
+    _store_host_machine_key(args.machine, provider.netloc)
     say(f'\n{len(issued)} credentials stored on this machine for {provider.netloc}.')
     say('Losing this machine means revoking exactly these four: `revoke --machine ' + args.machine + '`.')
     _refuse_identities_without_grants(provider, issued, required_repositories(args))
     return 0
+
+
+def _store_host_machine_key(machine: str, host: str) -> None:
+    """Establish this host's copy of `machine`'s rotation key -- the half the ROTATOR seals with.
+
+    The host must retain the machine key it issues, because sealing a future replacement is done
+    with that key (Fallback A). It is stored owner-only in the SWARM's own file, under the separate
+    `machine://` namespace that no role-token lookup can reach, and it never enters a git environment.
+    """
+    key = credentials.generate_machine_key()
+    try:
+        credentials.store_machine_key(machine, host, key)
+    except (PermissionError, RuntimeError) as exc:
+        raise Fail(str(exc)) from None
+    say(f'  machine key          stored  (owner-only, isolated namespace) sha256={fingerprint(key.hex())}')
 
 
 def write_secret_file(path: Path, payload: dict) -> None:
@@ -1198,12 +1215,28 @@ def cmd_emit(provider: GiteaProvider, args: argparse.Namespace) -> int:
     # is refused beside the administrator who can grant it -- rather than on the far machine, which
     # has the bundle and no way to change a permission.
     _refuse_identities_without_grants(provider, issued, required_repositories(args))
+    # THE MACHINE KEY TRAVELS IN THE SAME BUNDLE, AND THE HOST KEEPS ITS COPY. `consume` stores the
+    # key on the far machine so IT can unseal future rotations; this host keeps its own so the
+    # ROTATOR can seal them. Both halves use the isolated `machine://` namespace -- the key never
+    # enters a git environment and is never a role-token lookup.
+    key = credentials.generate_machine_key()
+    try:
+        credentials.store_machine_key(args.machine, provider.netloc, key)
+    except (PermissionError, RuntimeError) as exc:
+        raise Fail(str(exc)) from None
     path = Path(args.out or f'swarm-enroll-{args.machine}.json').resolve()
-    payload = {'scheme': provider.scheme, 'host': provider.netloc, 'machine': args.machine, 'credentials': issued}
+    payload = {
+        'scheme': provider.scheme,
+        'host': provider.netloc,
+        'machine': args.machine,
+        'credentials': issued,
+        'machine_key': _seal.to_bundle(key),
+    }
     write_secret_file(path, payload)
     say(f'wrote {path} (owner-readable only)')
     for username, token in issued.items():
         say(f'  {username:<18} sha256={fingerprint(token)}')
+    say(f'  machine key          sha256={fingerprint(key.hex())}')
     say('\nMove it to ' + args.machine + ' and run:  swarmctl consume --bundle <file>')
     say('It contains live credentials in plaintext. `consume` deletes it; if you abandon the')
     say('transfer, run `revoke --machine ' + args.machine + '` rather than leaving it on disk.')
@@ -1216,6 +1249,13 @@ def cmd_consume(_provider: GiteaProvider | None, args: argparse.Namespace) -> in
     for username, token in payload['credentials'].items():
         store_credential(payload['scheme'], payload['host'], username, token)
         say(f'  {username:<18} stored  sha256={fingerprint(token)}')
+    machine_key = payload.get('machine_key')
+    if machine_key:
+        try:
+            credentials.store_machine_key(payload['machine'], payload['host'], _seal.from_bundle(machine_key))
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            raise Fail(str(exc)) from None
+        say(f'  machine key          stored  (owner-only, isolated namespace) sha256={fingerprint(machine_key)}')
     Path(args.bundle).unlink()
     say(f'\nstored {len(payload["credentials"])} credentials; bundle deleted.')
     return 0
