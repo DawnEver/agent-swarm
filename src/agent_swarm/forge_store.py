@@ -55,7 +55,7 @@ import enum
 import re
 import threading
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import ClassVar, Self
 
@@ -403,9 +403,87 @@ class ForgeStore:
                 claim on it means anything. This used to be a quiet ``False``, which made a broken
                 deployment indistinguishable from a busy one.
         """
+        return self._claim(job, owner=owner, reclaim=False, reclaim_miss_limit=None, reclaim_sample=None)
+
+    def try_reclaim(
+        self,
+        job: Job,
+        *,
+        owner: str,
+        reclaim_miss_limit: int | None = None,
+        reclaim_sample: Callable[[], None] | None = None,
+    ) -> bool:
+        """Take `job` for `owner`, taking over a holder only after watching it stop beating.
+
+        THE CROSS-MACHINE CLAIM PATH. `try_claim` is the single-process one: it arbitrates a FRESH
+        race and reclaims a holder that has LAPSED by wall clock, and it never steals a holder that
+        is merely not yet expired. Across machines that is not enough -- two boxes whose clocks
+        disagree cannot agree on "lapsed", so a holder dead on its own box can read as live on a
+        candidate's for up to a lease. This path answers that: it runs the same fast `take` first,
+        and if a live claim ranks ahead it hands off to :meth:`agent_swarm.claim.Arbiter.reclaim` --
+        the failure detector that steals only after the holder's own monotonic `refresh` counter has
+        gone unchanged for `reclaim_miss_limit` consecutive reads. A holder that keeps beating is
+        never stolen, whatever either machine's clock says.
+
+        THE DIVISION OF LABOUR IS THE PROTOCOL'S, NOT A HAND-WAVE. `take` (inside `try_claim`) keeps
+        its wall-clock path for the single-process case where one clock is authoritative; `reclaim`
+        is the clock-free takeover for the cross-machine case where no clock is. Both coexist; the
+        CAS is still the comment id, decided by the same one read -- this method only decides WHEN a
+        holder may be taken over, never HOW. See `agent_swarm.claim` for why a holder judged dead is
+        reclaimed by deleting its claim comment and arbitrating the slot, and why the fleet is never
+        left with two live holders even through a false verdict.
+
+        Args:
+            reclaim_miss_limit: consecutive unchanged reads that prove the holder dead, passed to
+                `reclaim`. ``None`` means `reclaim`'s own default, so the fleet's choice is the one
+                the detector defines and never a second spelling.
+            reclaim_sample: called between `reclaim`'s polls at the candidate's cadence, letting a
+                live holder beat before the next read. ``None`` means `reclaim` sleeps its own
+                `beat_every`, the one derivation.
+
+        Raises:
+            ArbitrationUnsound: the backend could not read a comment it had just written, so no
+                claim on it means anything.
+            ValueError: a non-positive `reclaim_miss_limit`.
+        """
+        return self._claim(
+            job,
+            owner=owner,
+            reclaim=True,
+            reclaim_miss_limit=reclaim_miss_limit,
+            reclaim_sample=reclaim_sample,
+        )
+
+    def _claim(
+        self,
+        job: Job,
+        *,
+        owner: str,
+        reclaim: bool,
+        reclaim_miss_limit: int | None,
+        reclaim_sample: Callable[[], None] | None,
+    ) -> bool:
+        """The ONE claim flow, fast path then optional clock-free takeover.
+
+        `try_claim` and `try_reclaim` are the two faces of this single implementation; a second copy
+        would be the drift this module exists to delete. The fast `take` decides the fresh race and
+        the single-process wall-clock reclaim; the `reclaim` hand-off is engaged only when asked,
+        which is what keeps `try_claim`'s contract -- a held, non-expired claim refuses a new
+        claimant -- from stealing in a single process.
+        """
         number = self._item_number(job, create=True)
         assert not isinstance(number, NotVisible)
-        return self._arbiter(number).take(owner=owner) is not None
+        arbiter = self._arbiter(number)
+        if arbiter.take(owner=owner) is not None:
+            return True
+        if not reclaim:
+            return False
+        kwargs: dict[str, object] = {'owner': owner}
+        if reclaim_miss_limit is not None:
+            kwargs['miss_limit'] = reclaim_miss_limit
+        if reclaim_sample is not None:
+            kwargs['sample'] = reclaim_sample
+        return arbiter.reclaim(**kwargs) is not None
 
     def renew_claim(self, job: Job, *, owner: str) -> float:
         """Beat the heart of an existing claim. Returns the NEW expiry.
