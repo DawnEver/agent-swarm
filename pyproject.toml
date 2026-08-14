@@ -33,15 +33,26 @@ dependencies = []
 procs = ["psutil>=5.9"]
 # psutil is in `dev` too: the procs suite spawns real processes and would otherwise be silently
 # unrunnable, which for a module about "is it actually dead" is the worst possible thing to skip.
+# `crypto` is the SEAL/UNSEAL half of token rotation (`agent_swarm.seal`): the only place this package
+# needs an AEAD, supplied by the audited `cryptography` library rather than a hand-rolled cipher. It
+# is opt-in for the same reason `procs` is -- the Gitea host runs from a bare checkout with no venv,
+# and the decision core never reaches. Absent `cryptography`, `agent_swarm.seal` still IMPORTS; the
+# real seal is reached only through `seal.real()`, which lazily imports the library and RAISES a
+# clear reason when it is not installed.
+crypto = ["cryptography"]
 # DEV-TIME, and that distinction is load-bearing rather than tidy: nothing in this list is importable
 # from `src/agent_swarm`, so none of it reaches the Gitea host, where the package runs from a
 # checkout with no venv and no installer. `setuptools-scm` is here because
 # `tests/test_the_version_moves_with_the_commit.py` computes versions with the same engine the build
 # backend uses; `pre-commit` and `commitizen` are what .pre-commit-config.yaml drives.
+# `cryptography` is in `dev` too (as psutil is for `procs`): the seal suite exercises the REAL AEAD,
+# and a suite that could not run its real primitive would silently skip the thing the extra exists to
+# ship.
 dev = [
     "pytest>=8",
     "ruff>=0.6",
     "psutil>=5.9",
+    "cryptography",
     "pre-commit",
     "commitizen",
     "setuptools-scm",
