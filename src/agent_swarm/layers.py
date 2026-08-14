@@ -184,17 +184,18 @@ LAYERS: dict[str, int] = {
     'swarmctl': ENTRY,
     'tick': ENTRY,
     'workbench_cli': ENTRY,
-    # THE FOUR THAT ARRIVED 2026-08-12, and ENTRY is what they are: each is a command with its own
+    # THE THREE THAT ARRIVED 2026-08-12, and ENTRY is what they are: each is a command with its own
     # `main`, nothing in this package imports any of them, and every consumer fact they need --
     # a store directory, the trees to sweep, which roots hold importable code, which package and
     # distribution to resolve against -- is a required argument. They are `DEV_TOOL` below.
-    'pins': ENTRY,
+    # (`pins` was the fourth; it moved to the rem plugin 2026-08-14, its value being the Claude
+    # Code hook integration, which a host-agnostic package cannot carry.)
     'callsites': ENTRY,
     'staged_imports': ENTRY,
     'installed_symbols': ENTRY,
 }
 
-DEV_TOOL = frozenset({'bench', 'rem_bridge', 'pins', 'callsites', 'staged_imports', 'installed_symbols'})
+DEV_TOOL = frozenset({'bench', 'rem_bridge', 'callsites', 'staged_imports', 'installed_symbols'})
 """Development conveniences that happen to live here, NOT part of the job layer.
 
 Borrowed from motronics' four-valued PLACEMENT and for its stated reason: generic makes a module
