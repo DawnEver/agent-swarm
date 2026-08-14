@@ -446,7 +446,15 @@ class ForgeStore:
                 f'Stop the work: something else may already have taken it.'
             )
             raise LeaseLost(msg)
-        return arbiter.renew(Held(arbiter=arbiter, owner=owner, comment_id=mine.comment_id, expires_at=mine.expires_at))
+        return arbiter.renew(
+            Held(
+                arbiter=arbiter,
+                owner=owner,
+                comment_id=mine.comment_id,
+                expires_at=mine.expires_at,
+                refresh=mine.refresh,
+            )
+        )
 
     def claim_owner(self, job: Job) -> str | None:
         number = self._item_number(job)

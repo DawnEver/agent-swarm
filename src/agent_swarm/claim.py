@@ -14,9 +14,15 @@ found only when `--heavy` printed work nobody would ever do.
 THE PROTOCOL: A SERVER-ASSIGNED MONOTONIC ORDERING KEY, AND THE LOWEST N LIVE IDS WIN
 =====================================================================================
 
-    1. POST a comment `CLAIM <expiry> <owner>` on the contended item.
-    2. GET the comment list, ONCE. Sort the unexpired claims by comment id.
+    1. POST a comment `CLAIM <expiry> <refresh> <owner>` on the contended item.
+    2. GET the comment list, ONCE. Sort the live claims by comment id.
     3. Inside the first N -> held. Outside -> DELETE your own comment and return None.
+
+`<refresh>` is a monotonic counter only the holder's `renew` bumps. It is what makes the lease a
+FAILURE DETECTOR rather than a wall clock: `reclaim` steals a holder only after watching that
+counter go unchanged for `miss_limit` consecutive reads, so two machines whose clocks disagree
+never each conclude the other is dead (`expires_at` is kept for the holder's own self-guard and
+for a human scrolling the comment, never compared across machines).
 
 **THIS IS NOT A COMPARE-AND-SWAP, and calling it one would be the lie.** It is post-then-arbitrate,
 the same SHAPE as motronics' `ci_tick.claim()` that `store.py` was written to condemn. What makes it
@@ -151,27 +157,80 @@ class ArbitrationUnsound(RuntimeError):
     """
 
 
+class _MissCounter:
+    """A failure detector over one set of claims: dead only after K consecutive UNCHANGED reads.
+
+    THE CLOCK-FREE CORE OF THE LEASE. It compares successive GENERATIONS it has read itself, never a
+    timestamp it did not write, so two machines whose wall clocks disagree still reach one verdict
+    about a holder: it is alive exactly while `renew` keeps bumping its refresh, and dead only
+    when the detector has watched that refresh stay put for `miss_limit` consecutive reads. The
+    first read of a claim establishes a baseline (``'baseline'``); each subsequent read is either
+    ``'alive'`` (the refresh moved), ``'miss'`` (it did not, but we are not at the limit yet) or
+    ``'dead'`` (it has not moved for `miss_limit` reads).
+    """
+
+    __slots__ = ('miss_limit', '_refresh', '_consecutive')
+
+    def __init__(self, *, miss_limit: int) -> None:
+        self.miss_limit = miss_limit
+        self._refresh: dict[int, int] = {}
+        self._consecutive: dict[int, int] = {}
+
+    def observe(self, comment_id: int, refresh: int) -> str:
+        """Feed one read of a claim's refresh; return ``'baseline'``/``'alive'``/``'miss'``/``'dead'``."""
+        previous = self._refresh.get(comment_id)
+        if previous is None:
+            self._refresh[comment_id] = refresh
+            self._consecutive[comment_id] = 0
+            return 'baseline'
+        if refresh != previous:
+            self._refresh[comment_id] = refresh
+            self._consecutive[comment_id] = 0
+            return 'alive'
+        misses = self._consecutive.get(comment_id, 0) + 1
+        self._consecutive[comment_id] = misses
+        if misses >= self.miss_limit:
+            return 'dead'
+        return 'miss'
+
+
 @dataclass(frozen=True, slots=True)
 class Claim:
-    """A parsed claim comment. `comment_id` is the ordering key and is the server's, never ours."""
+    """A parsed claim comment. `comment_id` is the ordering key and is the server's, never ours.
+
+    `refresh` is a monotonic counter that ONLY the holder's `renew` bumps. It is the one clock
+    that all machines can agree on: it is not a timestamp, so a candidate stealing a holder never
+    compares two wall clocks -- it counts how many successive reads show the same refresh, which
+    is the failure detector's whole basis. `expires_at` survives for the holder's own self-guard
+    and for a human reading the comment; it is NOT compared across machines.
+    """
 
     owner: str
     expires_at: float
+    refresh: int = 0
     comment_id: int = -1
 
     def is_expired(self, *, now: float) -> bool:
-        """Has the lease run out? The boundary instant is still HELD, not free."""
+        """Has the lease run out? The boundary instant is still HELD, not free.
+
+        A SELF-GUARD ONLY, never a cross-machine verdict. The holder checks its OWN expiry against
+        its OWN clock; a candidate never uses this to call a holder dead, because that would compare
+        two machines' clocks. `reclaim` decides death from `refresh`, not from this.
+        """
         return now > self.expires_at
 
 
-def encode_claim(*, owner: str, expires_at: float) -> str:
-    """`CLAIM <expiry> <owner>`.
+def encode_claim(*, owner: str, expires_at: float, refresh: int = 0) -> str:
+    """`CLAIM <expiry> <refresh> <owner>`.
 
     The expiry comes FIRST so that the owner can be the whole remainder of the line: an owner with
     a space in it would otherwise be silently truncated to its first word, and two machines would
     then share one identity -- a release by either freeing the other's claim.
+
+    `refresh` sits before the owner for the same reason, and it is the monotonic refresh count
+    `renew` bumps. A claim that has never been beaten carries refresh 0.
     """
-    return f'{CLAIM_MARKER} {expires_at:.3f} {owner}'
+    return f'{CLAIM_MARKER} {expires_at:.3f} {refresh} {owner}'
 
 
 def decode_claim(body: str, *, comment_id: int = -1) -> Claim | None:
@@ -181,21 +240,24 @@ def decode_claim(body: str, *, comment_id: int = -1) -> Claim | None:
         ValueError: `body` announces itself as a claim and then cannot be read as one. THE
             DISTINCTION MATTERS MORE THAN IT LOOKS: "not a claim" and "an unreadable claim" would
             both be skipped if this returned ``None`` for each, and skipping a live claim hands a
-            running job to a second runner. A verdict comment is the first case; a truncated or
-            future-format claim is the second, and it must stop the caller.
+            running job to a second runner. A verdict comment is the first case; a truncated,
+            future-format, or refresh-less claim is the second, and it must stop the caller --
+            a claim whose `refresh` cannot be read has no failure detector and must not be
+            silently treated as dead.
     """
     if not body.startswith(f'{CLAIM_MARKER} '):
         return None
-    parts = body.split(maxsplit=2)
-    if len(parts) != 3:
+    parts = body.split(maxsplit=3)
+    if len(parts) != 4:
         msg = f'unreadable claim comment: {body[:80]!r}'
         raise ValueError(msg)
     try:
         expires_at = float(parts[1])
+        refresh = int(parts[2])
     except ValueError as exc:
         msg = f'unreadable claim comment expiry: {body[:80]!r}'
         raise ValueError(msg) from exc
-    return Claim(owner=parts[2], expires_at=expires_at, comment_id=comment_id)
+    return Claim(owner=parts[3], expires_at=expires_at, refresh=refresh, comment_id=comment_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +327,7 @@ class Held:
     owner: str
     comment_id: int
     expires_at: float
+    refresh: int = 0
 
     def needs_beat(self, *, now: float | None = None) -> bool:
         """Whether a caller's loop should beat NOW. The cadence, as code rather than as advice.
@@ -404,11 +467,12 @@ class Arbiter:
             )
             raise LeaseLost(msg)
         expires_at = now + self.lease_seconds
+        refresh = held.refresh + 1
         try:
             self.forge.update_comment(
                 self.item_number,
                 held.comment_id,
-                encode_claim(owner=held.owner, expires_at=expires_at),
+                encode_claim(owner=held.owner, expires_at=expires_at, refresh=refresh),
             )
         except CommentGone as exc:
             msg = (
@@ -417,6 +481,7 @@ class Arbiter:
             )
             raise LeaseLost(msg) from exc
         held.expires_at = expires_at
+        held.refresh = refresh
         return expires_at
 
     def release(self, *, owner: str, comment_id: int) -> None:
@@ -469,6 +534,103 @@ class Arbiter:
         ]
         live.sort(key=lambda claim: claim.comment_id)
         return live
+
+    def reclaim(
+        self,
+        *,
+        owner: str,
+        miss_limit: int = 3,
+        sample: Callable[[], None] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> Held | None:
+        """Take over from a holder only after watching its refresh go unchanged for `miss_limit`
+        consecutive reads -- the failure detector, not the wall clock.
+
+        WHY THIS IS NOT `take`. `take` arbitrates a FRESH race by comment id, and a fresh claim is
+        live on first sight; it never steals, because a single read cannot tell a live-but-skewed
+        holder from a dead one. This is the path that DOES steal, and it earns it: it posts our
+        claim, then polls the holders that keep us out of the slots. Each poll reads their
+        `refresh`. A refresh that moves means the holder is alive and will keep beating, so we
+        withdraw and try again later. A refresh that stays put for `miss_limit` polls means the
+        holder is DEAD -- not because a clock says so, but because only the holder's own `renew`
+        bumps that counter and it has not. Only then do we delete the dead claim and take the slot.
+
+        THE INVARIANT HOLDS THROUGH A FALSE POSITIVE, not in spite of it. If we ever misjudge a
+        living holder dead, its next `renew` finds its comment pruned and raises `LeaseLost` -- so
+        the fleet is never left with two live holders, whatever a stray verdict says.
+
+        Args:
+            owner: who we are claiming as.
+            miss_limit: consecutive unchanged reads that prove death. MUST BE POSITIVE -- a limit of
+                zero would steal from a holder on its first unread.
+            sample: called between polls, at OUR cadence, to let time pass (and a live holder to
+                beat) before the next read. Defaults to sleeping the claim's own `beat_every`, which
+                is `lease / 4` -- the one derivation, never re-derived here.
+            clock: our own wall clock, used ONLY for the `expires_at` this claim reports and guards.
+                It is never compared to a holder's, so a skewed `clock` cannot make us steal.
+
+        Returns:
+            The `Held` we won, or ``None`` when the blockers are alive and we gave up for now.
+
+        Raises:
+            ArbitrationUnsound: our just-posted claim was not in the list we read.
+        """
+        if miss_limit < 1:
+            msg = f'miss_limit must be positive, got {miss_limit!r}. A limit of zero would steal'
+            raise ValueError(msg)
+        sample = sample or (lambda: time.sleep(self.beat_every))
+        clock = clock or time.time
+        expires_at = clock() + self.lease_seconds
+        mine = self.forge.add_comment(self.item_number, encode_claim(owner=owner, expires_at=expires_at))
+        detector = _MissCounter(miss_limit=miss_limit)
+
+        while True:
+            claims = self.forge.comments(self.item_number)
+            dead: set[int] = set()
+            alive: set[int] = set()
+            for comment in claims:
+                if comment.id == mine:
+                    continue
+                claim = decode_claim(comment.body, comment_id=comment.id)
+                if claim is None:
+                    continue
+                verdict = detector.observe(claim.comment_id, claim.refresh)
+                if verdict == 'dead':
+                    dead.add(claim.comment_id)
+                elif verdict == 'alive':
+                    alive.add(claim.comment_id)
+
+            live = [
+                claim
+                for claim in (decode_claim(c.body, comment_id=c.id) for c in claims)
+                if claim is not None and claim.comment_id not in dead
+            ]
+            live.sort(key=lambda claim: claim.comment_id)
+            rank = next((i for i, claim in enumerate(live) if claim.comment_id == mine), None)
+            if rank is None:
+                self.forge.delete_comment(self.item_number, mine)
+                msg = (
+                    f'claim comment {mine} on item {self.item_number} was posted and is not in the '
+                    f'list this process then read. The deployment does not offer read-after-write '
+                    f'consistency, so no arbitration on it can be trusted.'
+                )
+                raise ArbitrationUnsound(msg)
+            if rank < self.slots:
+                # Won. Sweep the confirmed-dead claims we just outranked so the freed slot is
+                # durable -- a comment left behind would re-block the next reader.
+                for dead_id in dead:
+                    self.forge.delete_comment(self.item_number, dead_id)
+                return Held(arbiter=self, owner=owner, comment_id=mine, expires_at=expires_at)
+
+            # Still blocked. A holder that occupies one of the first `slots` live ranks and is
+            # confirmed ALIVE will keep beating, so there is no path to a slot while it lives.
+            blockers = live[: self.slots]
+            if any(claim.comment_id in alive for claim in blockers):
+                self.forge.delete_comment(self.item_number, mine)
+                return None
+            # Nothing is dead and nothing proved alive yet -- the holder may still be starting up.
+            # Wait our cadence and read again.
+            sample()
 
 
 class Beater:

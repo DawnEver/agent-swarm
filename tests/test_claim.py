@@ -327,6 +327,127 @@ class TestTheLeaseAndTheHeartbeat:
         assert inspect.signature(Held.renew).return_annotation == 'float'
 
 
+class TestFailureDetectorReclaimsWithoutWallClock:
+    """The lease's death verdict, made clock-independent.
+
+    WHY NOT A WALL CLOCK. The old liveness skipped a claim once ``now > expires_at`` -- a candidate
+    comparing ITS clock to a holder's, so two machines with skewed clocks could each read the other
+    as expired and both believe they were the sole holder (the flaky-tests shape). Here a candidate
+    never reads a holder's clock: it counts how many successive reads show the same `refresh`,
+    which only the holder's own `renew` bumps. A holder is dead only after `miss_limit` consecutive
+    UNCHANGED reads, and is never stolen while that counter keeps moving.
+
+    THE `clock` INJECTED IS DELIBERATELY USED ONLY FOR THE CANDIDATE'S OWN `expires_at`. The skew
+    tests make it run HOURS ahead to show it plays no part in judging a holder dead.
+    """
+
+    def test_renew_BUMPs_the_refresh_in_place(self, forge):
+        """The one counter the detector reads. If `renew` did not bump it, a live holder would read
+        as dead after `miss_limit` reads and every healthy job would be stolen."""
+        arbiter = _arbiter(forge, slots=1)
+        hold = arbiter.take(owner='x')
+        assert hold.refresh == 0
+        hold.renew()
+        assert hold.refresh == 1
+        assert decode_claim(forge.comments(arbiter.item_number)[0].body).refresh == 1
+
+    def test_a_live_holder_with_a_SKEWED_clock_is_not_stolen(self, forge):
+        """A beats between a candidate's samples, so its refresh moves and the detector reads
+        it alive -- whatever either machine's clock says."""
+        arbiter = _arbiter(forge, slots=1)
+        a_hold = arbiter.take(owner='A')
+        assert a_hold.refresh == 0
+
+        def sample() -> None:
+            a_hold.renew()  # A lives and beats; its refresh advances regardless of clocks
+
+        won = arbiter.reclaim(owner='B', miss_limit=3, sample=sample, clock=time.time)
+        assert won is None, 'a live, renewing holder was stolen'
+        assert arbiter.holders().by('A') is not None
+        assert arbiter.holders().by('B') is None
+
+    def test_a_candidate_whose_OWN_clock_runs_hours_AHEAD_does_not_steal(self, forge):
+        """THE DISCRIMINATING SKEW TEST. B's clock is two hours ahead of A's, so the old
+        wall-clock lease would have read A's `expires_at` as lapsed and B would have taken a live
+        job. The injected `clock` only writes B's OWN `expires_at`; the death verdict comes from A's
+        refresh, which is moving."""
+        arbiter = _arbiter(forge, slots=1, lease_seconds=300.0)
+        a_hold = arbiter.take(owner='A')
+
+        def ahead_clock() -> float:
+            return time.time() + 7200.0
+
+        def sample() -> None:
+            a_hold.renew()
+
+        won = arbiter.reclaim(owner='B', miss_limit=3, sample=sample, clock=ahead_clock)
+        assert won is None, 'a live holder was stolen because of a clock skew'
+        assert arbiter.holders().by('A') is not None
+
+    def test_a_dead_holder_is_stolen_only_after_K_consecutive_UNCHANGED_reads(self, forge):
+        """A stops renewing; its refresh freezes. B must watch it go unchanged for `miss_limit`
+        reads before it may take over -- never on a single read."""
+        arbiter = _arbiter(forge, slots=1, lease_seconds=300.0)
+        arbiter.take(owner='A')  # A takes and dies without ever beating
+
+        samples = {'n': 0}
+
+        def sample() -> None:
+            samples['n'] += 1
+
+        won = arbiter.reclaim(owner='B', miss_limit=3, sample=sample, clock=time.time)
+        assert won is not None, 'a dead holder was never reclaimed'
+        assert won.owner == 'B'
+        assert samples['n'] >= 3, 'the death verdict did not require K consecutive unchanged reads'
+        # The dead claim is gone, not merely outranked: the freed slot is durable.
+        assert arbiter.holders().by('A') is None
+        assert arbiter.holders().by('B') is not None
+
+    def test_a_holder_that_renews_TWICE_then_dies_is_still_reclaimed(self, forge):
+        """A holder that beat a few times (refresh well above zero) and then stopped must read as
+        dead exactly like a never-beating one -- the detector keys on the counter STOPPING, not on
+        its value."""
+        arbiter = _arbiter(forge, slots=1, lease_seconds=300.0)
+        a_hold = arbiter.take(owner='A')
+        a_hold.renew()
+        a_hold.renew()
+        assert decode_claim(forge.comments(arbiter.item_number)[0].body).refresh == 2
+
+        def sample() -> None:
+            pass
+
+        won = arbiter.reclaim(owner='B', miss_limit=2, sample=sample, clock=time.time)
+        assert won is not None and won.owner == 'B'
+        assert arbiter.holders().by('A') is None
+
+    def test_an_unchanged_refresh_is_NOT_dead_before_K_reads(self):
+        """The tolerant half: within `miss_limit` unchanged reads a claim is still 'miss', never
+        'dead' -- so a holder whose beats merely come slower than a candidate's polls is spared."""
+        detector = claim_module._MissCounter(miss_limit=3)
+        assert detector.observe(1, 0) == 'baseline'
+        assert detector.observe(1, 0) == 'miss'
+        assert detector.observe(1, 0) == 'miss'
+        assert detector.observe(1, 0) == 'dead'  # only the K-th consecutive unchanged read kills
+
+    def test_a_refresh_that_CHANGES_resets_the_miss_count(self, forge):
+        """A single movement of the counter is proof of life and forgives every prior miss."""
+        detector = claim_module._MissCounter(miss_limit=3)
+        assert detector.observe(1, 0) == 'baseline'
+        assert detector.observe(1, 0) == 'miss'
+        assert detector.observe(1, 0) == 'miss'
+        assert detector.observe(1, 1) == 'alive'  # it beat; the missed reads are forgotten
+        assert detector.observe(1, 1) == 'miss'  # and the clock starts over
+        assert detector.observe(1, 1) == 'miss'
+        assert detector.observe(1, 1) == 'dead'
+
+    def test_a_non_positive_miss_limit_is_refused_at_the_steal(self, forge):
+        """A limit of zero would steal from a holder on its first unread -- the failure detector
+        with the sensing removed."""
+        arbiter = _arbiter(forge, slots=1)
+        with pytest.raises(ValueError, match='miss_limit'):
+            arbiter.reclaim(owner='B', miss_limit=0, sample=lambda: None, clock=time.time)
+
+
 class TestReleaseIsOwnerCheckedAndIdChecked:
     def test_a_STRANGER_cannot_free_a_live_hold(self, forge):
         """Duplicate execution walking back in through the door marked cleanup."""
