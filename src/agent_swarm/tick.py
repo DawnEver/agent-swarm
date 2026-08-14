@@ -162,6 +162,14 @@ def tick(
     redirects where a verdict lands (refs, a CAS) instead of the work item. None is a second
     scheduler: each is the consumer's policy injected as data at the boundary this function was
     already the seam for, and the one-pass dispatch below them is the only thing this file owns.
+
+    THE CONSUMER IS NAMED so these do not read as generality nobody asked for: motronics-studio's
+    compute plane. Its `scripts/compute/compute_executor.py` runs a solve leg as a COMPUTE job and
+    its `workflow/compute_record.CasRecorder` is a `record` callable that lands the resulting field
+    bundle in a content-addressed store while the verdict still reaches the work item underneath --
+    which is the whole reason `record` exists, a compute answer being a result rather than one of
+    three words. `candidates` and `picker` serve the same consumer's planner, which computes its own
+    schedule (a sweep is N independent legs) and has no roadmap `needs` graph to discover.
     """
     moment = time.time() if now is None else now
     report = TickReport()
