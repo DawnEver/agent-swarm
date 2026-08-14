@@ -50,6 +50,7 @@ from agent_swarm import (
     scaling,
     seats,
     shards,
+    signing,
     spool,
     status,
     store,
@@ -89,6 +90,7 @@ from agent_swarm.scaling import (
     WidthNotHonoured,
     workers_for,
 )
+from agent_swarm.evidence import RecordVerdict, sign_verdict, verify_verdict
 from agent_swarm.store import VERDICTS, InMemoryStore, Store
 
 __all__ = [
@@ -142,6 +144,7 @@ __all__ = [
     'own_claim_is_abandoned',
     'pull',
     'read_owner',
+    'RecordVerdict',
     'refs',
     'roadmap',
     'run_one',
@@ -150,6 +153,8 @@ __all__ = [
     'seats',
     'shards',
     'should_retry',
+    'sign_verdict',
+    'signing',
     'spool',
     'staleness_blocker',
     'status',
@@ -157,5 +162,6 @@ __all__ = [
     'submission',
     'throughput',
     'time_blocker',
+    'verify_verdict',
     'workers_for',
 ]

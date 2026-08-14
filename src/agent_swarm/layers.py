@@ -71,6 +71,11 @@ LAYERS: dict[str, int] = {
     # or verdicts, and every fact that would be a consumer's -- where its source and tests live,
     # which prefixes are scanned, which tests are expensive -- arrives as an argument.
     'selection': HOST,
+    # HOST, and the vocabulary test is what forces it: hmac + hashlib against a payload and a key,
+    # with no word for an issue or a verdict. It imports `roles` (HOST) for the per-role key scheme,
+    # and the VERDICT structure that wraps it lives in `evidence` (JOB) -- where the word "verdict"
+    # already belongs -- so this module stays the primitive and the relation stays a job-layer fact.
+    'signing': HOST,
     # HOST, and the placement follows the layer's definition rather than the word "verdict" in its
     # docstring: it measures a MACHINE -- this interpreter, this installed set, these files on this
     # disk -- and knows nothing about issues, jobs or who is asking. Its two project facts (which
@@ -120,7 +125,8 @@ LAYERS: dict[str, int] = {
     # JOB, and the vocabulary test decides it against the pull of "it is just a dataclass": the
     # record exists to say what a VERDICT rests on, and its `effects` field is the declared intent
     # of a SUBMISSION held against what a run observably did. Needing those words at all puts it
-    # here. It imports nothing.
+    # here. It imports `signing` (HOST) -- a downward edge -- for the attestation primitives the
+    # verdict payload is built on.
     'evidence': JOB,
     'exclusive': JOB,
     'fabric': JOB,

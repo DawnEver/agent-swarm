@@ -43,12 +43,17 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
+from agent_swarm import signing
+
 __all__ = [
     'Artifact',
     'Effects',
     'Evidence',
     'IncompleteEvidence',
+    'RecordVerdict',
     'RunCounts',
+    'sign_verdict',
+    'verify_verdict',
 ]
 
 #: An artifact digest, permissively long-ish rather than exactly 64: a consumer may store a
@@ -212,6 +217,10 @@ class Evidence:
     counts: RunCounts
     effects: Effects
     artifacts: tuple[Artifact, ...] = field(default_factory=tuple)
+    #: WHO PRODUCED THIS RECORD. Optional because a run's evidence can exist before it is judged --
+    #: but a record with no signer is not yet attestable, and :meth:`sign` refuses to sign it as if
+    #: it were someone's. `None` (the default) is therefore "not produced", never "produced by nobody".
+    signer: str | None = None
 
     def __post_init__(self) -> None:
         _require(bool(self.tree), 'evidence needs the digest of the tree that was judged')
@@ -250,11 +259,16 @@ class Evidence:
             'counts': self.counts.to_mapping(),
             'effects': self.effects.to_mapping(),
             'artifacts': [artifact.to_mapping() for artifact in self.artifacts],
+            'signer': self.signer,
         }
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, object]) -> Evidence:
-        """Rebuild a record, naming EVERY missing field in one refusal."""
+        """Rebuild a record, naming EVERY missing field in one refusal.
+
+        `signer` is OPTIONAL -- a record predating attestation, or one not yet produced, has no
+        signer -- so its absence is not a refusal; it defaults to `None`.
+        """
         missing = [name for name in REQUIRED_FIELDS if name not in data]
         _require(not missing, f'evidence is missing required field(s): {", ".join(missing)}')
         return cls(
@@ -263,6 +277,7 @@ class Evidence:
             counts=RunCounts.from_mapping(data['counts']),  # type: ignore[arg-type]
             effects=Effects.from_mapping(data['effects']),  # type: ignore[arg-type]
             artifacts=tuple(Artifact.from_mapping(item) for item in data['artifacts']),  # type: ignore[union-attr]
+            signer=str(data['signer']) if data.get('signer') else None,
         )
 
     def to_json(self) -> str:
@@ -279,6 +294,124 @@ class Evidence:
         """A content address for the whole record.
 
         Over :meth:`to_json`, so the digest covers every field the record serialises and cannot
-        drift from it: a field added to the mapping enters the digest in the same edit.
+        drift from it: a field added to the mapping enters the digest in the same edit. `signer` is
+        in that mapping, so the digest -- and therefore any tag computed over it -- is bound to who
+        produced the record.
         """
         return hashlib.sha256(self.to_json().encode()).hexdigest()[:16]
+
+    def sign(self, key: bytes | str) -> str:
+        """A tag authenticating THIS record, bound to its producer.
+
+        Requires a `signer`: a record nobody produced cannot be signed as if it were someone's. Signs
+        the CONTENT ADDRESS (:meth:`digest`), so the tag authenticates every field the record
+        serialises -- `signer` included -- and moves with the record's canonical text.
+        """
+        if not self.signer:
+            raise IncompleteEvidence('cannot sign an evidence with no signer')
+        return signing.sign(key, self.digest().encode())
+
+    def verify(self, key: bytes | str, tag: str) -> bool:
+        """Whether `tag` is a valid signature of THIS record under `self.signer`'s key.
+
+        The reader must hold the signer role's key -- the very property that keeps an untrusted forge
+        from manufacturing it. A record with no signer is not verifiable and answers False rather
+        than raising: on the must-verify read path an unverifiable verdict is noise, not an error.
+        """
+        if not self.signer:
+            return False
+        return signing.verify(key, self.digest().encode(), tag)
+
+
+@dataclass(frozen=True)
+class RecordVerdict:
+    """A VERDICT AS A SIGNED PAYLOAD -- the answer, the evidence, and the tag that makes the two
+    trustworthy together.
+
+    §3.1: a verdict is a payload signed by the producing role's key; a reader verifies BEFORE the
+    verdict counts; an unsigned or badly-signed verdict is detectable noise, never a verdict. The
+    `tag` binds the verdict WORD and the ref identity to the evidence's content address, so a tag
+    cannot be lifted onto a different verdict, a different tree or a different producer and still
+    verify. `tag` may be empty -- that is an UNSIGNED record, which :func:`verify_verdict` refuses on
+    the read path rather than the constructor, so "was never signed" stays a detectable state.
+    """
+
+    testkey: str
+    kind: str
+    envkey: str
+    verdict: str
+    evidence: Evidence
+    tag: str
+    signer: str
+
+    def __post_init__(self) -> None:
+        _require(bool(self.signer), 'a verdict needs a producer')
+        _require(self.signer == self.evidence.signer, 'the verdict producer and the evidence signer must agree')
+
+
+def _verdict_payload(testkey: str, kind: str, envkey: str, verdict: str, evidence_digest: str) -> bytes:
+    """The canonical bytes the verdict's tag authenticates.
+
+    Canonical (sorted keys, no whitespace) for the same reason :meth:`Evidence.to_json` is: the
+    reader recomputes exactly what the producer signed, and a drift between the two is a verdict
+    that can never verify.
+    """
+    return json.dumps(
+        {
+            'testkey': testkey,
+            'kind': kind,
+            'envkey': envkey,
+            'verdict': verdict,
+            'evidence': evidence_digest,
+        },
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode()
+
+
+def sign_verdict(
+    key: bytes | str,
+    *,
+    testkey: str,
+    kind: str,
+    envkey: str,
+    verdict: str,
+    evidence: Evidence,
+) -> RecordVerdict:
+    """Sign an `evidence` (which must carry a `signer`) into a verdict payload binding the ref
+    identity and the verdict word to the evidence's content address. Returns the signed record.
+
+    THIS IS THE PRODUCER-SIDE HOOK. The verdict write path lives in the consumer (motronics'
+    `ci_tick`), which calls this with the role's key and stores the resulting `RecordVerdict`;
+    agent-swarm supplies the primitive and the structure, and the write path binding is the
+    consumer's next step.
+    """
+    if not evidence.signer:
+        raise IncompleteEvidence('cannot sign a verdict for evidence with no signer')
+    tag = signing.sign(key, _verdict_payload(testkey, kind, envkey, verdict, evidence.digest()))
+    return RecordVerdict(
+        testkey=testkey,
+        kind=kind,
+        envkey=envkey,
+        verdict=verdict,
+        evidence=evidence,
+        tag=tag,
+        signer=evidence.signer,
+    )
+
+
+def verify_verdict(record: RecordVerdict, key: bytes | str) -> bool:
+    """THE MUST-VERIFY READ PATH. Whether `record` is a verdict this reader may count: the tag is
+    present and is a valid signature under `key` (the producer role's key) of exactly this payload.
+
+    An unsigned (empty-tag) or badly-signed record answers False -- it is detectable noise, never a
+    verdict, and it must not advance anything. The forge, which never holds `key`, cannot compute a
+    valid tag no matter what it has seen or moved.
+    """
+    if not record.tag:
+        return False
+    return signing.verify(
+        key,
+        _verdict_payload(record.testkey, record.kind, record.envkey, record.verdict, record.evidence.digest()),
+        record.tag,
+    )
