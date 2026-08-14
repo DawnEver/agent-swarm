@@ -123,6 +123,7 @@ def tick(
     sha: str | None = None,
     candidates: list[Candidate] | None = None,
     picker: Callable[..., list[Job]] = rank,
+    record: Callable[..., None] | None = None,
 ) -> TickReport:
     """One pass: rank what is runnable, take the first thing this box may have, answer it, publish.
 
@@ -154,12 +155,13 @@ def tick(
     `SpooledStore`, so the verdict is on disk before anything is published and a failed POST costs a
     republish rather than the answer.
 
-    TWO SEAMS, BOTH DEFAULT TO THE ROADMAP/SINGLE-QUEUE SHAPE, SO `fleet_cli` IS UNCHANGED:
+    THREE SEAMS, ALL DEFAULTING TO THE ROADMAP/SINGLE-QUEUE SHAPE, SO `fleet_cli` IS UNCHANGED:
     `candidates` replaces the roadmap `needs`-graph discovery (a consumer with no roadmap -- a
-    store-policy scheduler or a compute substrate -- supplies its schedule directly), and `picker`
-    replaces `allocator.rank`'s priority+ageing law with the consumer's own ordering. Neither is a
-    second scheduler: both are the consumer's policy injected as data at the boundary this function
-    was already the seam for, and the one-pass dispatch below them is the only thing this file owns.
+    store-policy scheduler or a compute substrate -- supplies its schedule directly), `picker`
+    replaces `allocator.rank`'s priority+ageing law with the consumer's own ordering, and `record`
+    redirects where a verdict lands (refs, a CAS) instead of the work item. None is a second
+    scheduler: each is the consumer's policy injected as data at the boundary this function was
+    already the seam for, and the one-pass dispatch below them is the only thing this file owns.
     """
     moment = time.time() if now is None else now
     report = TickReport()
@@ -195,6 +197,7 @@ def tick(
             owner=fleet.owner,
             box=box,
             retry=retry,
+            record=record,
         )
         report.outcomes[job.claim_key()] = outcome
         if outcome in (Outcome.ANSWERED, Outcome.CRASHED):
