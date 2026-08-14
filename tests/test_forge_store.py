@@ -222,6 +222,14 @@ class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
         assert memory_store.try_claim(JOB, owner='runner-b') is False
         assert memory_store.claim_owner(JOB) == 'runner-a'
 
+    def test_a_non_positive_reclaim_miss_limit_is_refused(self, memory_store):
+        """A limit of zero would steal from a holder on its first unread -- the failure detector
+        with the sensing removed. Refused by `reclaim`, and this store must not swallow it into a
+        ``False`` that reads as healthy contention."""
+        memory_store.try_claim(JOB, owner='runner-a')
+        with pytest.raises(ValueError, match='miss_limit'):
+            memory_store.try_reclaim(JOB, owner='runner-b', reclaim_miss_limit=0, reclaim_sample=lambda: None)
+
     def test_a_ZERO_lease_is_refused_at_CONSTRUCTION(self, recording_forge):
         """A zero lease expires the claim being made, so every runner refuses forever and the job
         silently never runs -- which reads as healthy contention rather than as a bug.
@@ -281,6 +289,61 @@ class TestTheProtocolRefusesTheWayTheCONTRACTDemands:
         other = Job(id='j2', kind=TEST_RUN)
         assert memory_store.try_claim(JOB, owner='a') is True
         assert memory_store.try_claim(other, owner='b') is True
+
+
+class TestTheCrossMachinePathReclaimsDeadNotLive:
+    """`try_reclaim`: the claim flow's clock-free takeover, decided by a holder's `refresh`.
+
+    WHY NOT `try_claim`'S WALL CLOCK. `try_claim` reclaims a holder only once it LAPSES by this
+    machine's clock -- fine when one process owns one clock, useless across machines whose clocks
+    disagree, where a holder dead on its own box reads as live on a candidate's for up to a lease.
+    `try_reclaim` answers that: a candidate steals only after watching the holder's own monotonic
+    `refresh` go unchanged for `reclaim_miss_limit` consecutive reads -- the failure detector, not
+    a timestamp. A holder that keeps beating is never stolen, and a holder that stops is taken over
+    exactly once, so the fleet is never left with two holders.
+    """
+
+    def test_a_BEATING_holder_is_respected_not_stolen(self, memory_store):
+        """A renews between the candidate's samples, so its refresh moves and the detector reads it
+        alive -- whatever either machine's clock says. The cross-machine path must back off."""
+        assert memory_store.try_claim(JOB, owner='runner-a') is True
+
+        def keep_a_beating() -> None:
+            memory_store.renew_claim(JOB, owner='runner-a')  # A lives; its refresh advances
+
+        assert (
+            memory_store.try_reclaim(JOB, owner='runner-b', reclaim_miss_limit=3, reclaim_sample=keep_a_beating)
+            is False
+        ), 'a live, renewing holder was stolen'
+        assert memory_store.claim_owner(JOB) == 'runner-a'
+        assert memory_store.claim_owner(JOB) != 'runner-b'
+
+    def test_a_dead_holder_is_taken_over_only_after_K_UNCHANGED_reads(self, memory_store):
+        """A takes the job and dies without ever beating; its refresh freezes. B must watch it go
+        unchanged for `reclaim_miss_limit` reads before taking over -- never on a single read."""
+        assert memory_store.try_claim(JOB, owner='runner-a') is True  # A dies, never beating
+
+        samples = {'n': 0}
+
+        def count_sample() -> None:
+            samples['n'] += 1
+
+        assert (
+            memory_store.try_reclaim(JOB, owner='runner-b', reclaim_miss_limit=3, reclaim_sample=count_sample) is True
+        ), 'a dead holder was never reclaimed'
+        assert memory_store.claim_owner(JOB) == 'runner-b'
+        assert samples['n'] >= 3, 'the death verdict did not require K consecutive unchanged reads'
+
+    def test_a_reclaimed_job_has_EXACTLY_one_holder(self, memory_store):
+        """The invariant through the takeover: A is gone and B holds -- never two live holders."""
+        assert memory_store.try_claim(JOB, owner='runner-a') is True
+
+        def sample() -> None:
+            pass
+
+        assert memory_store.try_reclaim(JOB, owner='runner-b', reclaim_miss_limit=3, reclaim_sample=sample) is True
+        assert memory_store.claim_owner(JOB) == 'runner-b'
+        assert memory_store.try_claim(JOB, owner='runner-c') is False, 'a second live holder was admitted'
 
 
 class TestTheVerdictVocabularyIsClosedBEFOREAnyIO:
