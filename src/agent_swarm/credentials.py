@@ -69,8 +69,10 @@ Summaries use a truncated sha256, as the rest of this package does.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import secrets
 import stat
 import subprocess
 import sys
@@ -281,6 +283,78 @@ def forget_token(scheme: str, host: str, username: str, *, path: Path | None = N
     target = path or store_path()
     everything = _load(target)
     if everything.pop(_key(scheme, host, username), None) is not None:
+        write_secret_file(target, everything)
+
+
+# --------------------------------------------------------------------------- the machine key
+
+
+#: The store key for a machine's rotation key. A SEPARATE NAMESPACE from every role token, and that
+#: separation is the whole point: a role-token lookup keys on `scheme://username@host`, this keys on
+#: `machine://<machine>@<host>`, and the two cannot collide because no role account is ever named
+#: `machine`. A machine key stored here is unreachable by any `resolve_token`, so a credential path
+#: that touches role tokens can never hand a rotation key to a transport it authenticates with.
+_MACHINE_SCHEME = 'machine'
+
+
+def _machine_key_key(machine: str, host: str) -> str:
+    """The store key for `machine`'s key on `host`. The host is normalised like a role token's, so a
+    `user@`-prefixed netloc does not double the separator."""
+    return f'{_MACHINE_SCHEME}://{machine}@{normalise_host(host)}'
+
+
+def generate_machine_key(*, length: int = 32) -> bytes:
+    """A fresh rotation key for a machine: CSPRNG bytes, stdlib-only.
+
+    ESTABLISHED AT ENROLMENT and then SEALED AGAINST, never placed in a git environment and never
+    carried on a command line. It exists to open rotation payloads and for nothing else.
+    """
+    return secrets.token_bytes(length)
+
+
+def store_machine_key(machine: str, host: str, key: bytes, *, path: Path | None = None) -> None:
+    """Persist `machine`'s rotation key into the SWARM's owner-only store, then read it back.
+
+    THE READ-BACK IS `store_token`'s, for its reason: a write that cannot fail is indistinguishable
+    from one that works, and a machine that believes it has a key it does not will silently fail to
+    open every future rotation. The key is stored base64 (a serialisation, never a secrecy claim) in
+    the same owner-only file the role tokens live in, under the separate `machine://` namespace.
+
+    Raises:
+        PermissionError: the store could not be made owner-only (see `write_secret_file`).
+        RuntimeError: the store accepted the key and did not keep it. NEVER carries the key.
+    """
+    target = path or store_path()
+    everything = _load(target)
+    everything[_machine_key_key(machine, host)] = base64.b64encode(key).decode('ascii')
+    write_secret_file(target, everything)
+    if resolve_machine_key(machine, host, path=target) != key:
+        msg = (
+            f'the swarm credential store accepted the machine key for {machine}@{host} and did not '
+            f'keep it.\n  store: {target}\n  The machine would silently fail to open every future '
+            f'rotation. Re-establish it with `swarmctl emit`/`consume` (or `enroll` on the host).'
+        )
+        raise RuntimeError(msg)
+
+
+def resolve_machine_key(machine: str, host: str, *, path: Path | None = None) -> bytes | None:
+    """`machine`'s rotation key, or `None` when it has none. A QUIET absence, like a missing token:
+    the caller decides what an un-enrolled machine means, and it is never a prompt.
+
+    REACHABLE ONLY THROUGH THIS FUNCTION, never through `resolve_token` -- see `_machine_key_key`.
+    """
+    raw = _load(path).get(_machine_key_key(machine, host))
+    try:
+        return base64.b64decode(raw.encode('ascii')) if raw else None
+    except (ValueError, UnicodeError):
+        return None
+
+
+def forget_machine_key(machine: str, host: str, *, path: Path | None = None) -> None:
+    """Drop `machine`'s rotation key from the swarm's store. Silent when there was none."""
+    target = path or store_path()
+    everything = _load(target)
+    if everything.pop(_machine_key_key(machine, host), None) is not None:
         write_secret_file(target, everything)
 
 

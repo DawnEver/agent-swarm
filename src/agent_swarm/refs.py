@@ -189,6 +189,7 @@ def aged_globs() -> tuple[str, ...]:
         f'{VERDICTS_ROOT}/*/*/*',
         f'{ATTEMPTS_ROOT}/*/*/*',
         f'{DECISIONS_ROOT}/*/*',
+        f'{ROTATION_ROOT}/*/*',
     )
 
 
@@ -374,3 +375,52 @@ def outcome_ordinal(ref: str) -> int | None:
         return None
     tail = ref.rsplit('/', 1)[-1]
     return int(tail) if tail.isdigit() else None
+
+
+# --------------------------------------------------------------------------- the token-rotation plane
+
+
+#: WHERE THE ROTATOR PUBLISHES A SEALED ROLE-TOKEN REPLACEMENT, one ref per machine per attempt.
+#:
+#: THE CHANNEL IS THE FORGE ITSELF -- that is the design, not an accident. A machine fetches its own
+#: replacement over the ordinary git transport, using the very credential being rotated; a leaker who
+#: can read refs reads CIPHERTEXT, sealed to the machine's key, so a leaked role token buys no
+#: replacement. The ref is named `<machine>/<epoch>` so a machine asks for its own by prefix, and so a
+#: revoke can only ever follow the delivery it confirms (see :mod:`agent_swarm.rotation`).
+#:
+#: THIS NAMESPACE IS AGE-SWEPT IN THE SAME COMMIT THAT INTRODUCED IT -- it is the repository's rule
+#: (see :func:`aged_globs`), and it holds here doubly: a rotation payload is a live credential in
+#: ciphertext, so one that lingers is a standing recoverable secret rather than a stale answer.
+ROTATION_ROOT = 'refs/swarm/rotation'
+
+
+def rotation_ref(machine: str, epoch: int) -> str:
+    """Where the sealed replacement for `machine` at `epoch` lives.
+
+    THE EPOCH IS IN THE NAME for the reason :func:`heartbeat_ref` gives: a server-side ref's update
+    time is not queryable over the ordinary git protocol, so a ref-per-machine would order nothing.
+    The epoch is what lets a machine skip already-seen payloads and lets the rotator tell delivery A
+    from delivery B of the same machine.
+    """
+    return f'{ROTATION_ROOT}/{machine}/{epoch}'
+
+
+def rotation_glob() -> str:
+    """Every rotation ref, across machines and epochs. One pattern; `ls-remote`'s `*` crosses `/`."""
+    return f'{ROTATION_ROOT}/*/*'
+
+
+def rotation_epoch(ref: str) -> int | None:
+    """The epoch in `ref`, or `None` when the last segment is not one. An `int`, for the reason
+    `attempt_number` gives: a string sort would put epoch 10 before epoch 2."""
+    tail = ref.rsplit('/', 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def rotation_machine(ref: str) -> str | None:
+    """Which machine `ref` is for, or `None` if it is not a rotation ref. Parsed from a known root
+    rather than by counting segments, so a machine id containing a `/` cannot be misread."""
+    if not ref.startswith(ROTATION_ROOT + '/'):
+        return None
+    rest = ref.removeprefix(ROTATION_ROOT + '/')
+    return rest.split('/', 1)[0] if '/' in rest else None

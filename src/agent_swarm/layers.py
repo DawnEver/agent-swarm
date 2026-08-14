@@ -88,9 +88,19 @@ LAYERS: dict[str, int] = {
     # and knows nothing about issues, jobs or who is asking. Its consumer facts -- which
     # distributions are in-tree, which licence strings are curated -- arrive as arguments.
     'notices': HOST,
+    # HOST: the AEAD seam for token rotation. It imports only the stdlib, speaks no job vocabulary
+    # (no issue, no verdict, no runner), and -- because the Gitea host has no cipher -- it is an
+    # interface plus a refusing default, not an implementation. `rotation` (DRIVER) and `swarmctl`
+    # (ENTRY) both reach it, so anything higher would point up.
+    'seal': HOST,
     # DRIVER -- the outside world and its stand-ins.
     'credentials': DRIVER,
     'forge': DRIVER,
+    # DRIVER, and FORCED rather than chosen: the CLIENT half of role-token rotation exchanges
+    # credentials with the forge and is sealed to the machine key `credentials` stores. It imports
+    # `seal` (HOST), at or below it, and nothing imports it yet -- the placement is about what it is
+    # (credential exchange), not a load-bearing consumer.
+    'rotation': DRIVER,
     # DRIVER because of `_origin_url`, and the placement is FORCED rather than chosen: `policy`
     # cross-checks a declared repository against `git remote get-url origin`, which is a subprocess
     # against the outside world. Everything ELSE in it is a decision -- precedence, and the refusal
