@@ -147,7 +147,16 @@ class Box:
         return reasons
 
 
-def run_one(job: Job, *, executor: Executor, store: Store, owner: str, box: Box, retry: bool = False) -> Outcome:
+def run_one(
+    job: Job,
+    *,
+    executor: Executor,
+    store: Store,
+    owner: str,
+    box: Box,
+    retry: bool = False,
+    record: Callable[..., None] | None = None,
+) -> Outcome:
     """Take ``job`` if this box may have it, run it, record the answer, and let it go.
 
     Returns what happened; see :class:`Outcome`. Raises only if the executor answers with a word
@@ -166,8 +175,13 @@ def run_one(job: Job, *, executor: Executor, store: Store, owner: str, box: Box,
     THE WIDTH OF THIS RUN IS FIXED FOR ITS WHOLE LIFE. That is correct for work that cannot be
     resized and wrong for work that can -- see `run_regulated`, which is this function with a
     capacity re-read.
+
+    ``record`` is THE RECORD SEAM: where a verdict goes. The default writes into the store (the work
+    item); a consumer whose verdicts live elsewhere -- refs, a CAS, a result store -- supplies its own
+    and keeps the rest of the ordering (admit -> claim -> execute -> release) unchanged. It is called
+    with ``(job, verdict, detail)`` and must not raise on a normal verdict.
     """
-    return _run(job, lambda: executor.execute(job), store=store, owner=owner, box=box, retry=retry)
+    return _run(job, lambda: executor.execute(job), store=store, owner=owner, box=box, retry=retry, record=record)
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,14 +265,27 @@ def run_regulated(
     )
 
 
-def _run(job: Job, call: Callable[[], tuple[str, str]], *, store: Store, owner: str, box: Box, retry: bool) -> Outcome:
+def _run(
+    job: Job,
+    call: Callable[[], tuple[str, str]],
+    *,
+    store: Store,
+    owner: str,
+    box: Box,
+    retry: bool,
+    record: Callable[..., None] | None = None,
+) -> Outcome:
     """THE ONE ORDERING, shared by every entry point. See the module docstring for why each step sits
     where it does; there is nothing here that is not one of those four rules.
 
     A SINGLE COPY BECAUSE THE ORDERING IS THE CONTRACT. A second entry point re-spelling
     admit-claim-execute-record-release would be two implementations of the one guarantee this layer
     was extracted to provide, and they would diverge at the step nobody re-read.
+
+    `record` defaults to the store (the work item); a caller that overrode it in `run_one` redirects
+    where the verdict lands without touching the ordering the rest of this function guarantees.
     """
+    recorder = record or store.record_verdict
     if box.blockers(job):
         return Outcome.REFUSED
     if not retry and store.verdict(job) is not None:
@@ -273,12 +300,12 @@ def _run(job: Job, call: Callable[[], tuple[str, str]], *, store: Store, owner: 
         try:
             verdict, detail = call()
         except Exception:  # noqa: BLE001 -- ANY executor failure must still free the claim
-            store.record_verdict(job, verdict='INCONCLUSIVE', detail=traceback.format_exc())
+            recorder(job, verdict='INCONCLUSIVE', detail=traceback.format_exc())
             return Outcome.CRASHED
         if verdict not in VERDICTS:
             msg = f'executor returned verdict {verdict!r}, not one of {sorted(VERDICTS)}'
             raise ValueError(msg)
-        store.record_verdict(job, verdict=verdict, detail=detail)
+        recorder(job, verdict=verdict, detail=detail)
         return Outcome.ANSWERED
     finally:
         store.release(job, owner=owner)

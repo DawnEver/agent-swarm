@@ -32,9 +32,10 @@ started choosing would be the second scheduler the design refuses.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from agent_swarm.allocator import rank
+from agent_swarm.allocator import Candidate, rank
 from agent_swarm.forge_store import ForgeStore, Role
 from agent_swarm.job import Job, JobKind
 from agent_swarm.loop import Box, Executor, Outcome, run_one
@@ -114,7 +115,14 @@ def completed_keys(fleet: Fleet) -> frozenset[str]:
 
 
 def tick(
-    fleet: Fleet, box: Box, *, now: float | None = None, retry: bool = False, sha: str | None = None
+    fleet: Fleet,
+    box: Box,
+    *,
+    now: float | None = None,
+    retry: bool = False,
+    sha: str | None = None,
+    candidates: list[Candidate] | None = None,
+    picker: Callable[..., list[Job]] = rank,
 ) -> TickReport:
     """One pass: rank what is runnable, take the first thing this box may have, answer it, publish.
 
@@ -145,24 +153,40 @@ def tick(
     VERDICTS GO THROUGH THE SPOOL, never straight to the forge: `run_one` is handed a
     `SpooledStore`, so the verdict is on disk before anything is published and a failed POST costs a
     republish rather than the answer.
+
+    TWO SEAMS, BOTH DEFAULT TO THE ROADMAP/SINGLE-QUEUE SHAPE, SO `fleet_cli` IS UNCHANGED:
+    `candidates` replaces the roadmap `needs`-graph discovery (a consumer with no roadmap -- a
+    store-policy scheduler or a compute substrate -- supplies its schedule directly), and `picker`
+    replaces `allocator.rank`'s priority+ageing law with the consumer's own ordering. Neither is a
+    second scheduler: both are the consumer's policy injected as data at the boundary this function
+    was already the seam for, and the one-pass dispatch below them is the only thing this file owns.
     """
     moment = time.time() if now is None else now
     report = TickReport()
 
-    done = completed_keys(fleet)
-    results = {item.key: (fleet.runner.verdict(item.job),) for item in fleet.roadmap.items}
-    candidates = fleet.roadmap.candidates(
-        done=done,
-        results={key: tuple(v for v in verdicts if v) for key, verdicts in results.items()},
-    )
+    #: THE DISCOVERY SEAM. `candidates` is the schedule a consumer computed for this pass. The
+    #: default is the roadmap `needs`-graph discovery; a store-policy scheduler or a compute substrate
+    #: with no roadmap (nothing to join a `needs` graph against) supplies the list itself, and its own
+    #: registration side-effects (submitting overdue groups, a freshly-pushed trunk head) have already
+    #: run before this is called.
+    if candidates is None:
+        done = completed_keys(fleet)
+        results = {item.key: (fleet.runner.verdict(item.job),) for item in fleet.roadmap.items}
+        candidates = fleet.roadmap.candidates(
+            done=done,
+            results={key: tuple(v for v in verdicts if v) for key, verdicts in results.items()},
+        )
     spooled = SpooledStore(fleet.runner, fleet.spool)
 
     #: The job this tick actually ANSWERED, remembered where it is known rather than looked up
-    #: afterwards: `candidates` holds Candidates and `rank` yields Jobs, and re-deriving one from
+    #: afterwards: `candidates` holds Candidates and the picker yields Jobs, and re-deriving one from
     #: the other is a second definition of the mapping, free to drift from the first.
     answered: Job | None = None
 
-    for job in rank(candidates, box, now=moment):
+    #: THE ORDERING SEAM. `picker` replaces `allocator.rank`'s priority+ageing law with the consumer's
+    #: own, so a two-queue or freshness-first scheduler can inject its selection without forking the
+    #: chain. It still returns every runnable job best-first, so the claim-race loser walks the list.
+    for job in picker(candidates, box, now=moment):
         report.considered.append(job.claim_key())
         outcome = run_one(
             job,
