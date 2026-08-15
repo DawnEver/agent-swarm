@@ -255,7 +255,7 @@ def api(swarmctl, monkeypatch) -> _Api:
 
 
 def _probe(swarmctl):
-    return swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    return swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
 
 
 def test_a_403_is_a_FAILURE_not_a_success(swarmctl, api):

@@ -58,7 +58,7 @@ def run(swarmctl, monkeypatch, tmp_path):
 
     def go(items, **flags):
         deleted: list[int] = []
-        provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+        provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
         pages = [items, []]
         monkeypatch.setattr(provider, 'api_list', lambda _m, _p: pages.pop(0) if pages else [])
         monkeypatch.setattr(provider, 'api', lambda _m, path, _b=None: deleted.append(int(path.rsplit('/', 1)[-1])))
@@ -136,7 +136,7 @@ def test_the_manifest_is_written_BEFORE_the_first_delete(swarmctl, monkeypatch, 
     enumerate.
     """
     seen: list[str] = []
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     pages = [[_item(1), _item(2)], []]
     monkeypatch.setattr(provider, 'api_list', lambda _m, _p: pages.pop(0) if pages else [])
     manifest = tmp_path / 'm.jsonl'
@@ -156,7 +156,7 @@ def test_a_REFUSED_deletion_fails_the_run(swarmctl, monkeypatch, tmp_path):
     """Deletion needs OWNER or ADMIN -- measured: all four role credentials get 403. A sweep that
     printed a count while deleting nothing is the shape this repo hunts, so the refusal RAISES.
     """
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     pages = [[_item(1)], []]
     monkeypatch.setattr(provider, 'api_list', lambda _m, _p: pages.pop(0) if pages else [])
 
@@ -182,7 +182,7 @@ def test_it_never_asks_for_OPEN_items(swarmctl, monkeypatch):
     structural instead of a filter someone can reorder.
     """
     asked: list[str] = []
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
 
     def _list(_method, path):
         asked.append(path)

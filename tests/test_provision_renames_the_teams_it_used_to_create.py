@@ -82,7 +82,7 @@ class _Org:
 
 
 def _provider(org: _Org, *, existing_users: set[str] | None = None) -> swarmctl.GiteaProvider:
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     provider._call = org.call
     known = set() if existing_users is None else existing_users
     provider.user_exists = lambda username: username in known

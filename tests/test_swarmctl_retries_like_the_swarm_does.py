@@ -92,7 +92,7 @@ def transport(swarmctl, monkeypatch) -> _Transport:
 
 
 def _provider(swarmctl):
-    return swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    return swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
 
 
 # --------------------------------------------------------------------------- it retries

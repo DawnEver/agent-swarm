@@ -81,7 +81,6 @@ import os
 import secrets
 import socket
 import stat
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -241,7 +240,16 @@ def fingerprint(secret: str) -> str:
 
 
 class GiteaProvider:
-    """Gitea. The only provider with a user-creation path, because it has a server-side CLI."""
+    """Gitea. The only provider with a user-creation path, because its admin API has one.
+
+    THAT SENTENCE USED TO SAY "because it has a server-side CLI", and the whole class was built
+    around reaching that binary. RETIRED 2026-08-15 (user directive): the forge is a VPS reached over
+    SSH that runs Gitea and NOTHING ELSE, so there is no machine where our code and that binary
+    coexist -- every CLI path was a refusal telling the operator to "run it there", on a host nobody
+    may run code on. Each one now has an admin-API equivalent, which is where `issue_token` had
+    already arrived on its own after the claim "minting tokens has no API path" was re-measured and
+    found false.
+    """
 
     name = 'gitea'
 
@@ -249,7 +257,6 @@ class GiteaProvider:
         self,
         base_url: str,
         org: str,
-        exe: str | None,
         admin_user: str | None,
         *,
         ask_password: bool = False,
@@ -268,14 +275,8 @@ class GiteaProvider:
         # it is kept rather than dropped -- dropping it fails only against sub-path installs.
         self.prefix = split.path.rstrip('/')
         self.org = org
-        # A CONFIGURED PATH THAT DOES NOT EXIST MEANS "not the Gitea host", not "broken install".
-        # The wrapper carries the host's binary path on every machine, so absent-here is the normal
-        # off-host state; treating it as an error buries the one useful instruction (`admin-emit`)
-        # under a path complaint. The path is kept only to say WHERE we looked.
-        self.exe_configured = exe
-        self.exe = exe if exe and Path(exe).is_file() else None
         self.admin_user = admin_user
-        #: The name a CLI-minted admin token is created under. Defaults to this machine's hostname.
+        #: The name a self-minted admin token is created under. Defaults to this machine's hostname.
         #:
         #: OVERRIDABLE BECAUSE THE DEFAULT IS A WEDGE, MEASURED 2026-08-12 ON THE GITEA HOST. The
         #: name was fixed at `swarmctl-admin@<gethostname()>`, and the local store and the server
@@ -299,28 +300,19 @@ class GiteaProvider:
         #: Prompting is opt-in. See `admin_password`: a default of True hangs unattended runs.
         self.ask_password = ask_password
 
-    # ---- CLI (host only) --------------------------------------------------
-
-    def _cli(self, *args: str) -> str:
-        if not self.exe:
-            where = f' (looked at {self.exe_configured})' if self.exe_configured else ''
-            msg = (
-                f'this verb needs the Gitea CLI, which only exists on the Gitea host{where}.\n'
-                '  Creating users and minting tokens has no API path -- run it there.'
-            )
-            raise Fail(msg)
-        proc = subprocess.run([self.exe, *args], capture_output=True, text=True, check=False, timeout=180)
-        if proc.returncode != 0:
-            msg = f'gitea {" ".join(args[:3])} failed:\n{(proc.stderr or proc.stdout).strip()[:600]}'
-            raise Fail(msg)
-        return proc.stdout
+    # ---- users (admin API) -------------------------------------------------
 
     def user_exists(self, username: str) -> bool:
-        for line in self._cli('admin', 'user', 'list').splitlines():
-            fields = line.split()
-            if len(fields) > 1 and fields[1] == username:
-                return True
-        return False
+        """Does this account exist on the server.
+
+        `GET /users/{u}` RATHER THAN LISTING. The CLI path this replaced read `admin user list` and
+        matched the second whitespace field of each line -- a parse of a human table, which changes
+        when the table does. Asking about the one account is both cheaper and unambiguous.
+
+        A 404 IS THE ANSWER, NOT AN ERROR, so it is in `allow`: "no such user" is the state the
+        caller is checking for, and half of `provision`'s job is to find it.
+        """
+        return self._call('GET', f'/users/{urllib.parse.quote(username)}', allow=(404,)) is not None
 
     def credential_works(self, username: str, owner: str, repo: str) -> bool | None:
         """Can this role actually reach the repo with the credential stored HERE -- None if unknown.
@@ -361,25 +353,35 @@ class GiteaProvider:
         return payload is not None
 
     def create_user(self, username: str) -> None:
-        # A random password, never stored and never printed: these accounts authenticate by token.
-        self._cli(
-            'admin',
-            'user',
-            'create',
-            '--username',
-            username,
-            '--password',
-            secrets.token_urlsafe(32),
-            '--email',
-            f'{username}@{urllib.parse.urlsplit(self.base_url).hostname}',
-            '--must-change-password=false',
+        """Create one service account. A random password, never stored and never printed: these
+        accounts authenticate by token.
+
+        `must_change_password` IS FALSE AND THAT IS LOAD-BEARING, not tidiness. MEASURED on the live
+        host 2026-08-10: the four role accounts had been made by hand with the flag left on, and
+        Gitea answered `403 You must change your password` to every token they minted -- while
+        `verify` read teams, membership and units correctly and printed `configuration problems:
+        none` over a swarm that could not authenticate at all.
+        """
+        self._call(
+            'POST',
+            '/admin/users',
+            {
+                'username': username,
+                'email': f'{username}@{urllib.parse.urlsplit(self.base_url).hostname}',
+                'password': secrets.token_urlsafe(32),
+                'must_change_password': False,
+            },
         )
 
     def delete_user(self, username: str) -> None:
-        self._cli('admin', 'user', 'delete', '--username', username, '--purge')
+        """Remove a service account and everything it owns. `purge` matches the CLI verb this
+        replaced; without it Gitea refuses an account that still owns repositories.
+        """
+        self._call('DELETE', f'/admin/users/{urllib.parse.quote(username)}?purge=true', allow=(404,))
 
     #: Gitea's refusal when a token of that name already exists on the SERVER. Matched as a
-    #: substring of the CLI's stderr, which is the only place it appears.
+    #: substring of the error text -- it used to come from the CLI's stderr and now comes from the
+    #: API's message body, so the SPELLING is the server's either way and the match is unchanged.
     _NAME_TAKEN = 'has been used already'
 
     def _issue_token_remotely(self, username: str, token_name: str, scopes: list[str]) -> str:
@@ -461,8 +463,52 @@ class GiteaProvider:
             raise Fail(msg)
         return token
 
+    def _mint_with_password(self, username: str, token_name: str, scopes: list[str]) -> str:
+        """Mint a token for the account whose PASSWORD we hold. The bootstrap, and only the bootstrap.
+
+        `_issue_token_remotely` cannot serve here: it sets an ephemeral password using an ADMIN
+        TOKEN, which is the very thing being bootstrapped. This route needs no token at all --
+        Gitea grants token creation to the account that will own the token, and basic auth is the
+        identity it accepts there.
+
+        THE NAME-TAKEN STATE IS REPORTED, NOT HEALED, and the asymmetry with `issue_token` is
+        deliberate. There the ephemeral password is ours to spend, so revoking a stale name costs
+        nothing. Here the name may belong to a token an operator is still using from another machine,
+        and the credential in frame is a HUMAN'S -- deleting under it is not a repair this function
+        may decide on. `--admin-token-name` is the exit, and it is named.
+        """
+        try:
+            got = self._call(
+                'POST',
+                f'/users/{urllib.parse.quote(username)}/tokens',
+                {'name': token_name, 'scopes': scopes},
+                auth='raw-basic',
+                raw_basic=(username, self.admin_password()),
+            )
+        except Fail as exc:
+            if self._NAME_TAKEN not in str(exc):
+                raise
+            msg = (
+                f'a token named {token_name!r} already exists on the SERVER for {username!r}, and\n'
+                f'  this machine has no copy of it. Gitea shows a token value once, so the value\n'
+                f'  cannot be recovered, and every run fails here identically until it is dealt with.\n'
+                f'  TWO WAYS OUT, and the first is the one to reach for:\n'
+                f'      swarmctl --admin-token-name {token_name}-2 <verb>    (mint under a free name)\n'
+                f'      swarmctl revoke --token-name {token_name}            (needs the operator PASSWORD)\n'
+                f'  Prefer the first: the new token is STORED, so it is needed once, and it does not\n'
+                f'  delete a name another machine may still be using.\n'
+                f'  This is NOT a login failure and NOT a scope problem: the password was accepted.\n'
+                f'  It is one pairing with two halves, and only the server has its half.'
+            )
+            raise Fail(msg) from exc
+        token = (got or {}).get('sha1') if isinstance(got, dict) else None
+        if not token:
+            msg = f'the forge accepted the bootstrap mint for {username!r} but returned no token value'
+            raise Fail(msg)
+        return token
+
     def issue_token(self, username: str, token_name: str, scopes: list[str]) -> str:
-        """Mint a token, or REFUSE WITH A REMEDY when the name is already taken on the server.
+        """Mint a token for one account, healing the name-already-taken state rather than reporting it.
 
         THE THIRD STATE, MEASURED 2026-08-12 ON THE GITEA HOST. `token()`'s self-heal covers
         "stored locally, revoked server-side": the 401 erases the local copy and the next run mints
@@ -470,52 +516,23 @@ class GiteaProvider:
         store** -- which is what a cleared credential store, a re-imaged box, or a mint whose store
         write was lost all leave behind.
 
-        In that state every run tries the same name, Gitea refuses it, and the box is WEDGED
+        In that state every run tried the same name, Gitea refused it, and the box was WEDGED
         PERMANENTLY. Nothing in the old message said so: the operator saw a raw CLI error naming a
         token they cannot see, with no way to get from there to a working machine. And the token
         itself is unrecoverable -- Gitea shows a value once -- so "just find it" is not available.
 
-        The remedy has to be revoke-then-remint, and it must be NAMED HERE, because this is the
-        only place that knows both the token name and the host it belongs to.
+        THE WEDGE IS NOW SELF-HEALING, and that is what retiring the CLI bought. The old path could
+        only NAME the remedy: revoke-then-remint needs the ACCOUNT'S OWN credential, which the CLI
+        route never held, so it printed two commands and stopped. `_issue_token_remotely` has an
+        ephemeral password for exactly this account in frame, so it revokes the stale name and
+        remints in the same call, once, with no human and no operator password. The refusal text
+        that used to live here went with the branch that raised it.
+
+        THIS IS A ONE-LINE DELEGATION AND IT STAYS A METHOD. The name is what the rest of the file
+        and the tests call, and it is where the state above is written down -- the docstring is the
+        deliverable.
         """
-        if not self.exe:
-            # NO BINARY, SO THE API ROUTE. Not a degraded fallback -- on a host that runs Gitea and
-            # nothing else there is no binary to reach, and the old refusal here told the operator to
-            # "run it there", on a machine that by directive runs no code of ours.
-            return self._issue_token_remotely(username, token_name, scopes)
-        try:
-            out = self._cli(
-                'admin',
-                'user',
-                'generate-access-token',
-                '--username',
-                username,
-                '--token-name',
-                token_name,
-                '--scopes',
-                ','.join(scopes),
-            )
-        except Fail as exc:
-            if self._NAME_TAKEN not in str(exc):
-                raise
-            msg = (
-                f'a token named {token_name!r} already exists on the SERVER, but this machine has\n'
-                f'  no copy of it. Gitea shows a token value once, so it cannot be recovered -- and\n'
-                f'  every run will fail here identically until the server-side one is removed.\n'
-                f'  TWO WAYS OUT. The second needs no password and is the one to reach for:\n'
-                f'      swarmctl --admin-token-name {token_name}-2 <verb>    (mint under a free name)\n'
-                f'      swarmctl revoke --token-name {token_name}            (needs the operator PASSWORD)\n'
-                f'  Prefer the first: token management is the one route Gitea refuses to token auth,\n'
-                f'  so revoking drags a human credential into a path built to keep them out of it.\n'
-                f'  This is NOT a login failure and NOT a scope problem: the credential is fine,\n'
-                f'  there are simply two halves of one pairing and only the server has its half.'
-            )
-            raise Fail(msg) from exc
-        for line in out.splitlines():
-            if 'successfully created:' in line:
-                return line.rsplit(':', 1)[1].strip()
-        msg = f'could not read a token for {username} out of the CLI output'
-        raise Fail(msg)
+        return self._issue_token_remotely(username, token_name, scopes)
 
     # ---- API --------------------------------------------------------------
 
@@ -578,18 +595,27 @@ class GiteaProvider:
             self._token = stored
             self._token_came_from_the_store = True
             return stored
-        if not self.exe:
+        if not self.admin_user:
             msg = (
-                f'no admin credential stored for {self.ADMIN_CRED_USER}@{self.netloc}, and no Gitea\n'
-                '  CLI on this machine. Either run this on the Gitea host with --gitea-exe, or ask\n'
-                '  the host to run:  swarmctl admin-emit --machine <this machine>'
+                f'no admin credential stored for {self.ADMIN_CRED_USER}@{self.netloc}, and no\n'
+                '  --admin-user to mint one as. Either pass --admin-user (an existing Gitea admin,\n'
+                '  with SWARM_ADMIN_PASSWORD set or --ask-password), or have an already-enrolled\n'
+                '  machine run:  swarmctl admin-emit --machine <this machine>'
             )
             raise Fail(msg)
-        if not self.admin_user:
-            msg = 'this verb needs --admin-user (an existing Gitea admin) for the API'
-            raise Fail(msg)
         token_name = self.admin_token_name or f'{self.ADMIN_CRED_USER}@{socket.gethostname()}'
-        self._token = self.issue_token(
+        # THE BOOTSTRAP IS THE ONE MINT THAT CANNOT GO THROUGH `issue_token`, and it is why the CLI
+        # looked load-bearing for so long. `_issue_token_remotely` sets an ephemeral password with an
+        # admin token first -- which is exactly what we do not have yet, so using it here would be
+        # circular. The admin's OWN password mints the admin's OWN token in one call: Gitea grants
+        # token creation only to the account that will own the token, and basic auth is the identity
+        # that route accepts.
+        #
+        # THIS IS THE ONLY PLACE A HUMAN CREDENTIAL ENTERS, and it enters once per machine: the mint
+        # is stored below, so every later run reads the store and never asks again. The retired CLI
+        # bootstrap was not passwordless either -- it required standing on the forge host, which by
+        # directive nobody may do.
+        self._token = self._mint_with_password(
             self.admin_user,
             token_name,
             ['write:organization', 'write:repository', 'write:admin', 'write:user'],
@@ -912,7 +938,6 @@ def build_provider(args: argparse.Namespace) -> GiteaProvider:
     return GiteaProvider(
         args.base_url,
         args.org,
-        getattr(args, 'gitea_exe', None),
         getattr(args, 'admin_user', None),
         ask_password=getattr(args, 'ask_password', False),
         admin_token_name=getattr(args, 'admin_token_name', None),
@@ -962,10 +987,10 @@ def cmd_list(provider: GiteaProvider, args: argparse.Namespace) -> int:
     say(f'{provider.name}  {provider.base_url}  org={provider.org}')
     say('\nUSERS')
     for username in USERS.values():
-        if provider.exe:
-            present = 'present' if provider.user_exists(username) else 'MISSING'
-        else:
-            present = '(needs --gitea-exe to check)'
+        # ALWAYS ANSWERABLE NOW. This used to print `(needs --gitea-exe to check)` on every machine
+        # but the forge host -- which is every machine -- so `list`'s user column said nothing to
+        # anyone who could read it. `user_exists` is an API call and works wherever the token does.
+        present = 'present' if provider.user_exists(username) else 'MISSING'
         # UNKNOWN IS NOT EMPTY. Token listing needs the admin's PASSWORD (see `admin_password`), and
         # `list` is otherwise a read-only overview that must still work without one. Printing '-'
         # when we could not look would say "this user has no tokens" -- which is what an operator
@@ -1647,7 +1672,6 @@ CONFIG_KEYS = (
     'base_url',
     'org',
     'repo',
-    'gitea_exe',
     'admin_user',
     'branch',
     'status_context',
@@ -1793,7 +1817,6 @@ def parse_argv(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--base-url', default=setting('base_url', ''))
     parser.add_argument('--org', default=setting('org', ''))
     parser.add_argument('--repo', default=setting('repo', ''))
-    parser.add_argument('--gitea-exe', default=setting('gitea_exe'))
     parser.add_argument('--admin-user', default=setting('admin_user'))
     parser.add_argument('--machine', default=socket.gethostname())
     parser.add_argument('--branch', default=setting('branch', 'main'))

@@ -91,9 +91,11 @@ def _provider(swarmctl, server: _Server, monkeypatch, *, admin: str | None = 'ad
     a `# type: ignore[method-assign]` at each site, and this repo's suppression ratchet is a ceiling
     that must be met by restructuring rather than raised. monkeypatch also undoes them per test.
     """
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, admin)
-    monkeypatch.setattr(provider, 'exe', 'pretend-gitea')
-    monkeypatch.setattr(provider, 'issue_token', lambda _user, name, _scopes: server.issue(name))
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', admin)
+    # THE BOOTSTRAP MINT, which is `_mint_with_password` and not `issue_token`: the first admin
+    # token cannot be minted with an admin token. There is no `exe` to set any more -- the Gitea CLI
+    # was retired 2026-08-15 and `token()` now reaches the server by the admin's own password.
+    monkeypatch.setattr(provider, '_mint_with_password', lambda _user, name, _scopes: server.issue(name))
     monkeypatch.setattr(provider, 'tokens_of', lambda _user: list(server.tokens))
     monkeypatch.setattr(
         provider,
@@ -157,12 +159,16 @@ def test_no_ephemeral_token_is_ever_minted(swarmctl, monkeypatch):
 
 
 @pytest.mark.usefixtures('store')
-def test_a_machine_with_no_cli_and_no_credential_refuses(swarmctl, monkeypatch):
+def test_a_machine_with_no_admin_user_and_no_credential_refuses(swarmctl, monkeypatch):
     """It must not fall back to running unauthenticated: the failure is an instruction (`admin-emit`),
     not a 401 three layers down.
+
+    THE CONDITION MOVED WITH THE CLI. It used to be "no binary on this box", which was true of every
+    box; it is now "nothing to mint AS" -- no stored credential and no `--admin-user`. The property
+    is unchanged and it is the one that matters: a machine that cannot get an admin credential says
+    so, with the command that fixes it.
     """
-    provider = _provider(swarmctl, _Server(), monkeypatch)
-    monkeypatch.setattr(provider, 'exe', None)
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None)
     with pytest.raises(swarmctl.Fail, match='admin-emit'):
         provider.token()
 
@@ -174,13 +180,11 @@ def test_the_admin_user_is_swept_too(swarmctl):
     """`revoke` walked the four ROLE users only, so the account the leftovers live under was never
     scanned. Appended, not substituted -- an off-host run has no admin and must still sweep roles.
     """
-    assert 'MingyangBao' in swarmctl._revocable_users(
-        swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'MingyangBao')
-    )
+    assert 'MingyangBao' in swarmctl._revocable_users(swarmctl.GiteaProvider('http://host:9000', 'Org', 'MingyangBao'))
 
 
 def test_an_off_host_run_still_sweeps_the_role_users(swarmctl):
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, None)
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None)
     assert set(swarmctl._revocable_users(provider)) == set(swarmctl.USERS.values())
 
 
@@ -263,7 +267,7 @@ def test_listing_tokens_uses_BASIC_auth(swarmctl, monkeypatch):
     recorder = _Recorder()
     recorder.install(swarmctl, monkeypatch)
     monkeypatch.setenv('SWARM_ADMIN_PASSWORD', 'pw')
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     provider.tokens_of('swarm-agent')
     assert recorder.headers == ['Basic YWRtaW46cHc=']
 
@@ -272,7 +276,7 @@ def test_revoking_a_token_uses_BASIC_auth(swarmctl, monkeypatch):
     recorder = _Recorder()
     recorder.install(swarmctl, monkeypatch)
     monkeypatch.setenv('SWARM_ADMIN_PASSWORD', 'pw')
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     provider.revoke_token('swarm-agent', 7)
     assert recorder.headers[0].startswith('Basic ')
 
@@ -284,7 +288,7 @@ def test_an_ordinary_call_still_uses_the_TOKEN(swarmctl, monkeypatch):
     recorder = _Recorder()
     recorder.install(swarmctl, monkeypatch, payload=b'{}')
     monkeypatch.setattr(swarmctl, 'read_credential', lambda *_a, **_k: 'stored-token')
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     provider.api_obj('GET', '/orgs/Org')
     assert recorder.headers == ['token stored-token']
 
@@ -295,7 +299,7 @@ def test_no_password_REFUSES_with_an_instruction(swarmctl, monkeypatch):
     """
     monkeypatch.delenv('SWARM_ADMIN_PASSWORD', raising=False)
     monkeypatch.setattr(swarmctl.sys.stdin, 'isatty', lambda: False)
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     with pytest.raises(swarmctl.Fail, match='SWARM_ADMIN_PASSWORD'):
         provider.tokens_of('swarm-agent')
 
@@ -316,7 +320,7 @@ def test_list_says_UNKNOWN_rather_than_none_when_it_cannot_read_tokens(swarmctl,
     """
     monkeypatch.delenv('SWARM_ADMIN_PASSWORD', raising=False)
     monkeypatch.setattr(swarmctl.sys.stdin, 'isatty', lambda: False)
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     monkeypatch.setattr(provider, 'teams', list)
     monkeypatch.setattr(provider, 'user_exists', lambda _u: True)
     swarmctl.cmd_list(provider, argparse.Namespace(repo=None))
@@ -410,7 +414,7 @@ def test_it_does_not_prompt_unless_asked(swarmctl, monkeypatch):
     monkeypatch.delenv('SWARM_ADMIN_PASSWORD', raising=False)
     monkeypatch.setattr(swarmctl.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(swarmctl.getpass, 'getpass', lambda _p: pytest.fail('prompted without --ask-password'))
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     with pytest.raises(swarmctl.Fail, match='--ask-password'):
         provider.admin_password()
 
@@ -419,7 +423,7 @@ def test_asking_for_it_DOES_prompt(swarmctl, monkeypatch):
     """The discriminating half: a flag that never prompts is just a slower refusal."""
     monkeypatch.delenv('SWARM_ADMIN_PASSWORD', raising=False)
     monkeypatch.setattr(swarmctl.getpass, 'getpass', lambda _p: 'typed')
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin', ask_password=True)
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin', ask_password=True)
     assert provider.admin_password() == 'typed'
 
 
@@ -427,7 +431,7 @@ def test_the_environment_is_used_without_asking(swarmctl, monkeypatch):
     """The unattended path: a runner supplies it once and never reaches the prompt branch."""
     monkeypatch.setenv('SWARM_ADMIN_PASSWORD', 'from-env')
     monkeypatch.setattr(swarmctl.getpass, 'getpass', lambda _p: pytest.fail('prompted with the env var set'))
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin', ask_password=True)
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin', ask_password=True)
     assert provider.admin_password() == 'from-env'
 
 
@@ -436,7 +440,7 @@ def test_the_refusal_names_both_ways_to_supply_it(swarmctl, monkeypatch):
     guessing which of the two channels this tool accepts.
     """
     monkeypatch.delenv('SWARM_ADMIN_PASSWORD', raising=False)
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     with pytest.raises(swarmctl.Fail) as caught:
         provider.admin_password()
     assert 'SWARM_ADMIN_PASSWORD' in str(caught.value)
@@ -459,7 +463,7 @@ def test_a_REFUSED_stored_credential_is_forgotten(swarmctl, monkeypatch):
     recorder = _Recorder()
     recorder.status = 401
     recorder.install(swarmctl, monkeypatch)
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     with pytest.raises(swarmctl.Fail):
         provider.api_obj('GET', '/orgs/Org')
     assert erased == [swarmctl.GiteaProvider.ADMIN_CRED_USER]
@@ -475,7 +479,7 @@ def test_it_is_NOT_a_retry(swarmctl, monkeypatch):
     recorder = _Recorder()
     recorder.status = 401
     recorder.install(swarmctl, monkeypatch)
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     with pytest.raises(swarmctl.Fail):
         provider.api_obj('GET', '/orgs/Org')
     assert len(recorder.headers) == 1, 'a refusal must not be retried'
@@ -492,9 +496,8 @@ def test_a_token_minted_THIS_RUN_is_not_forgotten(swarmctl, monkeypatch):
     recorder = _Recorder()
     recorder.status = 401
     recorder.install(swarmctl, monkeypatch)
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
-    monkeypatch.setattr(provider, 'exe', 'pretend-gitea')
-    monkeypatch.setattr(provider, 'issue_token', lambda *_a: 'fresh-token')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
+    monkeypatch.setattr(provider, '_mint_with_password', lambda *_a: 'fresh-token')
     with pytest.raises(swarmctl.Fail):
         provider.api_obj('GET', '/orgs/Org')
     assert erased == []
@@ -509,6 +512,6 @@ def test_a_healthy_stored_credential_is_kept(swarmctl, monkeypatch):
     monkeypatch.setattr(swarmctl, 'erase_credential', lambda _s, _h, user: erased.append(user))
     recorder = _Recorder()
     recorder.install(swarmctl, monkeypatch, payload=b'{}')
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     provider.api_obj('GET', '/orgs/Org')
     assert erased == []

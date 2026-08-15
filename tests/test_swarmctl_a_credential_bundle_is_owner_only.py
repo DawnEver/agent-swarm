@@ -28,6 +28,7 @@ import subprocess
 
 import pytest
 
+from agent_swarm import credentials
 from agent_swarm import swarmctl as _swarmctl
 
 
@@ -57,7 +58,13 @@ def _icacls(swarmctl, monkeypatch, *, others: str) -> list[list[str]]:
 
     monkeypatch.setattr(swarmctl.os, 'name', 'nt')
     monkeypatch.setenv('USERNAME', 'OWNER')
-    monkeypatch.setattr(swarmctl.subprocess, 'run', run)
+    # PATCHED WHERE `icacls` IS ACTUALLY RUN -- `credentials`, not `swarmctl`. This used to say
+    # `swarmctl.subprocess` and worked only because both names bound the same module object, so the
+    # sole thing keeping `import subprocess` alive in `swarmctl` was this test reaching through it.
+    # When the Gitea CLI shell-out was retired 2026-08-15 that import went with it and five tests
+    # here failed for a reason unrelated to anything they assert. Naming the real caller is what
+    # makes the patch mean what it says.
+    monkeypatch.setattr(credentials.subprocess, 'run', run)
     return calls
 
 

@@ -53,7 +53,7 @@ def swarmctl():
 def sent(swarmctl, monkeypatch):
     """Capture the body `protect` would PUT, without reaching a server."""
     bodies: list[dict] = []
-    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin')
+    provider = swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin')
     monkeypatch.setattr(provider, 'protections', lambda _o, _r: [])
     monkeypatch.setattr(provider, 'api', lambda _m, _p, body=None: bodies.append(body or {}))
     provider.protect('Org', 'Repo', 'main', 'someproject/gate')
@@ -118,4 +118,4 @@ def test_onboard_REFUSES_to_protect_without_a_context(swarmctl):
     """
     args = type('A', (), {'protect': True, 'status_context': '', 'branch': 'main', 'repo': 'Org/Repo'})()
     with pytest.raises(SystemExit, match='status context'):
-        swarmctl.cmd_onboard(swarmctl.GiteaProvider('http://host:9000', 'Org', None, 'admin'), args)
+        swarmctl.cmd_onboard(swarmctl.GiteaProvider('http://host:9000', 'Org', 'admin'), args)

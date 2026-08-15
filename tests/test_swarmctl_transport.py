@@ -90,7 +90,7 @@ def forge():
 
 @pytest.fixture
 def provider(swarmctl, forge, monkeypatch):
-    made = swarmctl.GiteaProvider(f'http://{forge.netloc}', 'TestOrg', None, None)
+    made = swarmctl.GiteaProvider(f'http://{forge.netloc}', 'TestOrg', None)
     monkeypatch.setattr(made, 'token', lambda: 'test-token')
     return made
 
@@ -120,7 +120,7 @@ def test_a_base_url_with_a_path_prefix_keeps_it(swarmctl, forge, monkeypatch):
     fails ONLY against those installs, which is the kind of bug that surfaces on someone else's
     server months later.
     """
-    made = swarmctl.GiteaProvider(f'http://{forge.netloc}/gitea', 'TestOrg', None, None)
+    made = swarmctl.GiteaProvider(f'http://{forge.netloc}/gitea', 'TestOrg', None)
     monkeypatch.setattr(made, 'token', lambda: 't')
     forge.payload = []
     made.api_list('GET', '/orgs/TestOrg/teams')
@@ -172,7 +172,7 @@ def test_an_object_helper_refuses_a_list(provider, forge, swarmctl):
 
 def test_an_unreachable_server_says_unreachable_not_a_traceback(swarmctl, monkeypatch):
     """Port 1 on loopback refuses instantly, so this measures the error path rather than a timeout."""
-    made = swarmctl.GiteaProvider('http://127.0.0.1:1', 'TestOrg', None, None)
+    made = swarmctl.GiteaProvider('http://127.0.0.1:1', 'TestOrg', None)
     monkeypatch.setattr(made, 'token', lambda: 't')
     with pytest.raises(swarmctl.Fail, match='unreachable'):
         made.api_list('GET', '/orgs/TestOrg/teams')
@@ -184,9 +184,9 @@ def test_an_unreachable_server_says_unreachable_not_a_traceback(swarmctl, monkey
 @pytest.mark.parametrize('bad', ['file:///etc/passwd', 'ftp://host/x', 'gopher://host', 'host:9000', 'http://', ''])
 def test_a_non_http_base_url_is_refused_where_the_operator_typed_it(swarmctl, bad):
     with pytest.raises(swarmctl.Fail, match='--base-url'):
-        swarmctl.GiteaProvider(bad, 'TestOrg', None, None)
+        swarmctl.GiteaProvider(bad, 'TestOrg', None)
 
 
 @pytest.mark.parametrize('good', ['http://host:9000', 'https://forge.example.com', 'https://host/gitea'])
 def test_http_and_https_are_accepted(swarmctl, good):
-    assert swarmctl.GiteaProvider(good, 'TestOrg', None, None).scheme in {'http', 'https'}
+    assert swarmctl.GiteaProvider(good, 'TestOrg', None).scheme in {'http', 'https'}

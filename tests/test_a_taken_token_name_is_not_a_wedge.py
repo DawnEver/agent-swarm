@@ -22,34 +22,46 @@ from agent_swarm import swarmctl
 
 
 class _Provider(swarmctl.GiteaProvider):
+    """A provider whose one server call fails with the server's own text.
+
+    IT STUBS `_call`, NOT A CLI. The Gitea binary was retired 2026-08-15 (user directive): the forge
+    is a VPS reached over SSH that runs Gitea and NOTHING ELSE, so there is no machine where our code
+    and that binary coexist. The STATE under test is unchanged -- the SERVER holds a token name this
+    machine has no value for -- only the route that discovers it moved from parsing the CLI's stderr
+    to reading the API's message body. The matched phrase is the server's either way.
+    """
+
     def __init__(self, stderr: str) -> None:
         self._stderr = stderr
-        self.exe = 'gitea'
         self.scheme = 'http'
         self.netloc = 'forge.invalid:9000'
+        self.admin_user = 'admin'
+        self.ask_password = False
+        # PRE-SET so the double can never reach `getpass` or the environment. A literal is honest
+        # here because nothing authenticates: `_call` raises before the credential is used.
+        self._password = 'not-a-real-password'
 
-    def _cli(self, *args: str) -> str:
-        msg = f'gitea {" ".join(args[:3])} failed:\n{self._stderr}'
-        raise swarmctl.Fail(msg)
+    def _call(self, *_args: object, **_kwargs: object) -> object:
+        raise swarmctl.Fail(self._stderr)
 
 
 def test_a_taken_name_names_the_remedy_and_the_token():
     provider = _Provider('access token name has been used already')
     with pytest.raises(swarmctl.Fail) as caught:
-        provider.issue_token('admin', 'swarmctl-admin@BOX', ['write:admin'])
+        provider._mint_with_password('admin', 'swarmctl-admin@BOX', ['write:admin'])
     text = str(caught.value)
     assert 'swarmctl revoke --token-name swarmctl-admin@BOX' in text, f'no runnable remedy: {text}'
     assert 'NOT a login failure' in text, 'it does not rule out the wrong diagnosis'
     assert 'cannot be recovered' in text, 'it does not say the value is unrecoverable'
 
 
-def test_ANY_OTHER_cli_failure_is_passed_through_unchanged():
+def test_ANY_OTHER_mint_failure_is_passed_through_unchanged():
     """THE CONTROL, and the direction that costs evidence. A blanket `except Fail` that relabelled
     every mint failure as a name collision would send an operator to revoke a token over what was
     actually a permissions error or a dead server."""
     provider = _Provider('user does not exist')
     with pytest.raises(swarmctl.Fail, match='user does not exist'):
-        provider.issue_token('nobody', 'swarmctl-admin@BOX', ['write:admin'])
+        provider._mint_with_password('nobody', 'swarmctl-admin@BOX', ['write:admin'])
 
 
 class TestVerifyCannotReportNoProblemsWithoutLooking:
@@ -97,14 +109,14 @@ class TestTheUnwedgeDoesNotNeedTheOperatorsPassword:
 
     def test_the_override_replaces_the_hostname_derived_name(self):
         provider = swarmctl.GiteaProvider(
-            'http://forge.invalid:9000', 'Org', None, 'admin', admin_token_name='swarmctl-admin@chosen'
+            'http://forge.invalid:9000', 'Org', 'admin', admin_token_name='swarmctl-admin@chosen'
         )
         assert provider.admin_token_name == 'swarmctl-admin@chosen'
 
     def test_the_default_is_still_the_hostname(self):
         """The control: an override that was always set would make the collision unreachable and
         this whole family untestable against the real default."""
-        provider = swarmctl.GiteaProvider('http://forge.invalid:9000', 'Org', None, 'admin')
+        provider = swarmctl.GiteaProvider('http://forge.invalid:9000', 'Org', 'admin')
         assert provider.admin_token_name is None
 
     def test_the_refusal_offers_the_PASSWORDLESS_route_first(self):
@@ -112,7 +124,7 @@ class TestTheUnwedgeDoesNotNeedTheOperatorsPassword:
         named, and the one that does not drag a human credential into fleet tooling leads."""
         provider = _Provider('access token name has been used already')
         with pytest.raises(swarmctl.Fail) as caught:
-            provider.issue_token('admin', 'swarmctl-admin@BOX', ['write:admin'])
+            provider._mint_with_password('admin', 'swarmctl-admin@BOX', ['write:admin'])
         text = str(caught.value)
         assert '--admin-token-name' in text, 'the passwordless route is not offered'
         assert text.index('--admin-token-name') < text.index('revoke --token-name'), (
@@ -133,12 +145,11 @@ class TestTheOverrideIsNotSilentlyIgnored:
 
     def test_the_flag_bypasses_a_stored_credential(self, monkeypatch, capsys):
         provider = swarmctl.GiteaProvider(
-            'http://forge.invalid:9000', 'Org', None, 'admin', admin_token_name='swarmctl-admin@fresh'
+            'http://forge.invalid:9000', 'Org', 'admin', admin_token_name='swarmctl-admin@fresh'
         )
-        provider.exe = 'gitea'  # the mint branch needs a CLI; it is stubbed just below
         monkeypatch.setattr(swarmctl, 'read_credential', lambda *_a, **_k: 'a-stored-one')
         monkeypatch.setattr(swarmctl, 'store_credential', lambda *_a, **_k: None)
-        monkeypatch.setattr(provider.__class__, 'issue_token', lambda _s, _u, name, _sc: f'minted:{name}')
+        monkeypatch.setattr(provider.__class__, '_mint_with_password', lambda _s, _u, name, _sc: f'minted:{name}')
 
         assert provider.token() == 'minted:swarmctl-admin@fresh'
         assert 'IGNORING the stored credential' in capsys.readouterr().out, 'the bypass is silent'
@@ -147,7 +158,7 @@ class TestTheOverrideIsNotSilentlyIgnored:
         """THE CONTROL, and it guards the property the store exists for: read-only verbs must run
         from any machine without minting. A bypass that fired unconditionally would mint an admin
         token on every fleet box that ever ran `list`."""
-        provider = swarmctl.GiteaProvider('http://forge.invalid:9000', 'Org', None, 'admin')
+        provider = swarmctl.GiteaProvider('http://forge.invalid:9000', 'Org', 'admin')
         import agent_swarm.swarmctl as mod
 
         original = mod.read_credential

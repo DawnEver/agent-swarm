@@ -50,15 +50,15 @@ class _Recorder:
         return None
 
 
-def _provider(exe: str | None = None) -> GiteaProvider:
-    return GiteaProvider(base_url='https://forge.example', org='Org', exe=exe, admin_user='admin')
+def _provider() -> GiteaProvider:
+    return GiteaProvider(base_url='https://forge.example', org='Org', admin_user='admin')
 
 
 def test_WITHOUT_the_cli_a_token_is_still_ISSUED(monkeypatch) -> None:
     """The direction the constraint demands. Absent the binary this used to RAISE with a message
     telling the operator to go and run it on a machine that no longer runs anything.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
     recorder = _Recorder()
     monkeypatch.setattr(provider, '_call', recorder)
 
@@ -71,7 +71,7 @@ def test_the_MINT_uses_the_TARGET_USER_and_not_the_admin(monkeypatch) -> None:
     the token-creation route only to the account that will own the token. Minting as the admin would
     401 in production while every unit test that stubbed HTTP kept passing.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
     recorder = _Recorder()
     monkeypatch.setattr(provider, '_call', recorder)
 
@@ -90,7 +90,7 @@ def test_the_PASSWORD_IS_SET_FIRST_and_never_returned(monkeypatch) -> None:
     a stored password for a service account is a strictly worse credential than the token it exists
     to produce -- it does not expire and it cannot be scoped.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
     recorder = _Recorder()
     monkeypatch.setattr(provider, '_call', recorder)
 
@@ -105,7 +105,7 @@ def test_TWO_ISSUES_DO_NOT_REUSE_A_PASSWORD(monkeypatch) -> None:
     """Ephemeral means per issue. A password reused across mints is a long-lived secret with extra
     steps, and it would be the one an attacker who saw a single call could keep using.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
     recorder = _Recorder()
     monkeypatch.setattr(provider, '_call', recorder)
 
@@ -117,27 +117,22 @@ def test_TWO_ISSUES_DO_NOT_REUSE_A_PASSWORD(monkeypatch) -> None:
     assert all(len(p) >= 32 for p in passwords), 'and each must be long enough to be worth generating'
 
 
-def test_THE_CLI_IS_STILL_PREFERRED_WHERE_IT_EXISTS(monkeypatch, tmp_path) -> None:
-    """The host path is not replaced. It needs no admin token, no password write, and one round
-    trip instead of two -- so where the binary is present it stays the route, and the remote path is
-    the fallback rather than the default.
-    """
-    # A REAL FILE, because the constructor resolves `exe` with `Path(exe).is_file()` -- a made-up
-    # path silently becomes `exe=None`, and this test would then pass for the opposite reason.
-    binary = tmp_path / 'gitea'
-    binary.write_text('#!/bin/sh\n', encoding='utf-8')
-    provider = _provider(exe=str(binary))
-    used: list[tuple] = []
-    # REALISTIC CLI OUTPUT, not a bare value: the parser looks for Gitea's own phrasing, so a stub
-    # returning anything else fails INSIDE the branch and the assertion below is never reached --
-    # the test would be red for the stub's shape while the property under test actually held.
-    monkeypatch.setattr(
-        provider, '_cli', lambda *a: used.append(a) or 'Access token was successfully created: cli-token\n'
-    )
-    monkeypatch.setattr(provider, '_call', _Recorder())
+def test_THERE_IS_NO_CLI_ROUTE_LEFT_TO_PREFER() -> None:
+    """THIS TEST USED TO ASSERT THE OPPOSITE, and the reversal is the record.
 
-    assert provider.issue_token('swarm-observer', 'swarm-observer@WS9', ['read:repository']) == 'cli-token'
-    assert used, 'the CLI must still be used when it is there'
+    It was `test_THE_CLI_IS_STILL_PREFERRED_WHERE_IT_EXISTS`, defending the host binary as the
+    default and calling this file's route "the fallback". RETIRED 2026-08-15 (user directive:
+    "彻底撤销 gitea exe 和类似逻辑"). The preference was never exercised: the forge is a VPS reached
+    over SSH that runs Gitea and nothing else, so there is no machine where our code and that binary
+    coexist -- `exe` resolved to None everywhere, and the branch it guarded was dead in production
+    while every test that set it kept passing.
+
+    Keeping a second route for a machine that does not exist is not caution. It was the thing
+    `token()` refused into ("run this on the Gitea host with --gitea-exe") and what `issue_token`
+    could not heal a taken name from, because the CLI route never held the account's own credential.
+    """
+    assert not hasattr(GiteaProvider, '_cli'), 'the CLI shell-out is back'
+    assert not hasattr(_provider(), 'exe'), 'the provider is carrying a binary path again'
 
 
 def test_a_REFUSED_PASSWORD_WRITE_does_not_look_like_a_mint_failure(monkeypatch) -> None:
@@ -145,7 +140,7 @@ def test_a_REFUSED_PASSWORD_WRITE_does_not_look_like_a_mint_failure(monkeypatch)
     refused password write is an ADMIN credential problem, a refused mint is about the target
     account. The message must name which half failed.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
 
     def refuse(method, path, body=None, **_kw):
         if method == 'PATCH':
@@ -172,7 +167,7 @@ def test_a_NAME_ALREADY_TAKEN_is_revoked_and_reminted(monkeypatch) -> None:
     ONE RETRY, NOT A LOOP. If the delete succeeded and the mint still says the name is taken, the
     server is telling us something we do not understand, and retrying would turn that into a spin.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
     seen: list[tuple[str, str]] = []
     refused_once = {'done': False}
 
@@ -198,7 +193,7 @@ def test_a_MINT_that_fails_for_ANOTHER_REASON_is_not_retried(monkeypatch) -> Non
     """The discriminating half. A 403, a 404 or a network error is not a name collision, and
     deleting a token in response to one would destroy a working credential to fix nothing.
     """
-    provider = _provider(exe=None)
+    provider = _provider()
     attempts = {'n': 0}
 
     def call(method, path, body=None, *, allow=(), auth='token', raw_token=None, raw_basic=None):
